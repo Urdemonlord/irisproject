@@ -132,9 +132,8 @@ pub(crate) async fn save_draft(
     Ok(Json(json!({ "id": id })).into_response())
 }
 
-/// First recipient domain that IRIS can't deliver to yet (no outbound relay).
-fn undeliverable<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
-    if s.config.send_external { return None; }
+/// First recipient outside our own domains, if any.
+fn first_external<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
     c.to.iter().chain(&c.cc).chain(&c.bcc).find(|a| {
         let d = a.rsplit_once('@').map(|x| x.1).unwrap_or_default();
         !s.config.send_local_domains.iter().any(|l| d == l)
@@ -149,8 +148,8 @@ pub(crate) async fn send(
     if c.to.is_empty() && c.cc.is_empty() && c.bcc.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "no_recipients"));
     }
-    if let Some(addr) = undeliverable(&s, &c) {
-        tracing::info!("send blocked: external recipient domain ({})", addr.rsplit_once('@').map(|x| x.1).unwrap_or_default());
+    let external = first_external(&s, &c).is_some();
+    if external && s.relay.is_none() && !s.config.send_external {
         return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "external_sending_disabled"));
     }
 
@@ -163,7 +162,17 @@ pub(crate) async fn send(
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_sends"));
     }
 
-    s.jmap.send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref()).await?;
+    match (&s.relay, external) {
+        // Other domains go out through the relay (it also delivers our local recipients via MX);
+        // the copy for Sent is filed afterwards. A failed copy doesn't undo a sent message.
+        (Some(relay), true) => {
+            relay.send(&c).await?;
+            if let Err(e) = s.jmap.store_sent(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref()).await {
+                tracing::error!("sent via relay but Sent copy failed: {e}");
+            }
+        }
+        _ => s.jmap.send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref()).await?,
+    }
     sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
         .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await?;
     Ok(Json(json!({ "sent": true })).into_response())

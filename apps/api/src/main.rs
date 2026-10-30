@@ -8,7 +8,7 @@ use axum::{
 };
 use iris_auth as auth;
 use iris_config::Config;
-use iris_mail::{JmapClient, MailError};
+use iris_mail::{JmapClient, MailError, ResendClient};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -22,6 +22,8 @@ pub(crate) struct AppState {
     pool: SqlitePool,
     config: Config,
     jmap: JmapClient,
+    /// Outbound relay for other domains (None = only local domains can be reached).
+    relay: Option<ResendClient>,
 }
 
 #[derive(Clone)]
@@ -69,6 +71,7 @@ async fn main() {
     let state = Arc::new(AppState {
         pool,
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
+        relay: (!config.resend_api_key.is_empty()).then(|| ResendClient::new(config.resend_api_key.clone())),
         config: config.clone(),
     });
     tokio::spawn(cleanup::run(state.clone()));

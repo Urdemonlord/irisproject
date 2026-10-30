@@ -348,6 +348,20 @@ impl JmapClient {
         Ok(())
     }
 
+    /// Files a copy of a message sent elsewhere (e.g. via the HTTP relay) into Sent, removing `draft`.
+    pub async fn store_sent(&self, user: &str, pass: &str, account: &str, c: &Compose, draft: Option<&str>) -> Result<(), MailError> {
+        let sent = self.folder_id(user, pass, account, "sent").await?;
+        let mut e = email_json(c, &sent);
+        e["keywords"] = json!({"$seen": true});
+        let mut set = json!({"accountId": account, "create": {"n": e}});
+        if let Some(old) = draft { set["destroy"] = json!([old]); }
+        let r = self.call(user, pass, json!([["Email/set", set, "s"]])).await?;
+        if r[0]["created"]["n"].is_null() {
+            return Err(MailError::Protocol(format!("sent copy not stored: {}", r[0]["notCreated"])));
+        }
+        Ok(())
+    }
+
     /// The sending identity for `email`, created if the account has none.
     async fn identity(&self, user: &str, pass: &str, account: &str, email: &str) -> Result<String, MailError> {
         let r = self.call_using(user, pass, &USING_SUBMIT, json!([["Identity/get", {"accountId": account, "ids": null}, "i"]])).await?;
@@ -498,5 +512,67 @@ mod tests {
     fn updated_maps_results() {
         assert!(updated(&json!({"updated": {"x": null}}), "x").is_ok());
         assert!(matches!(updated(&json!({"notUpdated": {"x": {"type": "notFound"}}}), "x"), Err(MailError::NotFound)));
+    }
+}
+
+/// Outbound relay over Resend's HTTP API, used for recipients outside our own domains
+/// (the host can't send on port 25).
+#[derive(Clone)]
+pub struct ResendClient {
+    api_key: String,
+    http: reqwest::Client,
+}
+
+impl ResendClient {
+    pub fn new(api_key: String) -> Self {
+        let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().expect("reqwest client");
+        Self { api_key, http }
+    }
+
+    pub async fn send(&self, c: &Compose) -> Result<String, MailError> {
+        let resp = self.http.post("https://api.resend.com/emails")
+            .bearer_auth(&self.api_key)
+            .json(&resend_json(c))
+            .send().await
+            .map_err(|e| MailError::Unavailable(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        match status {
+            200..=299 => Ok(v["id"].as_str().unwrap_or_default().to_string()),
+            401 | 403 => Err(MailError::Unavailable(format!("relay auth failed: {}", v["message"]))),
+            429 | 500.. => Err(MailError::Unavailable(format!("relay HTTP {status}: {}", v["message"]))),
+            _ => Err(MailError::Rejected(v["message"].as_str().unwrap_or("relay refused the message").to_string())),
+        }
+    }
+}
+
+fn resend_json(c: &Compose) -> Value {
+    let mut v = json!({"from": c.from, "to": c.to, "subject": c.subject, "text": c.text});
+    if !c.cc.is_empty() { v["cc"] = json!(c.cc); }
+    if !c.bcc.is_empty() { v["bcc"] = json!(c.bcc); }
+    let mut headers = serde_json::Map::new();
+    if let Some(r) = &c.in_reply_to { headers.insert("In-Reply-To".into(), json!(format!("<{r}>"))); }
+    if !c.references.is_empty() {
+        headers.insert("References".into(), json!(c.references.iter().map(|r| format!("<{r}>")).collect::<Vec<_>>().join(" ")));
+    }
+    if !headers.is_empty() { v["headers"] = Value::Object(headers); }
+    v
+}
+
+#[cfg(test)]
+mod resend_tests {
+    use super::*;
+
+    #[test]
+    fn resend_payload() {
+        let c = Compose { from: "a@x.id".into(), to: vec!["b@gmail.com".into()], bcc: vec!["c@y.id".into()], subject: "Re: hi".into(),
+            text: "t".into(), in_reply_to: Some("m1@x".into()), references: vec!["m0@x".into(), "m1@x".into()], ..Default::default() };
+        let v = resend_json(&c);
+        assert_eq!(v["from"], "a@x.id");
+        assert_eq!(v["to"][0], "b@gmail.com");
+        assert!(v.get("cc").is_none());
+        assert_eq!(v["bcc"][0], "c@y.id");
+        assert_eq!(v["headers"]["In-Reply-To"], "<m1@x>");
+        assert_eq!(v["headers"]["References"], "<m0@x> <m1@x>");
     }
 }
