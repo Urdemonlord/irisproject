@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<!--head-->
+    <title>Privacy policy · IRIS</title>
+    <meta name="description" content="How IRIS handles your mail, cookies and data: what we store, for how long, and how temporary inboxes are deleted.">
+    <link rel="canonical" href="%VITE_SITE_URL%/privacy/">
+    <meta property="og:title" content="Privacy policy · IRIS">
+    <meta property="og:description" content="What IRIS stores, for how long, and how temporary inboxes are deleted.">
+    <meta property="og:url" content="%VITE_SITE_URL%/privacy/">
+</head>
+<body data-page="/privacy/">
+<div class="auth-shell">
+    <header class="simple-top"><a class="brand" href="/" aria-label="IRIS home"><span class="brand-mark">IRIS</span><span class="brand-sub">Meow Labs</span></a></header>
+    <main class="legal">
+        <p class="eyebrow">Legal</p>
+        <h1>Privacy policy</h1>
+        <p class="updated">Last updated: 30 October 2026</p>
+
+        <p>IRIS is a self-hosted email service run by Meow Labs. This page explains what IRIS stores about you, why, and for how long. We don’t sell your data and we don’t show ads.</p>
+
+        <h2 id="data">What we store</h2>
+        <ul>
+            <li><strong>Your mail.</strong> Messages in your mailbox are stored on our own mail server so you can read them. We don’t scan them for advertising.</li>
+            <li><strong>Your session.</strong> When you sign in we create a session that lasts up to 30 days. We never store your password: sign-in creates a separate mail-server password for that session only, kept encrypted and destroyed when you sign out or the session ends.</li>
+            <li><strong>Temporary inboxes.</strong> Each temporary address and its messages live for 1 hour. After it expires, the address stops working immediately and its messages are deleted within about an hour.</li>
+            <li><strong>Abuse protection.</strong> To limit how many temporary addresses can be created, we record your IP address and a random browser identifier for each request. These records are deleted after 2 days.</li>
+            <li><strong>Server logs.</strong> Our servers keep short technical logs (errors, request outcomes) to keep the service running and secure.</li>
+        </ul>
+
+        <h2 id="cookies">Cookies and local storage</h2>
+        <p>IRIS only sets cookies that are needed for it to work:</p>
+        <div class="table-scroll">
+        <table>
+            <thead><tr><th>Name</th><th>Purpose</th><th>Lifetime</th></tr></thead>
+            <tbody>
+                <tr><td><code>iris_session</code></td><td>Keeps you signed in.</td><td>Up to 30 days</td></tr>
+                <tr><td><code>iris_csrf</code></td><td>Protects forms against cross-site request forgery.</td><td>Up to 30 days</td></tr>
+                <tr><td><code>iris_temp_client</code></td><td>Limits active temporary addresses per browser.</td><td>24 hours</td></tr>
+            </tbody>
+        </table>
+        </div>
+        <p>Your browser also keeps the current temporary address (session storage, cleared when you close the tab) and your cookie choice (local storage).</p>
+        <p>If analytics is enabled on this server, we only load it after you allow it in the cookie notice. It counts anonymous page views (for example “/temp”) and never sees message contents, addresses or tokens. You can change your choice at any time: <button type="button" class="linklike link" data-cookie-settings>Cookie settings</button>.</p>
+
+        <h2 id="sharing">Who we share data with</h2>
+        <p>Nobody, unless the law requires it. Mail you receive comes from the senders you gave your address to; mail is delivered by standard internet email.</p>
+
+        <h2 id="rights">Your choices</h2>
+        <ul>
+            <li>Sign out at any time to end your session on that device.</li>
+            <li>Ask us for a copy of your data, or to delete your account and mailbox, using the contact below.</li>
+        </ul>
+
+        <h2 id="contact">Contact</h2>
+        <address class="contact-card">
+            Meow Labs<br>
+            <span data-optional><span data-contact-address></span><br></span>
+            <span data-optional>Email: <span data-contact-email></span></span>
+        </address>
+    </main>
+</div>
+<script type="module" src="/src/legal.ts"></script>
+</body>
+</html>

@@ -112,6 +112,10 @@
 
   <!-- ═══ UI ICONS — 20px grid, 1.5 stroke, square caps, miter joins ═══ -->
   <g id="icons" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter">
+  <symbol id="i-mail" viewBox="0 0 20 20"><path d="M2.75 4.75h14.5v10.5H2.75z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M2.75 5l7.25 6 7.25-6" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-lock" viewBox="0 0 20 20"><path d="M4.25 9h11.5v8.25H4.25z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M6.75 9V6.25a3.25 3.25 0 0 1 6.5 0V9" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-logout" viewBox="0 0 20 20"><path d="M8 3.25H3.25v13.5H8" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M7.5 10h9.25M13.25 6.5L16.75 10l-3.5 3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-clock" viewBox="0 0 20 20"><circle cx="10" cy="10" r="7.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 5.75V10l2.75 2" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-inbox" viewBox="0 0 20 20"><path d="M2.75 11.25h4.5l1.25 2h3l1.25-2h4.5M2.75 11.25L5 3.75h10l2.25 7.5v5H2.75z" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
   <symbol id="i-send" viewBox="0 0 20 20"><path d="M2.75 9.75L17.25 2.75L11 17.25L9 11zM9 11l8.25-8.25" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="miter"/></symbol>
   <symbol id="i-draft" viewBox="0 0 20 20"><path d="M4.75 2.75h7l3.5 3.5v11h-10.5zM11.75 2.75v3.5h3.5M7.5 10.25h5M7.5 13.25h3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
