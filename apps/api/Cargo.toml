@@ -15,6 +15,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
+anyhow = "1.0"
 iris-config = { path = "../../crates/config" }
 iris-auth = { path = "../../crates/auth" }
 iris-database = { path = "../../crates/database" }

@@ -43,6 +43,7 @@ pub struct JmapClient {
 }
 
 const USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
+const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
 const SUMMARY_PROPS: [&str; 7] = ["from", "to", "subject", "preview", "receivedAt", "keywords", "size"];
 
 impl JmapClient {
@@ -71,13 +72,17 @@ impl JmapClient {
     }
 
     async fn call(&self, user: &str, pass: &str, calls: Value) -> Result<Vec<Value>, MailError> {
+        self.call_using(user, pass, &USING, calls).await
+    }
+
+    async fn call_using(&self, user: &str, pass: &str, using: &[&str], calls: Value) -> Result<Vec<Value>, MailError> {
         // ponytail: posts to {base}/jmap/ instead of session.apiUrl (Stalwart advertises
         // the public hostname); switch to apiUrl if API and mail server get split.
         let resp = self
             .http
             .post(format!("{}/jmap/", self.base_url))
             .basic_auth(user, Some(pass))
-            .json(&json!({ "using": USING, "methodCalls": calls }))
+            .json(&json!({ "using": using, "methodCalls": calls }))
             .send()
             .await
             .map_err(|e| MailError::Unavailable(e.to_string()))?;
@@ -94,6 +99,60 @@ impl JmapClient {
             }
         }
         Ok(out)
+    }
+
+    /// Creates a Stalwart app password for the authenticated user; returns (id, secret).
+    /// The secret is only ever returned by this call.
+    pub async fn create_app_password(
+        &self, user: &str, pass: &str, description: &str, expires_at: &str,
+    ) -> Result<(String, String), MailError> {
+        let r = self
+            .call_using(user, pass, &USING_STALWART, json!([["x:AppPassword/set", {"create": {"n": {
+                "description": description, "permissions": {"@type": "Inherit"}, "expiresAt": expires_at}}}, "c"]]))
+            .await?;
+        let c = &r[0]["created"]["n"];
+        match (c["id"].as_str(), c["secret"].as_str()) {
+            (Some(id), Some(secret)) => Ok((id.to_string(), secret.to_string())),
+            _ => Err(MailError::Protocol(format!("app password not created: {}", r[0]["notCreated"]))),
+        }
+    }
+
+    /// Revokes an app password (an app password may revoke itself).
+    pub async fn destroy_app_password(&self, user: &str, pass: &str, id: &str) -> Result<(), MailError> {
+        self.call_using(user, pass, &USING_STALWART, json!([["x:AppPassword/set", {"destroy": [id]}, "c"]])).await?;
+        Ok(())
+    }
+
+    /// Destroys messages whose To: contains exactly `to` (temp inbox purge). Returns count destroyed.
+    pub async fn destroy_to(&self, user: &str, pass: &str, account: &str, to: &str) -> Result<usize, MailError> {
+        let r = self
+            .call(user, pass, json!([
+                ["Email/query", {"accountId": account, "filter": {"to": to}, "limit": 500}, "q"],
+                ["Email/get", {"accountId": account,
+                    "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"}, "properties": ["to"]}, "g"]
+            ]))
+            .await?;
+        // Full-text `to` filter can over-match; only destroy exact recipient hits.
+        let ids: Vec<&str> = r[1]["list"].as_array().into_iter().flatten()
+            .filter(|e| has_rcpt(e, to)).filter_map(|e| e["id"].as_str()).collect();
+        self.destroy(user, pass, account, &ids).await
+    }
+
+    /// Destroys messages received before `before` (UTC RFC3339), up to 500 per call.
+    pub async fn destroy_before(&self, user: &str, pass: &str, account: &str, before: &str) -> Result<usize, MailError> {
+        let r = self
+            .call(user, pass, json!([["Email/query", {"accountId": account, "filter": {"before": before}, "limit": 500}, "q"]]))
+            .await?;
+        let ids: Vec<&str> = r[0]["ids"].as_array().into_iter().flatten().filter_map(Value::as_str).collect();
+        self.destroy(user, pass, account, &ids).await
+    }
+
+    async fn destroy(&self, user: &str, pass: &str, account: &str, ids: &[&str]) -> Result<usize, MailError> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let r = self.call(user, pass, json!([["Email/set", {"accountId": account, "destroy": ids}, "d"]])).await?;
+        Ok(r[0]["destroyed"].as_array().map_or(0, Vec::len))
     }
 
     pub async fn list_inbox(

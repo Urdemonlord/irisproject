@@ -8,12 +8,17 @@ const app = document.querySelector<HTMLDivElement>('#app')!
 
 class HttpError extends Error { constructor(public status: number, public code: string) { super(code) } }
 
-async function api<T>(path: string, init?: RequestInit): Promise<T> {
-  const res = await fetch(path, {
-    credentials: 'same-origin',
-    headers: { 'content-type': 'application/json' },
-    ...init,
-  })
+const csrfCookie = () => document.cookie.split('; ').find((c) => c.startsWith('iris_csrf='))?.slice(10)
+
+async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const method = (init.method ?? 'GET').toUpperCase()
+  const headers: Record<string, string> = { 'content-type': 'application/json', ...(init.headers as Record<string, string>) }
+  if (method !== 'GET' && method !== 'HEAD') {
+    // Double-submit CSRF token: server compares this header to the iris_csrf cookie.
+    if (!csrfCookie()) await fetch('/auth/csrf', { credentials: 'same-origin' })
+    headers['x-csrf-token'] = csrfCookie() ?? ''
+  }
+  const res = await fetch(path, { credentials: 'same-origin', ...init, headers })
   if (!res.ok) {
     const body = await res.json().catch(() => ({}))
     throw new HttpError(res.status, body.error ?? 'request_failed')

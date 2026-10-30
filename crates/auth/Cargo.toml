@@ -7,3 +7,5 @@ edition.workspace = true
 uuid = { workspace = true }
 chrono = { workspace = true }
 sha2 = { workspace = true }
+# Already in the tree via rustls; used directly for AEAD + CSPRNG.
+ring = "0.17"

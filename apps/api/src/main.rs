@@ -12,24 +12,22 @@ use iris_mail::{JmapClient, MailError};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::{collections::HashMap, sync::{Arc, RwLock}};
+use std::sync::Arc;
 
+mod cleanup;
 mod temp;
 
 struct AppState {
     pool: SqlitePool,
     config: Config,
     jmap: JmapClient,
-    // ponytail: mail credentials live only in process memory keyed by session id, so an
-    // API restart forces re-login. Upgrade path: Stalwart app passwords / OAuth tokens.
-    creds: RwLock<HashMap<String, Creds>>,
 }
 
 #[derive(Clone)]
 struct Creds { user: String, pass: String }
 
 #[derive(Clone)]
-struct CurrentUser { user_id: String, session_id: String, email: String, creds: Creds }
+struct CurrentUser { user_id: String, email: String, creds: Creds }
 
 type S = State<Arc<AppState>>;
 type ApiResult = Result<Response, ApiError>;
@@ -61,13 +59,16 @@ impl From<MailError> for ApiError {
 async fn main() {
     tracing_subscriber::fmt::init();
     let config = Config::from_env().expect("config");
+    if config.env == "production" && (config.session_secret.len() < 32 || config.session_secret.starts_with("dev-secret")) {
+        panic!("SESSION_SECRET must be a random value of at least 32 chars in production");
+    }
     let pool = iris_database::init_pool(&config.database_url).await.expect("database");
     let state = Arc::new(AppState {
         pool,
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
         config: config.clone(),
-        creds: RwLock::new(HashMap::new()),
     });
+    tokio::spawn(cleanup::run(state.clone()));
 
     let protected = Router::new()
         .route("/api/v1/session", get(session))
@@ -80,12 +81,14 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(ready))
+        .route("/auth/csrf", get(csrf))
         .route("/auth/login", post(login))
         .route("/api/v1/temp-inboxes", post(temp::create))
         .route("/api/v1/temp-inboxes/:id", get(temp::status))
         .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
         .route("/api/v1/temp-inboxes/:id/messages/:message_id", get(temp::message))
         .merge(protected)
+        .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
         .with_state(state);
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -98,12 +101,38 @@ async fn ready(State(s): S) -> Json<serde_json::Value> {
     Json(json!({ "ready": iris_database::health_check(&s.pool).await.is_ok() }))
 }
 
+fn secure(s: &AppState) -> bool {
+    s.config.env == "production"
+}
+
+/// Issues (or re-issues) the double-submit CSRF cookie; the SPA calls this before its first write.
+async fn csrf(State(s): S, headers: HeaderMap) -> Response {
+    let existing = headers.get(header::COOKIE).and_then(|h| h.to_str().ok())
+        .and_then(|c| auth::cookie(c, auth::CSRF_COOKIE)).filter(|t| t.len() == 64).map(str::to_string);
+    let token = existing.unwrap_or_else(auth::new_token);
+    ([(header::SET_COOKIE, auth::set_csrf_cookie(&token, secure(&s)))], Json(json!({ "csrf_token": token }))).into_response()
+}
+
+/// Unsafe methods need a matching CSRF header+cookie, unless authenticated by a bearer
+/// capability token (temp inboxes), which a cross-site form cannot attach.
+async fn require_csrf(headers: HeaderMap, req: Request, next: Next) -> Response {
+    let m = req.method();
+    let unsafe_method = !(m == axum::http::Method::GET || m == axum::http::Method::HEAD || m == axum::http::Method::OPTIONS);
+    let bearer = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok()).is_some_and(|h| h.starts_with("Bearer "));
+    let cookies = headers.get(header::COOKIE).and_then(|h| h.to_str().ok());
+    let sent = headers.get(auth::CSRF_HEADER).and_then(|h| h.to_str().ok());
+    if unsafe_method && !bearer && !auth::csrf_ok(cookies, sent) {
+        return ApiError(StatusCode::FORBIDDEN, "csrf_failed").into_response();
+    }
+    next.run(req).await
+}
+
 #[derive(Deserialize)]
 struct LoginBody { email: String, password: String }
 
 const MAX_FAILED_LOGINS: i64 = 10; // per email per 15 minutes
 
-async fn login(State(s): S, Json(b): Json<LoginBody>) -> ApiResult {
+async fn login(State(s): S, headers: HeaderMap, Json(b): Json<LoginBody>) -> ApiResult {
     let email = b.email.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') || b.password.is_empty() || email.len() > 254 {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
@@ -128,29 +157,71 @@ async fn login(State(s): S, Json(b): Json<LoginBody>) -> ApiResult {
         Err(e) => return Err(e.into()),
     };
 
+    // Per-session app password: the user's real password is used once here and never kept.
+    let session_expiry = auth::expiry_at();
+    let (cred_id, app_secret) = s.jmap
+        .create_app_password(&email, &b.password, "IRIS web session", &session_expiry.to_rfc3339_opts(chrono::SecondsFormat::Secs, true))
+        .await?;
+
+    let token = auth::new_token();
+    if let Err(e) = persist_login(&s, &email, &account_id, &token, &session_expiry, &app_secret, &cred_id).await {
+        // Don't leak a live app password when the session row never got written.
+        let _ = s.jmap.destroy_app_password(&email, &app_secret, &cred_id).await;
+        return Err(e);
+    }
+
+    // Session rotation: any session this browser already held is revoked, never reused.
+    if let Some(old) = headers.get(header::COOKIE).and_then(|h| h.to_str().ok()).and_then(auth::token_from_cookie) {
+        revoke_by_token(&s, old).await;
+    }
+
+    let secure = secure(&s);
+    let mut resp = Json(json!({ "authenticated": true, "email": email })).into_response();
+    let h = resp.headers_mut();
+    h.append(header::SET_COOKIE, auth::set_cookie(&token, secure).parse().unwrap());
+    h.append(header::SET_COOKIE, auth::set_csrf_cookie(&auth::new_token(), secure).parse().unwrap());
+    Ok(resp)
+}
+
+async fn persist_login(
+    s: &AppState, email: &str, account_id: &str, token: &str, session_expiry: &chrono::DateTime<chrono::Utc>, app_secret: &str, cred_id: &str,
+) -> Result<(), ApiError> {
     let now = auth::now();
     let mut tx = s.pool.begin().await?;
     sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(email) DO UPDATE SET updated_at=excluded.updated_at")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(&email).bind(&email).bind(&now).bind(&now)
+        .bind(uuid::Uuid::new_v4().to_string()).bind(email).bind(email).bind(&now).bind(&now)
         .execute(&mut *tx).await?;
     let (user_id, status): (String, String) = sqlx::query_as("SELECT id,status FROM app_users WHERE email=?")
-        .bind(&email).fetch_one(&mut *tx).await?;
+        .bind(email).fetch_one(&mut *tx).await?;
     if status != "active" {
         return Err(ApiError(StatusCode::FORBIDDEN, "account_disabled"));
     }
     sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,created_at,updated_at) VALUES (?,?,?,?,?,?) ON CONFLICT(email_address) DO UPDATE SET mail_server_account_id=excluded.mail_server_account_id, updated_at=excluded.updated_at WHERE user_id=excluded.user_id")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(&user_id).bind(&email).bind(&account_id).bind(&now).bind(&now)
+        .bind(uuid::Uuid::new_v4().to_string()).bind(&user_id).bind(email).bind(account_id).bind(&now).bind(&now)
         .execute(&mut *tx).await?;
-    let token = auth::new_token();
     let session_id = uuid::Uuid::new_v4().to_string();
-    sqlx::query("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at) VALUES (?,?,?,?,?)")
-        .bind(&session_id).bind(&user_id).bind(auth::hash_token(&token)).bind(auth::expiry()).bind(&now)
+    sqlx::query("INSERT INTO auth_sessions (id,user_id,token_hash,expires_at,created_at,mail_credential_sealed,mail_credential_id) VALUES (?,?,?,?,?,?,?)")
+        .bind(&session_id).bind(&user_id).bind(auth::hash_token(token)).bind(session_expiry.to_rfc3339()).bind(&now)
+        .bind(auth::seal(&s.config.session_secret, token, app_secret)).bind(cred_id)
         .execute(&mut *tx).await?;
     tx.commit().await?;
-    s.creds.write().unwrap().insert(session_id, Creds { user: email.clone(), pass: b.password });
 
-    let cookie = auth::set_cookie(&token, s.config.env == "production");
-    Ok(([(header::SET_COOKIE, cookie)], Json(json!({ "authenticated": true, "email": email }))).into_response())
+    Ok(())
+}
+
+/// Revokes the session behind `token` and its mail app password (best effort).
+async fn revoke_by_token(s: &AppState, token: &str) {
+    let row: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+        "SELECT s.id, u.email, s.mail_credential_sealed, s.mail_credential_id FROM auth_sessions s JOIN app_users u ON u.id=s.user_id WHERE s.token_hash=? AND s.revoked_at IS NULL",
+    ).bind(auth::hash_token(token)).fetch_optional(&s.pool).await.unwrap_or(None);
+    let Some((id, email, sealed, cred_id)) = row else { return };
+    let _ = sqlx::query("UPDATE auth_sessions SET revoked_at=?, mail_credential_sealed=NULL WHERE id=?")
+        .bind(auth::now()).bind(&id).execute(&s.pool).await;
+    if let (Some(pass), Some(cred_id)) = (sealed.and_then(|x| auth::open(&s.config.session_secret, token, &x)), cred_id) {
+        if let Err(e) = s.jmap.destroy_app_password(&email, &pass, &cred_id).await {
+            tracing::warn!("app password revoke failed (expires on its own): {e}");
+        }
+    }
 }
 
 async fn require_session(State(s): S, headers: HeaderMap, mut req: Request, next: Next) -> Response {
@@ -160,18 +231,19 @@ async fn require_session(State(s): S, headers: HeaderMap, mut req: Request, next
     let Some(token) = headers.get(header::COOKIE).and_then(|h| h.to_str().ok()).and_then(auth::token_from_cookie) else {
         return unauthorized();
     };
-    let row: Option<(String, String, String)> = match sqlx::query_as(
-        "SELECT s.id, s.user_id, u.email FROM auth_sessions s JOIN app_users u ON u.id=s.user_id
+    let row: Option<(String, String, String, Option<String>)> = match sqlx::query_as(
+        "SELECT s.id, s.user_id, u.email, s.mail_credential_sealed FROM auth_sessions s JOIN app_users u ON u.id=s.user_id
          WHERE s.token_hash=? AND s.revoked_at IS NULL AND s.expires_at>? AND u.status='active'",
     ).bind(auth::hash_token(token)).bind(auth::now()).fetch_optional(&s.pool).await {
         Ok(r) => r,
         Err(e) => return ApiError::from(e).into_response(),
     };
-    let Some((session_id, user_id, email)) = row else { return unauthorized() };
-    let Some(creds) = s.creds.read().unwrap().get(&session_id).cloned() else { return unauthorized() };
+    let Some((session_id, user_id, email, sealed)) = row else { return unauthorized() };
+    let Some(pass) = sealed.and_then(|x| auth::open(&s.config.session_secret, token, &x)) else { return unauthorized() };
+    let creds = Creds { user: email.clone(), pass };
     let _ = sqlx::query("UPDATE auth_sessions SET last_seen_at=? WHERE id=?")
         .bind(auth::now()).bind(&session_id).execute(&s.pool).await;
-    req.extensions_mut().insert(CurrentUser { user_id, session_id, email, creds });
+    req.extensions_mut().insert(CurrentUser { user_id, email, creds });
     next.run(req).await
 }
 
@@ -179,10 +251,10 @@ async fn session(Extension(u): Extension<CurrentUser>) -> Json<serde_json::Value
     Json(json!({ "authenticated": true, "email": u.email }))
 }
 
-async fn logout(State(s): S, Extension(u): Extension<CurrentUser>) -> ApiResult {
-    sqlx::query("UPDATE auth_sessions SET revoked_at=? WHERE id=?")
-        .bind(auth::now()).bind(&u.session_id).execute(&s.pool).await?;
-    s.creds.write().unwrap().remove(&u.session_id);
+async fn logout(State(s): S, headers: HeaderMap) -> ApiResult {
+    if let Some(token) = headers.get(header::COOKIE).and_then(|h| h.to_str().ok()).and_then(auth::token_from_cookie) {
+        revoke_by_token(&s, token).await;
+    }
     Ok(([(header::SET_COOKIE, auth::clear_cookie())], StatusCode::NO_CONTENT).into_response())
 }
 
