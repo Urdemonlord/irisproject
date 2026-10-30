@@ -82,7 +82,18 @@ npm --prefix apps/web ci && npm --prefix apps/web run build   # -> apps/web/dist
 Serve `apps/web/dist` and proxy `/api` and `/auth` to the API on the same origin (CSRF cookie + `SameSite`
 rely on it). Proxy must set `X-Real-IP` (trusted only from loopback).
 
-Use the ready-made Caddy config in [`deploy/caddy/Caddyfile`](deploy/caddy/Caddyfile) (Caddy ≥ 2.8). It proxies
+Production (`mail.meowlabs.id`, behind Cloudflare) runs **nginx**: use [`deploy/nginx/mail.meowlabs.id`](deploy/nginx/mail.meowlabs.id)
+plus the [`iris-headers.conf`](deploy/nginx/iris-headers.conf) snippet (it also needs the host's `snippets/cloudflare-realip.conf`):
+
+```bash
+VITE_SITE_URL=https://mail.meowlabs.id npm --prefix apps/web run build
+rsync -a --delete apps/web/dist/ /srv/iris/dist/
+sudo cp deploy/nginx/iris-headers.conf /etc/nginx/snippets/
+sudo cp deploy/nginx/mail.meowlabs.id /etc/nginx/sites-available/
+sudo nginx -t && sudo systemctl reload nginx
+```
+
+Alternatively, with Caddy, use [`deploy/caddy/Caddyfile`](deploy/caddy/Caddyfile) (Caddy ≥ 2.8). It proxies
 `/api` + `/auth`, serves `dist` with long caching for hashed assets, shows `404.html` for unknown pages and sets
 security headers. Install on the server:
 
@@ -96,7 +107,7 @@ Public site settings (build-time, all optional — defaults in `apps/web/vite.co
 
 | Variable | Default | Used for |
 |---|---|---|
-| `VITE_SITE_URL` | `https://iris.meowlabs.id` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
+| `VITE_SITE_URL` | `https://mail.meowlabs.id` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
 | `VITE_CONTACT_EMAIL` | `admin@meowlabs.id` | footer + Privacy/Terms contact |
 | `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
 | `VITE_ANALYTICS_SRC` / `VITE_ANALYTICS_DOMAIN` | empty (off) | Plausible-compatible script, loaded only after cookie consent. Add its host to your CSP if you set one. |
@@ -109,7 +120,7 @@ Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.
 cargo test --workspace
 npm --prefix apps/web run build
 python3 scripts/license_audit.py                       # no GPL/LGPL/AGPL/SSPL deps
-IRIS_URL=https://iris.meowlabs.id IRIS_USER=... IRIS_PASS=... \
+IRIS_URL=https://mail.meowlabs.id IRIS_USER=... IRIS_PASS=... \
   SMTP_HOST=mx-iris.meowlabs.id python3 scripts/security_smoke.py   # CSRF, rotation, creds, 25 MiB limit
 ```
 

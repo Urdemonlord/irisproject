@@ -1,8 +1,8 @@
-# IRIS — public reverse proxy (Caddy v2).
+# IRIS — public reverse proxy (Caddy v2). Alternative to deploy/nginx (production currently uses nginx).
 # Install: copy to /etc/caddy/Caddyfile, then `caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy`.
 # Web build goes to /srv/iris/dist (npm --prefix apps/web run build), API listens on 127.0.0.1:8000.
 
-iris.meowlabs.id {
+mail.meowlabs.id {
 	encode zstd gzip
 
 	# API + auth -> iris-api (same origin, needed for CSRF cookie + SameSite).
