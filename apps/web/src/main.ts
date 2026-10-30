@@ -1,7 +1,7 @@
 import { footerLinks, initSite, setPage } from './site'
 
-type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean }
-type Detail = Summary & { text_body: string | null; html_body: string | null }
+type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean }
+type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[] }
 type TempInbox = { id: string; address: string; access_token: string; expires_at: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
@@ -262,33 +262,40 @@ function prefetchMessage(url: string, init?: RequestInit) {
 
 // Last message list per account, per tab (sessionStorage is cleared when the tab closes).
 const LIST_KEY = 'iris_list_cache'
-function readListCache(email: string, mb?: string): Summary[] | null {
-  try { const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null'); return c && c.email === email && c.mb === mb ? c.messages : null } catch { return null }
+function readListCache(email: string, mb: string, folder: string): Summary[] | null {
+  try { const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null'); return c && c.email === email && c.mb === mb ? c.folders?.[folder] ?? null : null } catch { return null }
 }
-function writeListCache(email: string, mb: string, messages: Summary[]) {
-  try { sessionStorage.setItem(LIST_KEY, JSON.stringify({ email, mb, messages })) } catch { /* storage full or blocked */ }
+function writeListCache(email: string, mb: string, folder: string, messages: Summary[]) {
+  try {
+    const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null')
+    const folders = c && c.email === email && c.mb === mb ? c.folders ?? {} : {}
+    folders[folder] = messages
+    sessionStorage.setItem(LIST_KEY, JSON.stringify({ email, mb, folders }))
+  } catch { /* storage full or blocked */ }
 }
 function clearMailCache() { messageCache.clear(); try { sessionStorage.removeItem(LIST_KEY) } catch { /* ignore */ } }
 
-async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void, position: string) {
+async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void, position: string, toolbar?: (d: Detail) => HTMLElement) {
   if (!messageCache.has(url)) reader.replaceChildren(readerSkeleton())
   try {
     const { message: m } = await prefetchMessage(url, init)
     const initial = (senderName(m.from).replace(/[^\p{L}\p{N}]/gu, '')[0] ?? '?').toUpperCase()
     reader.replaceChildren(
+      ...(toolbar ? [toolbar(m)] : []),
       h('p', { className: 'reader-pos' }, position),
       h('h1', { className: 'reader-subject' }, m.subject || '(no subject)'),
       h('div', { className: 'reader-head' }, h('span', { className: 'avatar', 'aria-hidden': 'true' }, initial),
         h('dl', { className: 'reader-meta' },
           h('dt', {}, 'From'), h('dd', { className: 'reader-from' }, m.from),
-          h('dt', {}, 'To'), h('dd', {}, m.to.join(', ')),
+          h('dt', {}, 'To'), h('dd', {}, m.to.join(', ') || '—'),
+          ...(m.cc?.length ? [h('dt', {}, 'Cc'), h('dd', {}, m.cc.join(', '))] : []),
           h('dt', {}, 'Date'), h('dd', {}, h('time', { dateTime: m.received_at }, fmtDate(m.received_at))))),
       ...messageBody(m))
     reader.focus({ preventScroll: true })
   } catch (err) {
     if ([401, 410].includes((err as HttpError).status)) return onAuthFail()
     messageCache.delete(url)
-    reader.replaceChildren(errorState('Could not open this message.', () => openMessageAt(url, reader, init, onAuthFail, position)))
+    reader.replaceChildren(errorState('Could not open this message.', () => openMessageAt(url, reader, init, onAuthFail, position, toolbar)))
   }
 }
 
@@ -306,18 +313,21 @@ function mailShell(o: { topbar: HTMLElement; nav: HTMLElement[]; listTop: HTMLEl
   back.onclick = () => { layout.dataset.view = 'list'; list.querySelector<HTMLElement>('[aria-current="true"]')?.focus() }
   app.className = 'app-shell'
   app.replaceChildren(o.topbar, h('main', { className: 'app-main' }, layout))
-  return { list, readerBody, show: () => { layout.dataset.view = 'reader'; reader.scrollTop = 0 } }
+  return { list, readerBody, show: () => { layout.dataset.view = 'reader'; reader.scrollTop = 0 }, hide: (idle: HTMLElement) => { layout.dataset.view = 'list'; readerBody.replaceChildren(idle) } }
 }
 
 /** Render message rows. Rows are buttons; an optional OTP copy button sits beside each row (never nested). */
-function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; onOpen: (m: Summary, index: number) => void; onIntent?: (m: Summary) => void }) {
+function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void }) {
   if (!messages.length) return list.replaceChildren(o.empty)
   const prevList = list.querySelector('.message-list')
   const seen = new Set([...list.querySelectorAll<HTMLElement>('.msg-item')].map((li) => li.dataset.id))
   list.replaceChildren(h('ul', { className: `message-list${prevList ? '' : ' stagger'}`, ariaLabel: 'Messages' }, ...messages.map((m, i) => {
     const mark = m.is_read ? [] : [h('span', { className: 'iris-mark', title: 'Unread' }, h('span', { className: 'sr-only' }, 'Unread: '))]
     const row = h('button', { type: 'button', className: `msg${m.is_read ? '' : ' unread'}${o.compact ? ' compact' : ''}` },
-      h('span', { className: 'msg-from' }, ...mark, h('span', { className: 'msg-from-name' }, senderName(m.from))),
+      h('span', { className: 'msg-from' }, ...mark,
+        ...(m.is_draft ? [h('span', { className: 'draft-tag' }, 'Draft')] : []),
+        h('span', { className: 'msg-from-name' }, o.showTo ? (m.to.length ? `To: ${m.to.map(senderName).join(', ')}` : '(no recipients)') : senderName(m.from)),
+        ...(m.has_attachment ? [icon('clip', 'icon icon-sm msg-clip')] : [])),
       h('time', { className: 'msg-date', dateTime: m.received_at, title: fmtDate(m.received_at) }, fmtShort(m.received_at)),
       h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
       ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []))
@@ -328,8 +338,9 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
       row.setAttribute('aria-current', 'true')
       row.classList.remove('unread')
       row.querySelector('.iris-mark')?.remove()
+      const wasUnread = !m.is_read
       m.is_read = true
-      o.onOpen(m, i)
+      o.onOpen(m, i, wasUnread)
     }
     const li = h('li', { className: `msg-item${prevList && !seen.has(m.id) ? ' is-new' : ''}` }, row)
     li.dataset.id = m.id
@@ -360,62 +371,393 @@ function searchBox(onSearch: (q: string) => void) {
 const matches = (m: Summary, q: string) => !q || `${m.from} ${m.subject} ${m.preview}`.toLowerCase().includes(q)
 
 // ---------- Mailbox ----------
-async function renderMailbox() {
-  const [session, { mailboxes }] = await Promise.all([
-    api<{ email: string }>('/api/v1/session'),
-    api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
-  ])
-  const mb = mailboxes[0]?.id
-  const cached = readListCache(session.email, mb)
-  setPage({ title: 'Inbox', description: 'Your IRIS inbox.', path: '/', noindex: true })
+type FolderRole = 'inbox' | 'sent' | 'drafts' | 'archive' | 'trash'
+type FolderInfo = { id: string; role: FolderRole; name: string; total: number; unread: number }
+const FOLDERS: { role: FolderRole; label: string; icon: string; empty: [string, string] }[] = [
+  { role: 'inbox', label: 'Inbox', icon: 'inbox', empty: ['Your inbox is clear', 'New mail for this address will appear here.'] },
+  { role: 'sent', label: 'Sent', icon: 'send', empty: ['Nothing sent yet', 'Messages you send appear here.'] },
+  { role: 'drafts', label: 'Drafts', icon: 'draft', empty: ['No drafts', 'Messages you start but don’t send are saved here.'] },
+  { role: 'archive', label: 'Archive', icon: 'archive', empty: ['Archive is empty', 'Archive mail to clear your inbox without deleting it.'] },
+  { role: 'trash', label: 'Trash', icon: 'trash', empty: ['Trash is empty', 'Deleted messages stay here until you delete them forever.'] },
+]
+const folderHash = (r: FolderRole) => (r === 'inbox' ? '#/' : `#/${r}`)
+const folderMeta = (r: FolderRole) => FOLDERS.find((f) => f.role === r)!
 
-  let all: Summary[] = cached ?? []
+/** Signed-in account, kept while switching folders so each switch skips two requests. */
+let account: { email: string; mb: string } | null = null
+
+const sendErrors: Record<string, string> = {
+  external_sending_disabled: 'IRIS can only send to @meowlabs.id addresses for now. Sending to other domains isn’t set up yet.',
+  too_many_sends: 'You’ve reached the sending limit (100 per hour). Try again later.',
+  invalid_recipient: 'One of the addresses isn’t valid.',
+  no_recipients: 'Add at least one recipient.',
+  too_many_recipients: 'Too many recipients (50 max).',
+  send_rejected: 'The mail server refused this message.',
+  network: errorText.network,
+}
+
+// ----- toast + confirm -----
+function toast(text: string, action?: { label: string; run: () => void }) {
+  document.querySelector('.toast')?.remove()
+  const t = h('div', { className: 'toast', role: 'status' }, h('span', {}, text))
+  if (action) t.append(h('button', { type: 'button', className: 'toast-action', onclick: () => { t.remove(); action.run() } }, action.label))
+  document.body.append(t)
+  setTimeout(() => t.remove(), action ? 7000 : 4000)
+}
+
+function confirmDialog(title: string, text: string, confirmLabel: string): Promise<boolean> {
+  return new Promise((resolve) => {
+    const ok = h('button', { type: 'button', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, confirmLabel))
+    const cancel = h('button', { type: 'button', className: 'btn btn-secondary' }, h('span', { className: 'btn-label' }, 'Cancel'))
+    const d = h('dialog', { className: 'confirm' }, h('h2', {}, title), h('p', { className: 'muted' }, text), h('div', { className: 'confirm-actions' }, cancel, ok)) as HTMLDialogElement
+    const done = (v: boolean) => { d.close(); d.remove(); resolve(v) }
+    ok.onclick = () => done(true)
+    cancel.onclick = () => done(false)
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(false) })
+    document.body.append(d)
+    d.showModal()
+    cancel.focus()
+  })
+}
+
+// ----- composer -----
+type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string }
+const emailOf = (a: string) => (a.match(/<([^>]+)>/)?.[1] ?? a).trim().toLowerCase()
+const ADDRESS = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]+$/
+const splitAddrs = (v: string) => v.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean)
+const uniq = (xs: string[]) => [...new Set(xs)]
+
+function htmlToText(html: string) {
+  // Parsing into an inert document never runs scripts; only text is read back.
+  const doc = new DOMParser().parseFromString(html, 'text/html')
+  doc.querySelectorAll('br').forEach((b) => b.replaceWith('\n'))
+  doc.querySelectorAll('p, div, li, tr, h1, h2, h3').forEach((b) => b.append('\n'))
+  return (doc.body.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim()
+}
+const plainBody = (d: Detail) => (d.text_body ?? htmlToText(d.html_body ?? '')).trim()
+
+function replyDraft(d: Detail, kind: 'reply' | 'all' | 'forward', me: string): ComposeDraft {
+  const subject = d.subject || ''
+  if (kind === 'forward') {
+    return {
+      title: 'Forward', subject: /^fwd?:/i.test(subject) ? subject : `Fwd: ${subject}`,
+      text: `\n\n---------- Forwarded message ----------\nFrom: ${d.from}\nDate: ${fmtDate(d.received_at)}\nSubject: ${subject}\nTo: ${d.to.join(', ')}\n\n${plainBody(d)}`,
+    }
+  }
+  const fromMe = emailOf(d.from) === me
+  let to = fromMe ? d.to.map(emailOf) : [emailOf(d.from)]
+  let cc: string[] = []
+  if (kind === 'all') {
+    to = uniq([...to, ...d.to.map(emailOf)]).filter((a) => a !== me)
+    cc = uniq((d.cc ?? []).map(emailOf)).filter((a) => a !== me && !to.includes(a))
+  }
+  const quoted = plainBody(d).split('\n').map((l) => `> ${l}`).join('\n')
+  return {
+    title: kind === 'all' ? 'Reply all' : 'Reply', to, cc,
+    subject: /^re:/i.test(subject) ? subject : `Re: ${subject}`,
+    text: `\n\nOn ${fmtDate(d.received_at)}, ${d.from} wrote:\n${quoted}`,
+    inReplyTo: d.message_id, references: [...(d.references ?? []), ...(d.message_id ? [d.message_id] : [])],
+  }
+}
+
+let closeComposer: (() => Promise<void>) | null = null
+
+async function openComposer(base: string, d: ComposeDraft, onChange: () => void) {
+  if (closeComposer) await closeComposer()
+  let draftId = d.draftId
+  let dirty = false
+  let saving: Promise<void> | null = null
+  let timer = 0
+  let closed = false
+
+  const input = (id: string, label: string, value: string, type = 'text') => {
+    const el = h('input', { id, type, value, autocomplete: type === 'email' ? 'email' : 'off', spellcheck: type !== 'email' }) as HTMLInputElement
+    if (type === 'email') { el.type = 'text'; el.inputMode = 'email'; el.setAttribute('autocapitalize', 'off') }
+    const err = h('p', { className: 'field-error', id: `${id}-error` })
+    el.setAttribute('aria-describedby', err.id)
+    const row = h('div', { className: 'compose-row' }, h('label', { htmlFor: id }, label), el)
+    return { el, row, err, set: (m: string) => { err.textContent = m; m ? el.setAttribute('aria-invalid', 'true') : el.removeAttribute('aria-invalid') } }
+  }
+  const to = input('c-to', 'To', (d.to ?? []).join(', '), 'email')
+  const cc = input('c-cc', 'Cc', (d.cc ?? []).join(', '), 'email')
+  const bcc = input('c-bcc', 'Bcc', (d.bcc ?? []).join(', '), 'email')
+  const subject = input('c-subject', 'Subject', d.subject ?? '')
+  const body = h('textarea', { className: 'compose-body', ariaLabel: 'Message', value: d.text ?? '', placeholder: 'Write your message…' }) as HTMLTextAreaElement
+  const showCc = !!(d.cc?.length || d.bcc?.length)
+  cc.row.hidden = bcc.row.hidden = !showCc
+  const ccToggle = h('button', { type: 'button', className: 'linklike cc-toggle', hidden: showCc }, 'Cc / Bcc')
+  ccToggle.onclick = () => { cc.row.hidden = bcc.row.hidden = false; ccToggle.hidden = true; cc.el.focus() }
+  to.row.append(ccToggle)
+
+  const status = h('span', { className: 'compose-status', 'aria-live': 'polite' })
+  const error = h('div', { className: 'form-error', role: 'alert' })
+  const send = h('button', { type: 'button', className: 'btn btn-primary' }, icon('send'), h('span', { className: 'btn-label' }, 'Send')) as HTMLButtonElement
+  const discard = btn('btn btn-ghost btn-icon-sm', 'Discard draft', 'trash')
+  const closeBtn = btn('btn btn-ghost btn-icon-sm', 'Close (saves draft)', 'close')
+  const panel = h('section', { className: 'composer', role: 'dialog', ariaLabel: d.title ?? 'New message' },
+    h('header', { className: 'composer-head' }, h('h2', {}, d.title ?? 'New message'), status, closeBtn),
+    h('div', { className: 'composer-fields' }, to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
+    body,
+    error,
+    h('footer', { className: 'composer-foot' }, send, h('span', { className: 'compose-hint' }, 'Ctrl + Enter to send'), discard))
+
+  const payload = () => ({
+    to: splitAddrs(to.el.value), cc: splitAddrs(cc.el.value), bcc: splitAddrs(bcc.el.value),
+    subject: subject.el.value.replace(/[\r\n]+/g, ' '), text: body.value,
+    in_reply_to: d.inReplyTo ?? null, references: d.references ?? [], draft_id: draftId ?? null,
+  })
+  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim()
+
+  const save = async () => {
+    clearTimeout(timer)
+    if (saving) await saving
+    if (!dirty || closed && isEmpty()) return
+    // Drafts may hold half-typed addresses; keep only valid ones so the save never fails.
+    const p = payload()
+    for (const k of ['to', 'cc', 'bcc'] as const) p[k] = p[k].filter((a) => ADDRESS.test(a))
+    dirty = false
+    status.textContent = 'Saving…'
+    saving = api<{ id: string }>(`${base}/drafts`, { method: 'POST', body: JSON.stringify(p) })
+      .then((r) => { draftId = r.id; status.textContent = `Saved ${fmtTime(new Date())}`; onChange() })
+      .catch(() => { dirty = true; status.textContent = 'Not saved' })
+      .finally(() => { saving = null })
+    await saving
+  }
+  const changed = () => { dirty = true; status.textContent = ''; clearTimeout(timer); timer = window.setTimeout(save, 2500) }
+  ;[to.el, cc.el, bcc.el, subject.el, body].forEach((el) => el.addEventListener('input', changed))
+  ;[to, cc, bcc].forEach((f) => f.el.addEventListener('input', () => f.set('')))
+
+  const close = async () => {
+    if (closed) return
+    closed = true
+    closeComposer = null
+    document.removeEventListener('keydown', onKey)
+    panel.classList.add('is-closing')
+    if (dirty && !isEmpty()) { await save(); toast('Draft saved') }
+    setTimeout(() => panel.remove(), 160)
+  }
+  closeComposer = close
+  closeBtn.onclick = () => close()
+
+  discard.onclick = async () => {
+    clearTimeout(timer)
+    if (saving) await saving
+    const id = draftId
+    closed = true; closeComposer = null
+    document.removeEventListener('keydown', onKey)
+    panel.remove()
+    if (id) { await api(`${base}/messages/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {}); onChange() }
+    toast('Draft discarded')
+  }
+
+  send.onclick = async () => {
+    error.replaceChildren()
+    const p = payload()
+    let bad = false
+    for (const [f, list] of [[to, p.to], [cc, p.cc], [bcc, p.bcc]] as const) {
+      const wrong = list.find((a) => !ADDRESS.test(a))
+      f.set(wrong ? `“${wrong}” isn’t a valid email address.` : '')
+      bad ||= !!wrong
+    }
+    if (!bad && !p.to.length && !p.cc.length && !p.bcc.length) { to.set('Add at least one recipient.'); bad = true }
+    if (bad) { panel.querySelector<HTMLInputElement>('[aria-invalid="true"]')?.focus(); return }
+    clearTimeout(timer)
+    if (saving) await saving
+    const restore = busy(send, 'Sending…')
+    try {
+      await api(`${base}/send`, { method: 'POST', body: JSON.stringify({ ...p, draft_id: draftId ?? null }) })
+      closed = true; closeComposer = null
+      document.removeEventListener('keydown', onKey)
+      panel.classList.add('is-closing')
+      setTimeout(() => panel.remove(), 160)
+      toast('Message sent')
+      onChange()
+    } catch (err) {
+      restore()
+      const code = (err as HttpError).code
+      error.replaceChildren(icon('alert'), h('span', {}, sendErrors[code] ?? 'Could not send. Your draft is kept.'))
+      if ((err as HttpError).status === 401) { account = null; renderLogin() }
+    }
+  }
+
+  const onKey = (e: KeyboardEvent) => {
+    if (e.key === 'Escape' && !document.querySelector('dialog[open]')) { e.preventDefault(); close() }
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) { e.preventDefault(); send.click() }
+  }
+  document.addEventListener('keydown', onKey)
+  document.body.append(panel)
+  ;(d.to?.length ? (d.subject ? body : subject.el) : to.el).focus()
+  if (d.to?.length && d.subject) body.setSelectionRange(0, 0)
+}
+
+// ----- mailbox view -----
+async function renderMailbox(folder: FolderRole = 'inbox') {
+  if (!account) {
+    const [session, { mailboxes }] = await Promise.all([
+      api<{ email: string }>('/api/v1/session'),
+      api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
+    ])
+    account = { email: session.email, mb: mailboxes[0]?.id ?? '' }
+  }
+  const { email, mb } = account
+  const meta = folderMeta(folder)
+  const base = `/api/v1/mailboxes/${mb}`
+  setPage({ title: meta.label, description: `Your IRIS ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
+
+  let all: Summary[] = (mb && readListCache(email, mb, folder)) || []
   let query = ''
   let current = ''
 
+  const signOut = () => { clearMailCache(); account = null; closeComposer?.() }
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
-  logout.onclick = async () => { busy(logout, ''); clearMailCache(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
+  logout.onclick = async () => { busy(logout, ''); signOut(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
   const refresh = btn('btn btn-ghost btn-icon-sm', 'Refresh', 'refresh')
   const synced = h('span', { className: 'synced', 'aria-live': 'polite' })
-  const unreadChip = h('span', { className: 'pane-chip' })
-  const navCount = h('span', { className: 'nav-count' })
+  const unreadChip = h('span', { className: 'pane-chip', hidden: true })
+  const counts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'nav-count' })]))
+  const tabCounts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'tab-count' })]))
+
+  const compose = (d: ComposeDraft = {}) => { if (mb) openComposer(base, d, onMutate) }
+  const composeBtn = btn('btn btn-primary compose-btn', 'Compose', 'pen', { onclick: () => compose() })
+  const fab = btn('btn btn-primary fab', 'Compose', 'pen', { onclick: () => compose() })
 
   const topbar = h('header', { className: 'topbar' },
     brand(location.hostname),
     searchBox((q) => { query = q; draw() }),
     h('div', { className: 'topbar-right' }, synced,
-      h('span', { className: 'account-chip', title: session.email }, icon('account'), h('span', { className: 'account-email' }, session.email)),
+      h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email)),
       logout))
 
+  const folderTabs = h('nav', { className: 'folder-tabs', ariaLabel: 'Folders' }, ...FOLDERS.map((f) =>
+    h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)))
+
+  const idle = () => emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.')
   const ui = mailShell({
     topbar,
     nav: [
+      composeBtn,
       navSection('Mailbox'),
-      navItem('#/', 'inbox', 'Inbox', true, navCount),
+      ...FOLDERS.map((f) => {
+        const a = navItem(folderHash(f.role), f.icon, f.label, f.role === folder, counts.get(f.role))
+        a.classList.add('nav-folder')
+        return a
+      }),
+      h('a', { href: folderHash(folder), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
       navItem('#/temp', 'timer', 'Temporary inbox'),
       footerLinks('sidebar-footer'),
     ],
-    listTop: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, 'Inbox'), unreadChip, refresh)],
-    idle: emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.'),
+    listTop: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, meta.label), unreadChip, refresh), folderTabs],
+    listBottom: fab,
+    idle: idle(),
   })
+
+  const url = (id: string) => `${base}/messages/${encodeURIComponent(id)}`
+
+  const loadFolders = async () => {
+    if (!mb) return
+    try {
+      const { folders } = await api<{ folders: FolderInfo[] }>(`${base}/folders`)
+      for (const f of folders) {
+        const n = f.role === 'inbox' ? f.unread : f.role === 'drafts' ? f.total : 0
+        counts.get(f.role)!.textContent = n ? String(n) : ''
+        tabCounts.get(f.role)!.textContent = n ? String(n) : ''
+      }
+    } catch { /* counts are optional */ }
+  }
+
+  const removeLocal = (id: string) => {
+    all = all.filter((m) => m.id !== id)
+    writeListCache(email, mb, folder, all)
+    if (current === id) { current = ''; ui.hide(idle()) }
+    draw()
+  }
+
+  const move = async (m: Summary, target: FolderRole) => {
+    removeLocal(m.id)
+    try {
+      await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder: target }) })
+      toast(target === 'trash' ? 'Moved to Trash' : `Moved to ${folderMeta(target).label}`, {
+        label: 'Undo',
+        run: async () => {
+          await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder }) }).catch(() => toast('Could not undo.'))
+          load(); loadFolders()
+        },
+      })
+      loadFolders()
+    } catch {
+      toast('Could not move the message.'); load()
+    }
+  }
+
+  const deleteForever = async (m: Summary) => {
+    if (!(await confirmDialog('Delete forever?', 'This message will be permanently deleted. This can’t be undone.', 'Delete forever'))) return
+    removeLocal(m.id)
+    try { await api(url(m.id), { method: 'DELETE' }); messageCache.delete(url(m.id)); toast('Message deleted forever'); loadFolders() }
+    catch { toast('Could not delete the message.'); load() }
+  }
+
+  const markUnread = async (m: Summary) => {
+    m.is_read = false
+    current = ''
+    ui.hide(idle())
+    draw()
+    await api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: false }) }).catch(() => {})
+    loadFolders()
+  }
+
+  const toolbar = (m: Summary) => (d: Detail) => {
+    const b = (label: string, ic: string, run: () => void, cls = 'btn btn-secondary btn-sm') => btn(cls, label, ic, { onclick: run })
+    const many = d.to.length + (d.cc?.length ?? 0) > 1
+    const actions: HTMLElement[] = []
+    if (folder !== 'trash') {
+      actions.push(b('Reply', 'reply', () => compose(replyDraft(d, 'reply', email))))
+      if (many) actions.push(b('Reply all', 'reply', () => compose(replyDraft(d, 'all', email))))
+      actions.push(b('Forward', 'forward', () => compose(replyDraft(d, 'forward', email))))
+    }
+    const icons: HTMLElement[] = []
+    const ib = (label: string, ic: string, run: () => void) => btn('btn btn-ghost btn-icon-sm', label, ic, { onclick: run })
+    if (folder === 'inbox') icons.push(ib('Archive', 'archive', () => move(m, 'archive')))
+    if (folder === 'archive') icons.push(ib('Move to Inbox', 'inbox', () => move(m, 'inbox')))
+    if (folder === 'trash') {
+      actions.push(b('Restore to Inbox', 'inbox', () => move(m, 'inbox')))
+      actions.push(b('Delete forever', 'trash', () => deleteForever(m), 'btn btn-danger btn-sm'))
+    } else {
+      icons.push(ib('Delete', 'trash', () => move(m, 'trash')))
+    }
+    if (folder === 'inbox' || folder === 'archive') icons.push(ib('Mark as unread', 'mail', () => markUnread(m)))
+    return h('div', { className: 'reader-toolbar' }, h('div', { className: 'reader-actions' }, ...actions), h('div', { className: 'reader-icons' }, ...icons))
+  }
+
+  const openDraft = async (m: Summary) => {
+    try {
+      const { message: d } = await api<{ message: Detail }>(url(m.id))
+      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '' })
+    } catch { toast('Could not open the draft.') }
+  }
 
   const draw = () => {
     const shown = all.filter((m) => matches(m, query))
     const unread = all.filter((m) => !m.is_read).length
     unreadChip.textContent = `${unread} unread`
-    unreadChip.hidden = !unread
-    navCount.textContent = unread ? String(unread) : ''
+    unreadChip.hidden = folder !== 'inbox' || !unread
+    const [title, text] = meta.empty
     fillList(ui.list, shown, {
       current,
-      empty: query ? emptyState('search', 'No matches', `Nothing in this list matches “${query}”.`) : emptyState('inbox', 'Your inbox is clear', 'New mail for this address will appear here.'),
-      onOpen: (m, i) => {
+      showTo: folder === 'sent' || folder === 'drafts',
+      empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, title, text),
+      onOpen: (m, i, wasUnread) => {
+        if (folder === 'drafts') return void openDraft(m)
+        if (wasUnread) {
+          writeListCache(email, mb, folder, all)
+          api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
+        }
         current = m.id
         draw()
         ui.show()
-        openMessageAt(`/api/v1/mailboxes/${mb}/messages/${encodeURIComponent(m.id)}`, ui.readerBody, undefined, renderLogin, `${i + 1} of ${shown.length}`)
+        openMessageAt(url(m.id), ui.readerBody, undefined, () => { account = null; renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m))
       },
-      onIntent: (m) => prefetchMessage(`/api/v1/mailboxes/${mb}/messages/${encodeURIComponent(m.id)}`),
+      onIntent: folder === 'drafts' ? undefined : (m) => prefetchMessage(url(m.id)),
     })
   }
 
@@ -425,20 +767,29 @@ async function renderMailbox() {
     const restore = busy(refresh, '')
     refresh.classList.add('is-spinning')
     try {
-      const fresh = (await api<{ messages: Summary[] }>(`/api/v1/mailboxes/${mb}/messages?limit=50`)).messages
-      // keep read state set locally while the request was in flight
+      const fresh = (await api<{ messages: Summary[] }>(`${base}/messages?folder=${folder}&limit=50`)).messages
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
       all = fresh.map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) }))
-      writeListCache(session.email, mb, all)
+      writeListCache(email, mb, folder, all)
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
     } catch (err) {
-      if ((err as HttpError).status === 401) { clearMailCache(); return renderLogin() }
+      if ((err as HttpError).status === 401) { signOut(); return renderLogin() }
       if (all.length) { synced.textContent = 'Offline · showing saved list'; return }
       ui.list.replaceChildren(errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.', load))
     } finally { restore(); refresh.classList.remove('is-spinning') }
   }
-  refresh.onclick = load
+  // After sending or saving: refresh counts, and the list if it's the folder that changed.
+  function onMutate() {
+    loadFolders()
+    if (folder === 'drafts' || folder === 'sent') load()
+    if (folder === 'inbox') setTimeout(load, 1500) // a message sent to yourself arrives shortly
+  }
+
+  refresh.onclick = () => { load(); loadFolders() }
+  loadFolders()
+  // New mail shows up on its own while the tab is visible.
+  tempTimers.push(window.setInterval(() => { if (!document.hidden) { load(); loadFolders() } }, 30_000))
   if (all.length) { draw(); load() } else await load()
 }
 
@@ -631,9 +982,10 @@ function route() {
     return saved ? renderTempInbox(saved) : renderTempStart()
   }
   if (r === '/signed-out') return renderSignedOut()
-  if (r !== '/') return renderNotFound()
-  renderMailbox().catch((err) => {
-    if ((err as HttpError).status === 401) return renderLogin()
+  const folder = r === '/' ? 'inbox' : FOLDERS.find((f) => `/${f.role}` === r)?.role
+  if (!folder) return renderNotFound()
+  renderMailbox(folder).catch((err) => {
+    if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     setPage({ title: 'Unavailable', description: 'IRIS is temporarily unavailable.', noindex: true })
     simplePage('auth-main', h('section', { className: 'auth-card center' },
       h('h1', {}, 'IRIS is unavailable.'),

@@ -14,6 +14,9 @@ pub enum MailError {
     NotFound,
     #[error("unexpected response: {0}")]
     Protocol(String),
+    /// The mail server refused to send (e.g. recipient rejected).
+    #[error("rejected: {0}")]
+    Rejected(String),
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -25,6 +28,8 @@ pub struct MessageSummary {
     pub preview: String,
     pub received_at: String,
     pub is_read: bool,
+    pub is_draft: bool,
+    pub has_attachment: bool,
     pub size_bytes: u64,
 }
 
@@ -34,6 +39,38 @@ pub struct MessageDetail {
     pub summary: MessageSummary,
     pub text_body: Option<String>,
     pub html_body: Option<String>,
+    pub cc: Vec<String>,
+    /// Message-ID header (without angle brackets), for threading replies.
+    pub message_id: Option<String>,
+    pub references: Vec<String>,
+}
+
+/// A folder (JMAP mailbox) with its standard role.
+#[derive(Debug, Clone, Serialize)]
+pub struct Folder {
+    pub id: String,
+    pub role: String,
+    pub name: String,
+    pub total: u64,
+    pub unread: u64,
+}
+
+/// Standard folders IRIS shows, in display order, with the name used when one is missing.
+pub const FOLDER_ROLES: [(&str, &str); 5] = [
+    ("inbox", "Inbox"), ("sent", "Sent"), ("drafts", "Drafts"), ("archive", "Archive"), ("trash", "Trash"),
+];
+
+/// An outgoing message or draft. `from` is always the signed-in user.
+#[derive(Debug, Clone, Default)]
+pub struct Compose {
+    pub from: String,
+    pub to: Vec<String>,
+    pub cc: Vec<String>,
+    pub bcc: Vec<String>,
+    pub subject: String,
+    pub text: String,
+    pub in_reply_to: Option<String>,
+    pub references: Vec<String>,
 }
 
 #[derive(Clone)]
@@ -44,7 +81,8 @@ pub struct JmapClient {
 
 const USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
 const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
-const SUMMARY_PROPS: [&str; 7] = ["from", "to", "subject", "preview", "receivedAt", "keywords", "size"];
+const USING_SUBMIT: [&str; 3] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail", "urn:ietf:params:jmap:submission"];
+const SUMMARY_PROPS: [&str; 8] = ["from", "to", "subject", "preview", "receivedAt", "keywords", "size", "hasAttachment"];
 
 impl JmapClient {
     pub fn new(base_url: String) -> Self {
@@ -158,10 +196,15 @@ impl JmapClient {
     pub async fn list_inbox(
         &self, user: &str, pass: &str, account: &str, limit: u32, position: u32,
     ) -> Result<(Vec<MessageSummary>, u64), MailError> {
-        let mb = self
-            .call(user, pass, json!([["Mailbox/query", {"accountId": account, "filter": {"role": "inbox"}}, "m"]]))
-            .await?;
-        let inbox = mb[0]["ids"][0].as_str().ok_or(MailError::NotFound)?.to_string();
+        self.list_folder(user, pass, account, "inbox", limit, position).await
+    }
+
+    /// Lists a standard folder by role (inbox, sent, drafts, archive, trash), newest first.
+    pub async fn list_folder(
+        &self, user: &str, pass: &str, account: &str, role: &str, limit: u32, position: u32,
+    ) -> Result<(Vec<MessageSummary>, u64), MailError> {
+        let folders = self.folders(user, pass, account).await?;
+        let inbox = folders.iter().find(|f| f.role == role).ok_or(MailError::NotFound)?.id.clone();
         let r = self
             .call(user, pass, json!([
                 ["Email/query", {"accountId": account, "filter": {"inMailbox": inbox},
@@ -198,6 +241,127 @@ impl JmapClient {
         Ok(list.iter().filter(|e| has_rcpt(e, to)).map(summary).collect())
     }
 
+    /// Standard folders with counts. Missing ones (e.g. Archive) are created on first use.
+    pub async fn folders(&self, user: &str, pass: &str, account: &str) -> Result<Vec<Folder>, MailError> {
+        let get = json!([["Mailbox/get", {"accountId": account, "ids": null,
+            "properties": ["name", "role", "totalEmails", "unreadEmails"]}, "m"]]);
+        let mut list = self.call(user, pass, get.clone()).await?[0]["list"].as_array().cloned().unwrap_or_default();
+        let has = |list: &[Value], role: &str| list.iter().any(|m| m["role"] == role);
+        let mut create = serde_json::Map::new();
+        let mut update = serde_json::Map::new();
+        for (role, name) in FOLDER_ROLES {
+            if has(&list, role) { continue }
+            // Reuse a same-named folder without a role instead of creating a duplicate.
+            match list.iter().find(|m| m["role"].is_null() && m["name"].as_str().is_some_and(|n| n.eq_ignore_ascii_case(name))) {
+                Some(m) => { update.insert(m["id"].as_str().unwrap_or_default().to_string(), json!({"role": role})); }
+                None => { create.insert(role.to_string(), json!({"name": name, "role": role})); }
+            }
+        }
+        if !create.is_empty() || !update.is_empty() {
+            let r = self.call(user, pass, json!([["Mailbox/set", {"accountId": account, "create": create, "update": update}, "s"]])).await?;
+            if let Some(err) = r[0]["notCreated"].as_object().filter(|o| !o.is_empty()) {
+                return Err(MailError::Protocol(format!("folders not created: {}", Value::Object(err.clone()))));
+            }
+            list = self.call(user, pass, get).await?[0]["list"].as_array().cloned().unwrap_or_default();
+        }
+        Ok(FOLDER_ROLES.iter().filter_map(|(role, _)| {
+            let m = list.iter().find(|m| m["role"] == *role)?;
+            Some(Folder {
+                id: m["id"].as_str()?.to_string(),
+                role: role.to_string(),
+                name: m["name"].as_str().unwrap_or(role).to_string(),
+                total: m["totalEmails"].as_u64().unwrap_or(0),
+                unread: m["unreadEmails"].as_u64().unwrap_or(0),
+            })
+        }).collect())
+    }
+
+    async fn folder_id(&self, user: &str, pass: &str, account: &str, role: &str) -> Result<String, MailError> {
+        Ok(self.folders(user, pass, account).await?.into_iter().find(|f| f.role == role).ok_or(MailError::NotFound)?.id)
+    }
+
+    /// Roles of the folders a message is currently in.
+    pub async fn message_roles(&self, user: &str, pass: &str, account: &str, id: &str) -> Result<Vec<String>, MailError> {
+        let folders = self.folders(user, pass, account).await?;
+        let r = self.call(user, pass, json!([["Email/get", {"accountId": account, "ids": [id], "properties": ["mailboxIds"]}, "g"]])).await?;
+        let e = r[0]["list"].get(0).ok_or(MailError::NotFound)?;
+        let ids = e["mailboxIds"].as_object().cloned().unwrap_or_default();
+        Ok(folders.into_iter().filter(|f| ids.contains_key(&f.id)).map(|f| f.role).collect())
+    }
+
+    /// Moves a message into exactly one standard folder.
+    pub async fn move_to(&self, user: &str, pass: &str, account: &str, id: &str, role: &str) -> Result<(), MailError> {
+        let target = self.folder_id(user, pass, account, role).await?;
+        let r = self.call(user, pass, json!([["Email/set", {"accountId": account,
+            "update": {id: {"mailboxIds": {target: true}}}}, "u"]])).await?;
+        updated(&r[0], id)
+    }
+
+    pub async fn set_seen(&self, user: &str, pass: &str, account: &str, id: &str, seen: bool) -> Result<(), MailError> {
+        let patch = if seen { json!(true) } else { Value::Null };
+        let r = self.call(user, pass, json!([["Email/set", {"accountId": account,
+            "update": {id: {"keywords/$seen": patch}}}, "u"]])).await?;
+        updated(&r[0], id)
+    }
+
+    /// Permanently deletes one message.
+    pub async fn destroy_one(&self, user: &str, pass: &str, account: &str, id: &str) -> Result<(), MailError> {
+        match self.destroy(user, pass, account, &[id]).await? {
+            0 => Err(MailError::NotFound),
+            _ => Ok(()),
+        }
+    }
+
+    /// Saves a draft (replacing `replace` if given) and returns the new draft id.
+    pub async fn save_draft(&self, user: &str, pass: &str, account: &str, c: &Compose, replace: Option<&str>) -> Result<String, MailError> {
+        let drafts = self.folder_id(user, pass, account, "drafts").await?;
+        let mut set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        if let Some(old) = replace { set["destroy"] = json!([old]); }
+        let r = self.call(user, pass, json!([["Email/set", set, "s"]])).await?;
+        r[0]["created"]["n"]["id"].as_str().map(str::to_string)
+            .ok_or_else(|| MailError::Protocol(format!("draft not saved: {}", r[0]["notCreated"])))
+    }
+
+    /// Sends a message as the signed-in user; it lands in Sent. Deletes `draft` if given.
+    pub async fn send(&self, user: &str, pass: &str, account: &str, c: &Compose, draft: Option<&str>) -> Result<(), MailError> {
+        let folders = self.folders(user, pass, account).await?;
+        let id_of = |role: &str| folders.iter().find(|f| f.role == role).map(|f| f.id.clone()).ok_or(MailError::NotFound);
+        let (drafts, sent) = (id_of("drafts")?, id_of("sent")?);
+        let identity = self.identity(user, pass, account, &c.from).await?;
+        let mut email_set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        if let Some(old) = draft { email_set["destroy"] = json!([old]); }
+        let r = self.call_using(user, pass, &USING_SUBMIT, json!([
+            ["Email/set", email_set, "e"],
+            ["EmailSubmission/set", {"accountId": account,
+                "create": {"s": {"identityId": identity, "emailId": "#n"}},
+                "onSuccessUpdateEmail": {"#s": {
+                    format!("mailboxIds/{drafts}"): null, format!("mailboxIds/{sent}"): true,
+                    "keywords/$draft": null, "keywords/$seen": true}}}, "x"]
+        ])).await?;
+        if r[0]["created"]["n"].is_null() {
+            return Err(MailError::Protocol(format!("message not created: {}", r[0]["notCreated"])));
+        }
+        if r[1]["created"]["s"].is_null() {
+            return Err(MailError::Rejected(r[1]["notCreated"]["s"]["description"].as_str()
+                .or(r[1]["notCreated"]["s"]["type"].as_str()).unwrap_or("submission refused").to_string()));
+        }
+        Ok(())
+    }
+
+    /// The sending identity for `email`, created if the account has none.
+    async fn identity(&self, user: &str, pass: &str, account: &str, email: &str) -> Result<String, MailError> {
+        let r = self.call_using(user, pass, &USING_SUBMIT, json!([["Identity/get", {"accountId": account, "ids": null}, "i"]])).await?;
+        if let Some(id) = r[0]["list"].as_array().into_iter().flatten()
+            .find(|i| i["email"].as_str().is_some_and(|e| e.eq_ignore_ascii_case(email)))
+            .and_then(|i| i["id"].as_str()) {
+            return Ok(id.to_string());
+        }
+        let r = self.call_using(user, pass, &USING_SUBMIT, json!([["Identity/set", {"accountId": account,
+            "create": {"i": {"email": email, "name": ""}}}, "s"]])).await?;
+        r[0]["created"]["i"]["id"].as_str().map(str::to_string)
+            .ok_or_else(|| MailError::Protocol(format!("identity not created: {}", r[0]["notCreated"])))
+    }
+
     /// Like `get_message`, but NotFound unless the To: header contains `to` exactly.
     pub async fn get_message_to(
         &self, user: &str, pass: &str, account: &str, id: &str, to: &str,
@@ -216,7 +380,7 @@ impl JmapClient {
         &self, user: &str, pass: &str, account: &str, id: &str,
     ) -> Result<MessageDetail, MailError> {
         let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
-        props.extend(["textBody", "htmlBody", "bodyValues"]);
+        props.extend(["textBody", "htmlBody", "bodyValues", "cc", "messageId", "references"]);
         let r = self
             .call(user, pass, json!([["Email/get", {"accountId": account, "ids": [id],
                 "properties": props, "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
@@ -237,7 +401,13 @@ impl JmapClient {
             .is_some_and(|p| p.iter().any(|p| p["type"] == "text/html"))
             .then(|| body("htmlBody"))
             .flatten();
-        Ok(MessageDetail { summary: summary(e), text_body: body("textBody"), html_body: html })
+        let strings = |k: &str| e[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+        Ok(MessageDetail {
+            summary: summary(e), text_body: body("textBody"), html_body: html,
+            cc: e["cc"].as_array().map(|a| a.iter().map(addr).collect()).unwrap_or_default(),
+            message_id: strings("messageId").into_iter().next(),
+            references: strings("references"),
+        })
     }
 }
 
@@ -271,6 +441,62 @@ fn summary(e: &Value) -> MessageSummary {
         preview: e["preview"].as_str().unwrap_or_default().to_string(),
         received_at: e["receivedAt"].as_str().unwrap_or_default().to_string(),
         is_read: e["keywords"]["$seen"] == true,
+        is_draft: e["keywords"]["$draft"] == true,
+        has_attachment: e["hasAttachment"] == true,
         size_bytes: e["size"].as_u64().unwrap_or(0),
+    }
+}
+
+fn updated(r: &Value, id: &str) -> Result<(), MailError> {
+    if r["updated"].as_object().is_some_and(|o| o.contains_key(id)) {
+        return Ok(());
+    }
+    match r["notUpdated"][id]["type"].as_str() {
+        Some("notFound") => Err(MailError::NotFound),
+        _ => Err(MailError::Protocol(format!("not updated: {}", r["notUpdated"]))),
+    }
+}
+
+/// JMAP Email/create object for a plain-text message in `mailbox`, flagged as a draft.
+fn email_json(c: &Compose, mailbox: &str) -> Value {
+    let addrs = |v: &[String]| v.iter().map(|e| json!({"email": e})).collect::<Vec<_>>();
+    let mut e = json!({
+        "mailboxIds": {mailbox: true},
+        "keywords": {"$draft": true, "$seen": true},
+        "from": [{"email": c.from}],
+        "to": addrs(&c.to),
+        "subject": c.subject,
+        "bodyValues": {"b": {"value": c.text}},
+        "textBody": [{"partId": "b", "type": "text/plain"}],
+    });
+    if !c.cc.is_empty() { e["cc"] = json!(addrs(&c.cc)); }
+    if !c.bcc.is_empty() { e["bcc"] = json!(addrs(&c.bcc)); }
+    if let Some(r) = &c.in_reply_to { e["inReplyTo"] = json!([r]); }
+    if !c.references.is_empty() { e["references"] = json!(c.references); }
+    e
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn email_json_shapes_a_plain_text_draft() {
+        let c = Compose { from: "a@x.id".into(), to: vec!["b@x.id".into()], subject: "Hi".into(), text: "Body".into(),
+            in_reply_to: Some("m1@x".into()), references: vec!["m0@x".into(), "m1@x".into()], ..Default::default() };
+        let e = email_json(&c, "D");
+        assert_eq!(e["mailboxIds"]["D"], true);
+        assert_eq!(e["keywords"]["$draft"], true);
+        assert_eq!(e["to"][0]["email"], "b@x.id");
+        assert!(e.get("cc").is_none() && e.get("bcc").is_none());
+        assert_eq!(e["bodyValues"]["b"]["value"], "Body");
+        assert_eq!(e["inReplyTo"][0], "m1@x");
+        assert_eq!(e["references"][1], "m1@x");
+    }
+
+    #[test]
+    fn updated_maps_results() {
+        assert!(updated(&json!({"updated": {"x": null}}), "x").is_ok());
+        assert!(matches!(updated(&json!({"notUpdated": {"x": {"type": "notFound"}}}), "x"), Err(MailError::NotFound)));
     }
 }

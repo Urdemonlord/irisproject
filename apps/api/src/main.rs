@@ -15,24 +15,26 @@ use sqlx::SqlitePool;
 use std::sync::Arc;
 
 mod cleanup;
+mod compose;
 mod temp;
 
-struct AppState {
+pub(crate) struct AppState {
     pool: SqlitePool,
     config: Config,
     jmap: JmapClient,
 }
 
 #[derive(Clone)]
-struct Creds { user: String, pass: String }
+pub(crate) struct Creds { pub(crate) user: String, pub(crate) pass: String }
 
 #[derive(Clone)]
-struct CurrentUser { user_id: String, email: String, creds: Creds }
+pub(crate) struct CurrentUser { pub(crate) user_id: String, pub(crate) email: String, pub(crate) creds: Creds }
 
-type S = State<Arc<AppState>>;
-type ApiResult = Result<Response, ApiError>;
+pub(crate) type S = State<Arc<AppState>>;
+pub(crate) type ApiResult = Result<Response, ApiError>;
 
-struct ApiError(StatusCode, &'static str);
+#[derive(Debug)]
+pub(crate) struct ApiError(pub(crate) StatusCode, pub(crate) &'static str);
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         (self.0, Json(json!({ "error": self.1 }))).into_response()
@@ -50,6 +52,7 @@ impl From<MailError> for ApiError {
         match e {
             MailError::Auth => ApiError(StatusCode::UNAUTHORIZED, "unauthorized"),
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
+            MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
             _ => ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable"),
         }
     }
@@ -75,7 +78,12 @@ async fn main() {
         .route("/auth/logout", post(logout))
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
-        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id", get(get_message))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id", get(get_message).delete(compose::delete_message))
+        .route("/api/v1/mailboxes/:mailbox_id/folders", get(compose::folders))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/move", post(compose::move_message))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/seen", post(compose::set_seen))
+        .route("/api/v1/mailboxes/:mailbox_id/drafts", post(compose::save_draft))
+        .route("/api/v1/mailboxes/:mailbox_id/send", post(compose::send))
         .route_layer(middleware::from_fn_with_state(state.clone(), require_session));
 
     let app = Router::new()
@@ -267,24 +275,25 @@ async fn mailboxes(State(s): S, Extension(u): Extension<CurrentUser>) -> ApiResu
 }
 
 /// Ownership check: returns the mail-server account id only if the mailbox belongs to the user.
-async fn owned_account(s: &AppState, u: &CurrentUser, mailbox_id: &str) -> Result<String, ApiError> {
+pub(crate) async fn owned_account(s: &AppState, u: &CurrentUser, mailbox_id: &str) -> Result<String, ApiError> {
     sqlx::query_scalar("SELECT mail_server_account_id FROM permanent_mailboxes WHERE id=? AND user_id=? AND status='active'")
         .bind(mailbox_id).bind(&u.user_id).fetch_optional(&s.pool).await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))
 }
 
 #[derive(Deserialize)]
-struct Page { limit: Option<u32>, position: Option<u32> }
+struct Page { limit: Option<u32>, position: Option<u32>, folder: Option<String> }
 
 async fn list_messages(State(s): S, Extension(u): Extension<CurrentUser>, Path(mailbox_id): Path<String>, Query(p): Query<Page>) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     let limit = p.limit.unwrap_or(50).clamp(1, 100);
     let position = p.position.unwrap_or(0);
-    let (messages, total) = s.jmap.list_inbox(&u.creds.user, &u.creds.pass, &account, limit, position).await?;
+    let folder = compose::folder_role(p.folder.as_deref().unwrap_or("inbox"))?;
+    let (messages, total) = s.jmap.list_folder(&u.creds.user, &u.creds.pass, &account, folder, limit, position).await?;
     Ok(Json(json!({ "messages": messages, "total": total, "position": position })).into_response())
 }
 
-fn valid_message_id(id: &str) -> bool {
+pub(crate) fn valid_message_id(id: &str) -> bool {
     id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
 }
 

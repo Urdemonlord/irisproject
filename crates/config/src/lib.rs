@@ -13,6 +13,10 @@ pub struct Config {
     /// Catch-all sink mailbox for the temp domain (not an admin account).
     pub temp_inbox_mail_user: String,
     pub temp_inbox_mail_password: String,
+    /// Domains IRIS may send to while no outbound relay is configured.
+    pub send_local_domains: Vec<String>,
+    /// Allow sending to any domain (set once the mail server has a working outbound relay).
+    pub send_external: bool,
 }
 
 impl Config {
@@ -39,6 +43,10 @@ impl Config {
                 .unwrap_or(1),
             temp_inbox_mail_user: std::env::var("TEMP_INBOX_MAIL_USER").unwrap_or_default(),
             temp_inbox_mail_password: std::env::var("TEMP_INBOX_MAIL_PASSWORD").unwrap_or_default(),
+            send_local_domains: std::env::var("SEND_LOCAL_DOMAINS")
+                .unwrap_or_else(|_| "meowlabs.id,iris.meowlabs.id,inbox.meowlabs.id".to_string())
+                .split(',').map(|d| d.trim().to_lowercase()).filter(|d| !d.is_empty()).collect(),
+            send_external: std::env::var("SEND_EXTERNAL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
         })
     }
 }
