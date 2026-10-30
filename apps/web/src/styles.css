@@ -487,3 +487,68 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { animation-duration: 0.01ms !important; animation-iteration-count: 1 !important; transition-duration: 0.01ms !important; }
 }
+
+/* ---------- Motion ---------- */
+/* All of this is switched off by the prefers-reduced-motion rule above. */
+@keyframes iris-enter { from { opacity: 0; transform: translateY(10px); } }
+@keyframes iris-fade { from { opacity: 0; } }
+@keyframes iris-word { from { opacity: 0; transform: translateY(0.35em); } }
+@keyframes iris-row-in { from { opacity: 0; transform: translateY(6px); } }
+@keyframes iris-new { 0% { background: var(--iris-vermilion-wash); } 100% { background: transparent; } }
+@keyframes iris-slide-left { from { opacity: 0.4; transform: translateX(-12px); } }
+@keyframes iris-slide-in { from { opacity: 0; transform: translateX(24px); } }
+@keyframes iris-pop { 40% { transform: scale(1.06); } }
+@keyframes iris-blink { 0%, 92%, 100% { transform: scaleY(1); } 95% { transform: scaleY(0.1); } }
+@keyframes iris-tail { 0%, 100% { transform: rotate(0deg); } 50% { transform: rotate(-6deg); } }
+@keyframes iris-peek { 0% { transform: translateY(24px); opacity: 0; } 60% { transform: translateY(-3px); opacity: 1; } 100% { transform: none; } }
+@keyframes iris-bob { 0%, 100% { transform: none; } 50% { transform: translateY(2px); } }
+@keyframes iris-urgent { 50% { opacity: 0.55; } }
+
+/* Page entrances */
+.login-panel, .auth-card, .legal, .temp-card { animation: iris-enter var(--iris-dur-slow) var(--iris-ease) both; }
+.auth-card { animation-delay: 40ms; }
+.pane-head, .temp-list-head, .expiry-rail { animation: iris-fade var(--iris-dur-slow) var(--iris-ease) both; }
+.login-tagline span { display: block; animation: iris-word 520ms var(--iris-ease) both; }
+.login-tagline span:nth-child(2) { animation-delay: 70ms; }
+.login-tagline span:nth-child(3) { animation-delay: 140ms; }
+.login-tagline span:nth-child(4) { animation-delay: 210ms; }
+.route-line { transform-origin: left; animation: iris-fade 900ms var(--iris-ease) both 200ms; }
+
+/* Message list: rows cascade in on first load; new mail slides in and flashes */
+.message-list.stagger .msg-item { animation: iris-row-in 260ms var(--iris-ease) both; animation-delay: calc(var(--i, 0) * 28ms); }
+.msg-item.is-new { animation: iris-slide-left 320ms var(--iris-ease) both, iris-new 1.6s ease-out 320ms; }
+.msg-item.is-new .iris-mark { animation: iris-pop 400ms var(--iris-ease) 2; }
+.msg-item { transition: background-color var(--iris-dur-fast) var(--iris-ease); }
+.msg[aria-current="true"]::before { animation: iris-fade var(--iris-dur-base) var(--iris-ease); }
+
+/* Reader: content fades up when a message opens */
+.reader-body > * { animation: iris-enter 220ms var(--iris-ease) both; }
+.reader-body > :nth-child(2) { animation-delay: 30ms; }
+.reader-body > :nth-child(3) { animation-delay: 60ms; }
+.reader-body > :nth-child(n+4) { animation-delay: 90ms; }
+
+/* Buttons: brutalist lift on hover, pop on success */
+.btn-block, .copy-btn { transition: background-color var(--iris-dur-fast) var(--iris-ease), color var(--iris-dur-fast) var(--iris-ease), transform var(--iris-dur-fast) var(--iris-ease), box-shadow var(--iris-dur-fast) var(--iris-ease); }
+@media (hover: hover) {
+  .btn-block:hover:not(:disabled), .copy-btn:hover:not(:disabled) { transform: translate(-2px, -2px); box-shadow: 3px 3px 0 var(--iris-ink); }
+  .btn-primary.btn-block:hover:not(:disabled), .copy-btn:hover:not(:disabled) { box-shadow: 3px 3px 0 var(--iris-ink); }
+}
+.btn-block:active:not(:disabled), .copy-btn:active:not(:disabled) { transform: translate(0, 0); box-shadow: none; }
+.is-done { animation: iris-pop 320ms var(--iris-ease); }
+.nav-item .icon { transition: transform var(--iris-dur-base) var(--iris-ease); }
+.nav-item:hover .icon { transform: translateY(-1px); }
+
+/* Cat: blinks, sways its tail, peeks over cards */
+.mascot-wrap .cat-eyes { transform-box: fill-box; transform-origin: center; animation: iris-blink 5.5s ease-in-out infinite 1.2s; }
+.mascot-wrap .cat-tail { transform-box: fill-box; transform-origin: 0% 100%; animation: iris-tail 3.2s ease-in-out infinite; }
+.cat-peek .mascot { animation: iris-peek 600ms var(--iris-ease) both 250ms, iris-bob 4s ease-in-out infinite 900ms; }
+
+/* Countdown under 10 minutes breathes */
+.countdown.urgent, .sticky-count.urgent, .expiry-chip.urgent { animation: iris-urgent 1.6s ease-in-out infinite; }
+
+/* Phone: reader slides in over the list */
+@media (max-width: 767px) {
+  .mail-layout[data-view="reader"] .reader { animation: iris-slide-in 240ms var(--iris-ease) both; }
+  .mail-layout[data-view="list"] .list-pane { animation: iris-fade 180ms var(--iris-ease) both; }
+  .login-tagline span { display: inline; }
+}
