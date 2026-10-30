@@ -1,0 +1,41 @@
+version: '3.8'
+
+services:
+  api:
+    build:
+      context: ../../
+      dockerfile: ./deploy/api.Dockerfile
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      DATABASE_URL: sqlite:///data/iris.db
+    volumes:
+      - api-data:/data
+    depends_on:
+      - stalwart
+
+  web:
+    build:
+      context: ../../apps/web
+    ports:
+      - "127.0.0.1:5173:5173"
+
+  stalwart:
+    image: stalwartlabs/stalwart:latest
+    ports:
+      - "25:25"
+      - "587:587"
+      - "465:465"
+      - "143:143"
+      - "993:993"
+      - "110:110"
+      - "995:995"
+      - "127.0.0.1:8091:8080"
+    volumes:
+      - stalwart-etc:/etc/stalwart
+      - stalwart-data:/var/lib/stalwart
+
+volumes:
+  api-data:
+  stalwart-etc:
+  stalwart-data:

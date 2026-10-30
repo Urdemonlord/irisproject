@@ -1,0 +1,87 @@
+:root {
+  color-scheme: light;
+  --iris-bg: #F7F7F2;
+  --iris-surface: #FFFFFF;
+  --iris-surface-subtle: #F1F1EB;
+  --iris-text: #171717;
+  --iris-text-secondary: #707070;
+  --iris-text-tertiary: #8A8A83;
+  --iris-border: #D9D9D2;
+  --iris-border-strong: #B8B8AF;
+  --iris-accent: #B83232;
+  --iris-accent-hover: #982828;
+  --iris-accent-subtle: #F8EAEA;
+  --iris-success: #2F6B3B;
+  --iris-success-subtle: #EAF3EB;
+  --iris-warning: #A35A1C;
+  --iris-warning-subtle: #FAF0E4;
+  --iris-danger: #9E2F2F;
+  --iris-danger-subtle: #F8EAEA;
+  --iris-focus: #245CC5;
+  --iris-font-ui: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --iris-font-mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  --iris-text-xs: 0.75rem;
+  --iris-text-sm: 0.8125rem;
+  --iris-text-base: 0.9375rem;
+  --iris-text-lg: 1.0625rem;
+  --iris-heading-sm: 1.25rem;
+  --iris-heading-md: 1.5rem;
+  --iris-heading-lg: 1.875rem;
+  --iris-space-1: 0.25rem;
+  --iris-space-2: 0.5rem;
+  --iris-space-3: 0.75rem;
+  --iris-space-4: 1rem;
+  --iris-space-5: 1.25rem;
+  --iris-space-6: 1.5rem;
+  --iris-space-8: 2rem;
+  --iris-space-10: 2.5rem;
+  --iris-space-12: 3rem;
+  --iris-radius-sm: 4px;
+  --iris-radius-md: 7px;
+  --iris-radius-lg: 10px;
+  --iris-sidebar-width: 220px;
+  --iris-list-width: 340px;
+  --iris-topbar-height: 60px;
+  --iris-control-height: 36px;
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html {
+  color-scheme: light;
+  background: var(--iris-bg);
+  color: var(--iris-text);
+  font-family: var(--iris-font-ui);
+}
+
+body {
+  margin: 0;
+  min-width: 320px;
+  min-height: 100vh;
+}
+
+button,
+input,
+textarea,
+select {
+  font: inherit;
+}
+
+button {
+  cursor: pointer;
+}
+
+:focus-visible {
+  outline: 2px solid var(--iris-focus);
+  outline-offset: 2px;
+}
+
+.app-shell {
+  min-height: 100vh;
+  display: grid;
+  grid-template-rows: var(--iris-topbar-height) minmax(0, 1fr);
+}
