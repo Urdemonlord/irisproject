@@ -118,6 +118,41 @@ impl JmapClient {
         Ok((list.iter().map(summary).collect(), total))
     }
 
+    /// Messages in `account` whose To: header contains exactly `to`, received after `after` (UTC RFC3339).
+    // ponytail: matches the To: header only, so Bcc'd mail is invisible; switch to the
+    // envelope recipient (Delivered-To / sieve tagging) if that matters.
+    pub async fn list_to(
+        &self, user: &str, pass: &str, account: &str, to: &str, after: &str, limit: u32,
+    ) -> Result<Vec<MessageSummary>, MailError> {
+        let r = self
+            .call(user, pass, json!([
+                ["Email/query", {"accountId": account,
+                    "filter": {"operator": "AND", "conditions": [{"to": to}, {"after": after}]},
+                    "sort": [{"property": "receivedAt", "isAscending": false}], "limit": limit}, "q"],
+                ["Email/get", {"accountId": account,
+                    "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
+                    "properties": SUMMARY_PROPS}, "g"]
+            ]))
+            .await?;
+        let list = r[1]["list"].as_array().cloned().unwrap_or_default();
+        // Full-text `to` filter can over-match; keep only exact address hits.
+        Ok(list.iter().filter(|e| has_rcpt(e, to)).map(summary).collect())
+    }
+
+    /// Like `get_message`, but NotFound unless the To: header contains `to` exactly.
+    pub async fn get_message_to(
+        &self, user: &str, pass: &str, account: &str, id: &str, to: &str,
+    ) -> Result<MessageDetail, MailError> {
+        let r = self
+            .call(user, pass, json!([["Email/get", {"accountId": account, "ids": [id], "properties": ["to"]}, "g"]]))
+            .await?;
+        let e = r[0]["list"].get(0).ok_or(MailError::NotFound)?;
+        if !has_rcpt(e, to) {
+            return Err(MailError::NotFound);
+        }
+        self.get_message(user, pass, account, id).await
+    }
+
     pub async fn get_message(
         &self, user: &str, pass: &str, account: &str, id: &str,
     ) -> Result<MessageDetail, MailError> {
@@ -153,6 +188,10 @@ async fn check(resp: reqwest::Response) -> Result<Value, MailError> {
         s if s >= 400 => Err(MailError::Unavailable(format!("HTTP {s}"))),
         _ => resp.json().await.map_err(|e| MailError::Protocol(e.to_string())),
     }
+}
+
+fn has_rcpt(e: &Value, to: &str) -> bool {
+    e["to"].as_array().is_some_and(|a| a.iter().any(|t| t["email"].as_str().is_some_and(|x| x.eq_ignore_ascii_case(to))))
 }
 
 fn addr(v: &Value) -> String {

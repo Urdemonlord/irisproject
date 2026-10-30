@@ -157,3 +157,10 @@ button {
   .list-pane { border-right: 0; max-height: 40vh; }
   .reader { padding: var(--iris-space-4); }
 }
+
+.temp-link { font-size: var(--iris-text-sm); color: var(--iris-accent); margin-top: var(--iris-space-3); }
+.temp-address { font-family: var(--iris-font-mono); font-size: var(--iris-text-base); background: var(--iris-surface-subtle); padding: var(--iris-space-1) var(--iris-space-2); border-radius: var(--iris-radius-sm); user-select: all; overflow-wrap: anywhere; }
+.temp-countdown { margin-left: auto; font-size: var(--iris-text-sm); color: var(--iris-warning); font-variant-numeric: tabular-nums; }
+@media (max-width: 720px) {
+  .topbar:has(.temp-address) { flex-wrap: wrap; height: auto; padding: var(--iris-space-2) var(--iris-space-4); gap: var(--iris-space-2); }
+}

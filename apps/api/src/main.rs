@@ -14,6 +14,8 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::{collections::HashMap, sync::{Arc, RwLock}};
 
+mod temp;
+
 struct AppState {
     pool: SqlitePool,
     config: Config,
@@ -79,13 +81,17 @@ async fn main() {
         .route("/health", get(|| async { "OK" }))
         .route("/ready", get(ready))
         .route("/auth/login", post(login))
+        .route("/api/v1/temp-inboxes", post(temp::create))
+        .route("/api/v1/temp-inboxes/:id", get(temp::status))
+        .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
+        .route("/api/v1/temp-inboxes/:id/messages/:message_id", get(temp::message))
         .merge(protected)
         .with_state(state);
 
     let addr = format!("{}:{}", config.host, config.port);
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     tracing::info!("IRIS API listening on http://{addr}");
-    axum::serve(listener, app).await.expect("server");
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.expect("server");
 }
 
 async fn ready(State(s): S) -> Json<serde_json::Value> {
@@ -206,9 +212,13 @@ async fn list_messages(State(s): S, Extension(u): Extension<CurrentUser>, Path(m
     Ok(Json(json!({ "messages": messages, "total": total, "position": position })).into_response())
 }
 
+fn valid_message_id(id: &str) -> bool {
+    id.len() <= 128 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+}
+
 async fn get_message(State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, message_id)): Path<(String, String)>) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
-    if message_id.len() > 128 || !message_id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') {
+    if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;

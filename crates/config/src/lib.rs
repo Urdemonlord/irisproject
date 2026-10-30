@@ -10,6 +10,9 @@ pub struct Config {
     pub stalwart_api_url: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
+    /// Catch-all sink mailbox for the temp domain (not an admin account).
+    pub temp_inbox_mail_user: String,
+    pub temp_inbox_mail_password: String,
 }
 
 impl Config {
@@ -34,6 +37,8 @@ impl Config {
                 .ok()
                 .and_then(|h| h.parse().ok())
                 .unwrap_or(1),
+            temp_inbox_mail_user: std::env::var("TEMP_INBOX_MAIL_USER").unwrap_or_default(),
+            temp_inbox_mail_password: std::env::var("TEMP_INBOX_MAIL_PASSWORD").unwrap_or_default(),
         })
     }
 }
