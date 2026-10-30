@@ -1,6 +1,11 @@
 [workspace]
 members = [
     "apps/api",
+    "crates/config",
+    "crates/auth",
+    "crates/database",
+    "crates/mail",
+    "crates/observability",
 ]
 resolver = "2"
 

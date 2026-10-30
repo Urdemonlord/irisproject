@@ -1,0 +1,13 @@
+[package]
+name = "iris-auth"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+uuid = { workspace = true }
+chrono = { workspace = true }
+serde = { workspace = true }
+anyhow = "1.0"
+thiserror = "1.0"
+
+[dev-dependencies]
