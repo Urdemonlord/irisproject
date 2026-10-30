@@ -17,6 +17,8 @@ pub struct Config {
     pub send_local_domains: Vec<String>,
     /// Allow sending to any domain (set once the mail server has a working outbound relay).
     pub send_external: bool,
+    /// Resend API key; when set, mail to other domains is relayed through Resend.
+    pub resend_api_key: String,
 }
 
 impl Config {
@@ -47,6 +49,7 @@ impl Config {
                 .unwrap_or_else(|_| "meowlabs.id,iris.meowlabs.id,inbox.meowlabs.id".to_string())
                 .split(',').map(|d| d.trim().to_lowercase()).filter(|d| !d.is_empty()).collect(),
             send_external: std::env::var("SEND_EXTERNAL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
         })
     }
 }
