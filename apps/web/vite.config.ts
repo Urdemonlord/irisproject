@@ -7,7 +7,7 @@ const api = process.env.IRIS_API_URL ?? 'http://127.0.0.1:8000'
 // Public, non-secret defaults. Override with env vars or apps/web/.env.production.local.
 const DEFAULTS: Record<string, string> = {
   VITE_SITE_URL: 'https://iris.meowlabs.id',
-  VITE_CONTACT_EMAIL: 'postmaster@meowlabs.id',
+  VITE_CONTACT_EMAIL: 'admin@meowlabs.id',
   VITE_CONTACT_ADDRESS: '', // postal address shown on Privacy/Terms; empty = hidden
   VITE_ANALYTICS_SRC: '', // e.g. https://plausible.io/js/script.manual.js — empty = analytics off
   VITE_ANALYTICS_DOMAIN: '',
