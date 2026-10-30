@@ -110,7 +110,8 @@ Public site settings (build-time, all optional — defaults in `apps/web/vite.co
 | `VITE_SITE_URL` | `https://mail.meowlabs.id` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
 | `VITE_CONTACT_EMAIL` | `admin@meowlabs.id` | footer + Privacy/Terms contact |
 | `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
-| `VITE_ANALYTICS_SRC` / `VITE_ANALYTICS_DOMAIN` | empty (off) | Plausible-compatible script, loaded only after cookie consent. Add its host to your CSP if you set one. |
+| `VITE_ANALYTICS_SRC` | `https://analytics.meowlabs.id/script.js` | Umami tracking script |
+| `VITE_ANALYTICS_WEBSITE_ID` | empty (off) | Umami website ID. Analytics loads only when set **and** the visitor allows it in the cookie notice; only route names are sent. |
 
 Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.txt` and `sitemap.xml`.
 

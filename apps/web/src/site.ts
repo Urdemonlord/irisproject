@@ -6,10 +6,11 @@ export const SITE = {
   url: (env.VITE_SITE_URL || location.origin).replace(/\/$/, ''),
   contactEmail: env.VITE_CONTACT_EMAIL || '',
   contactAddress: env.VITE_CONTACT_ADDRESS || '',
-  // Plausible-compatible script, e.g. https://plausible.io/js/script.manual.js
+  // Umami: script URL + website ID. Analytics stays off unless both are set.
   analyticsSrc: env.VITE_ANALYTICS_SRC || '',
-  analyticsDomain: env.VITE_ANALYTICS_DOMAIN || '',
+  analyticsWebsiteId: env.VITE_ANALYTICS_WEBSITE_ID || '',
 }
+const analyticsConfigured = !!(SITE.analyticsSrc && SITE.analyticsWebsiteId)
 
 // ---------- meta ----------
 function meta(selector: string, attr: string, value: string) {
@@ -45,35 +46,42 @@ type Consent = 'granted' | 'denied'
 const CONSENT_KEY = 'iris_consent'
 const readConsent = (): Consent | null => { try { return localStorage.getItem(CONSENT_KEY) as Consent | null } catch { return null } }
 const writeConsent = (c: Consent) => { try { localStorage.setItem(CONSENT_KEY, c) } catch { /* private mode */ } }
-const analyticsOn = () => !!SITE.analyticsSrc && readConsent() === 'granted'
+const analyticsOn = () => analyticsConfigured && readConsent() === 'granted'
 
-declare global { interface Window { plausible?: ((e: string, o?: Record<string, unknown>) => void) & { q?: unknown[] } } }
+type UmamiPayload = Record<string, unknown>
+declare global { interface Window { umami?: { track: (p?: (props: UmamiPayload) => UmamiPayload) => void } } }
 
 let analyticsLoaded = false
+let pending: string | null = null
+const send = (path: string) => window.umami?.track((props) => ({ ...props, url: path, title: document.title }))
+
 function loadAnalytics() {
   if (analyticsLoaded || !analyticsOn()) return
   analyticsLoaded = true
-  window.plausible = window.plausible || Object.assign((...a: unknown[]) => { (window.plausible!.q = window.plausible!.q || []).push(a) }, {})
   const s = document.createElement('script')
   s.defer = true
   s.src = SITE.analyticsSrc
-  s.dataset.domain = SITE.analyticsDomain || location.hostname
+  s.dataset.websiteId = SITE.analyticsWebsiteId
+  s.dataset.autoTrack = 'false' // we send page views ourselves, with the route only
+  s.dataset.domains = new URL(SITE.url).hostname // ignore dev/preview hosts
+  s.onload = () => { if (pending) send(pending); pending = null }
   document.head.append(s)
 }
 
 let lastTracked = ''
 export function trackPageview(path: string) {
-  // Only the route is sent — never message ids, addresses or tokens.
+  // Only the route is sent — never message ids, addresses, tokens or the query string.
   if (!analyticsOn() || path === lastTracked) return
   lastTracked = path
   loadAnalytics()
-  window.plausible?.('pageview', { u: SITE.url + path })
+  if (window.umami) send(path)
+  else pending = path
 }
 
 export function showCookieBanner(force = false) {
   document.querySelector('.cookie-banner')?.remove()
   if (!force && readConsent()) return
-  const hasAnalytics = !!SITE.analyticsSrc
+  const hasAnalytics = analyticsConfigured
   const bar = document.createElement('section')
   bar.className = 'cookie-banner'
   bar.setAttribute('role', 'region')
