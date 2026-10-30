@@ -1,0 +1,48 @@
+# IRIS — public reverse proxy (Caddy v2).
+# Install: copy to /etc/caddy/Caddyfile, then `caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy`.
+# Web build goes to /srv/iris/dist (npm --prefix apps/web run build), API listens on 127.0.0.1:8000.
+
+iris.meowlabs.id {
+	encode zstd gzip
+
+	# API + auth -> iris-api (same origin, needed for CSRF cookie + SameSite).
+	# X-Real-IP is trusted by the API only from loopback.
+	@backend path /api/* /auth/*
+	handle @backend {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	# Static web app.
+	handle {
+		root * /srv/iris/dist
+
+		# Hashed build files never change: cache for a year.
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+		# HTML and root files (favicon, og-image, robots, sitemap): always revalidate.
+		@revalidate not path /assets/*
+		header @revalidate Cache-Control "no-cache"
+
+		file_server
+	}
+
+	# Unknown static paths -> custom 404 page (keeps the 404 status).
+	# Only errors raised by Caddy itself land here; API 404s pass through untouched.
+	handle_errors 404 {
+		root * /srv/iris/dist
+		rewrite * /404.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), interest-cohort=()"
+		-Server
+	}
+}

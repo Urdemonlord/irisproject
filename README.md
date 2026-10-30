@@ -80,26 +80,16 @@ npm --prefix apps/web ci && npm --prefix apps/web run build   # -> apps/web/dist
 ```
 
 Serve `apps/web/dist` and proxy `/api` and `/auth` to the API on the same origin (CSRF cookie + `SameSite`
-rely on it). Proxy must set `X-Real-IP` (trusted only from loopback). Example (Caddy):
+rely on it). Proxy must set `X-Real-IP` (trusted only from loopback).
 
-```caddy
-iris.meowlabs.id {
-    encode gzip
-    handle /api/* { reverse_proxy 127.0.0.1:8000 { header_up X-Real-IP {remote_host} } }
-    handle /auth/* { reverse_proxy 127.0.0.1:8000 { header_up X-Real-IP {remote_host} } }
-    handle {
-        root * /srv/iris/dist
-        @hashed path /assets/*
-        header @hashed Cache-Control "public, max-age=31536000, immutable"
-        file_server
-    }
-    handle_errors 404 {
-        root * /srv/iris/dist
-        rewrite * /404.html
-        file_server
-    }
-    header Strict-Transport-Security "max-age=31536000"
-}
+Use the ready-made Caddy config in [`deploy/caddy/Caddyfile`](deploy/caddy/Caddyfile) (Caddy ≥ 2.8). It proxies
+`/api` + `/auth`, serves `dist` with long caching for hashed assets, shows `404.html` for unknown pages and sets
+security headers. Install on the server:
+
+```bash
+rsync -a --delete apps/web/dist/ /srv/iris/dist/
+sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile
+sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
 
 Public site settings (build-time, all optional — defaults in `apps/web/vite.config.ts`):
