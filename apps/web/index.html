@@ -1,6 +1,15 @@
 <!DOCTYPE html>
 <html lang="en">
 <head>
+    <script>
+      // Start the first API calls now instead of waiting for the app bundle to download.
+      (function () {
+        var h = location.hash;
+        if (h && h !== '#/' && h !== '#') return;
+        var get = function (u) { return fetch(u, { credentials: 'same-origin', headers: { 'content-type': 'application/json' } }); };
+        try { window.__early = { '/api/v1/session': get('/api/v1/session'), '/api/v1/mailboxes': get('/api/v1/mailboxes') }; } catch (e) {}
+      })();
+    </script>
 <!--head-->
     <title>IRIS — Every message finds its way</title>
     <meta name="description" content="IRIS is the self-hosted mailbox from Meow Labs. Sign in to your inbox, or get a free 1-hour temporary email address — no sign-up needed.">

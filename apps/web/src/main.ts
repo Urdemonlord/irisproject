@@ -6,6 +6,14 @@ type TempInbox = { id: string; address: string; access_token: string; expires_at
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
+// Requests started by the inline script in index.html before this bundle loaded.
+declare global { interface Window { __early?: Record<string, Promise<Response>> } }
+function takeEarly(path: string) {
+  const p = window.__early?.[path]
+  if (p) delete window.__early![path]
+  return p
+}
+
 class HttpError extends Error { constructor(public status: number, public code: string) { super(code) } }
 
 const csrfCookie = () => document.cookie.split('; ').find((c) => c.startsWith('iris_csrf='))?.slice(10)
@@ -17,7 +25,8 @@ async function api<T>(path: string, init: RequestInit = {}): Promise<T> {
     headers['x-csrf-token'] = csrfCookie() ?? ''
   }
   let res: Response
-  try { res = await fetch(path, { credentials: 'same-origin', ...init, headers }) } catch { throw new HttpError(0, 'network') }
+  const early = method === 'GET' ? takeEarly(path) : undefined
+  try { res = await (early ?? fetch(path, { credentials: 'same-origin', ...init, headers })) } catch { throw new HttpError(0, 'network') }
   if (!res.ok) { const body = await res.json().catch(() => ({})); throw new HttpError(res.status, body.error ?? 'request_failed') }
   return res.status === 204 ? (undefined as T) : res.json()
 }
@@ -92,15 +101,17 @@ const CAT_BODY = `
   <defs><filter id="ink" x="-5%" y="-5%" width="110%" height="110%"><feTurbulence type="fractalNoise" baseFrequency=".045" numOctaves="2" seed="7" result="n"/><feDisplacementMap in="SourceGraphic" in2="n" scale="3.2" xChannelSelector="R" yChannelSelector="G"/></filter></defs>
   <g filter="url(#ink)" fill="#16130F">
     <path d="M58 244C34 214 38 160 66 132C55 116 52 98 56 82L50 34L82 60C93 56 109 56 120 60L152 34L146 82C150 98 147 116 136 132C160 158 166 212 142 244Z"/>
-    <path d="M140 238C178 240 196 214 186 184C180 166 162 168 166 184" fill="none" stroke="#16130F" stroke-width="13" stroke-linecap="round"/>
+    <path class="cat-tail" d="M140 238C178 240 196 214 186 184C180 166 162 168 166 184" fill="none" stroke="#16130F" stroke-width="13" stroke-linecap="round"/>
   </g>
   <path d="M96 112l4 3 4-3" stroke="#F7F7F2" stroke-width="1.6" fill="none" stroke-linecap="round" opacity=".7"/>`
 const CAT_EYES_OPEN = `
   <path d="M84 216C86 228 84 238 80 244M116 216C114 228 116 238 120 244" stroke="#F7F7F2" stroke-width="2" fill="none" stroke-linecap="round" opacity=".55"/>
+  <g class="cat-eyes">
   <path d="M70 92Q83 79 96 92Q83 103 70 92Z" fill="#B83232"/>
   <path class="pupil" d="M83 82.5C81 87 81 97 83 101C85 97 85 87 83 82.5Z" fill="#16130F" style="transform-box:fill-box;transform-origin:center;"/>
   <path d="M104 92Q117 79 130 92Q117 103 104 92Z" fill="#B83232"/>
-  <path class="pupil" d="M117 82.5C115 87 115 97 117 101C119 97 119 87 117 82.5Z" fill="#16130F" style="transform-box:fill-box;transform-origin:center;"/>`
+  <path class="pupil" d="M117 82.5C115 87 115 97 117 101C119 97 119 87 117 82.5Z" fill="#16130F" style="transform-box:fill-box;transform-origin:center;"/>
+  </g>`
 const CAT_EYES_SHUT = `<path d="M71 92Q83 99 95 92M105 92Q117 99 129 92" stroke="#B83232" stroke-width="3" fill="none" stroke-linecap="round"/>`
 
 function catSitSVG(shut = false): SVGSVGElement {
@@ -236,10 +247,33 @@ function messageBody(m: Detail) {
   return [bar, body]
 }
 
+// Message bodies don't change: keep them (as promises) for instant re-open and hover prefetch.
+const messageCache = new Map<string, Promise<{ message: Detail }>>()
+function prefetchMessage(url: string, init?: RequestInit) {
+  let p = messageCache.get(url)
+  if (!p) {
+    p = api<{ message: Detail }>(url, init)
+    p.catch(() => messageCache.delete(url))
+    if (messageCache.size > 100) messageCache.delete(messageCache.keys().next().value!)
+    messageCache.set(url, p)
+  }
+  return p
+}
+
+// Last message list per account, per tab (sessionStorage is cleared when the tab closes).
+const LIST_KEY = 'iris_list_cache'
+function readListCache(email: string, mb?: string): Summary[] | null {
+  try { const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null'); return c && c.email === email && c.mb === mb ? c.messages : null } catch { return null }
+}
+function writeListCache(email: string, mb: string, messages: Summary[]) {
+  try { sessionStorage.setItem(LIST_KEY, JSON.stringify({ email, mb, messages })) } catch { /* storage full or blocked */ }
+}
+function clearMailCache() { messageCache.clear(); try { sessionStorage.removeItem(LIST_KEY) } catch { /* ignore */ } }
+
 async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void, position: string) {
-  reader.replaceChildren(readerSkeleton())
+  if (!messageCache.has(url)) reader.replaceChildren(readerSkeleton())
   try {
-    const { message: m } = await api<{ message: Detail }>(url, init)
+    const { message: m } = await prefetchMessage(url, init)
     const initial = (senderName(m.from).replace(/[^\p{L}\p{N}]/gu, '')[0] ?? '?').toUpperCase()
     reader.replaceChildren(
       h('p', { className: 'reader-pos' }, position),
@@ -253,6 +287,7 @@ async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit
     reader.focus({ preventScroll: true })
   } catch (err) {
     if ([401, 410].includes((err as HttpError).status)) return onAuthFail()
+    messageCache.delete(url)
     reader.replaceChildren(errorState('Could not open this message.', () => openMessageAt(url, reader, init, onAuthFail, position)))
   }
 }
@@ -275,9 +310,11 @@ function mailShell(o: { topbar: HTMLElement; nav: HTMLElement[]; listTop: HTMLEl
 }
 
 /** Render message rows. Rows are buttons; an optional OTP copy button sits beside each row (never nested). */
-function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; onOpen: (m: Summary, index: number) => void }) {
+function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; onOpen: (m: Summary, index: number) => void; onIntent?: (m: Summary) => void }) {
   if (!messages.length) return list.replaceChildren(o.empty)
-  list.replaceChildren(h('ul', { className: 'message-list', ariaLabel: 'Messages' }, ...messages.map((m, i) => {
+  const prevList = list.querySelector('.message-list')
+  const seen = new Set([...list.querySelectorAll<HTMLElement>('.msg-item')].map((li) => li.dataset.id))
+  list.replaceChildren(h('ul', { className: `message-list${prevList ? '' : ' stagger'}`, ariaLabel: 'Messages' }, ...messages.map((m, i) => {
     const mark = m.is_read ? [] : [h('span', { className: 'iris-mark', title: 'Unread' }, h('span', { className: 'sr-only' }, 'Unread: '))]
     const row = h('button', { type: 'button', className: `msg${m.is_read ? '' : ' unread'}${o.compact ? ' compact' : ''}` },
       h('span', { className: 'msg-from' }, ...mark, h('span', { className: 'msg-from-name' }, senderName(m.from))),
@@ -285,6 +322,7 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
       h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
       ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []))
     if (m.id === o.current) row.setAttribute('aria-current', 'true')
+    if (o.onIntent) { const intent = () => o.onIntent!(m); row.addEventListener('pointerenter', intent, { once: true }); row.addEventListener('focus', intent, { once: true }); row.addEventListener('touchstart', intent, { once: true, passive: true }) }
     row.onclick = () => {
       list.querySelectorAll('.msg').forEach((b) => b.removeAttribute('aria-current'))
       row.setAttribute('aria-current', 'true')
@@ -293,7 +331,9 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
       m.is_read = true
       o.onOpen(m, i)
     }
-    const li = h('li', { className: 'msg-item' }, row)
+    const li = h('li', { className: `msg-item${prevList && !seen.has(m.id) ? ' is-new' : ''}` }, row)
+    li.dataset.id = m.id
+    li.style.setProperty('--i', String(Math.min(i, 12)))
     const code = o.compact ? `${m.subject} ${m.preview}`.match(/\b(\d{4,8})\b/)?.[1] : undefined
     if (code) li.append(copyButton(code, `Copy code ${code}`, 'otp-chip', code))
     return li
@@ -321,17 +361,20 @@ const matches = (m: Summary, q: string) => !q || `${m.from} ${m.subject} ${m.pre
 
 // ---------- Mailbox ----------
 async function renderMailbox() {
-  const session = await api<{ email: string }>('/api/v1/session')
-  const { mailboxes } = await api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes')
+  const [session, { mailboxes }] = await Promise.all([
+    api<{ email: string }>('/api/v1/session'),
+    api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
+  ])
   const mb = mailboxes[0]?.id
+  const cached = readListCache(session.email, mb)
   setPage({ title: 'Inbox', description: 'Your IRIS inbox.', path: '/', noindex: true })
 
-  let all: Summary[] = []
+  let all: Summary[] = cached ?? []
   let query = ''
   let current = ''
 
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
-  logout.onclick = async () => { busy(logout, ''); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
+  logout.onclick = async () => { busy(logout, ''); clearMailCache(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
   const refresh = btn('btn btn-ghost btn-icon-sm', 'Refresh', 'refresh')
   const synced = h('span', { className: 'synced', 'aria-live': 'polite' })
   const unreadChip = h('span', { className: 'pane-chip' })
@@ -372,6 +415,7 @@ async function renderMailbox() {
         ui.show()
         openMessageAt(`/api/v1/mailboxes/${mb}/messages/${encodeURIComponent(m.id)}`, ui.readerBody, undefined, renderLogin, `${i + 1} of ${shown.length}`)
       },
+      onIntent: (m) => prefetchMessage(`/api/v1/mailboxes/${mb}/messages/${encodeURIComponent(m.id)}`),
     })
   }
 
@@ -381,21 +425,28 @@ async function renderMailbox() {
     const restore = busy(refresh, '')
     refresh.classList.add('is-spinning')
     try {
-      all = (await api<{ messages: Summary[] }>(`/api/v1/mailboxes/${mb}/messages?limit=50`)).messages
+      const fresh = (await api<{ messages: Summary[] }>(`/api/v1/mailboxes/${mb}/messages?limit=50`)).messages
+      // keep read state set locally while the request was in flight
+      const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
+      all = fresh.map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) }))
+      writeListCache(session.email, mb, all)
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
     } catch (err) {
-      if ((err as HttpError).status === 401) return renderLogin()
+      if ((err as HttpError).status === 401) { clearMailCache(); return renderLogin() }
+      if (all.length) { synced.textContent = 'Offline · showing saved list'; return }
       ui.list.replaceChildren(errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.', load))
     } finally { restore(); refresh.classList.remove('is-spinning') }
   }
   refresh.onclick = load
-  await load()
+  if (all.length) { draw(); load() } else await load()
 }
 
 // ---------- Temp inbox ----------
 let tempTimers: number[] = []
-const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = [] }
+let onVisible: (() => void) | null = null
+document.addEventListener('visibilitychange', () => onVisible?.())
+const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = []; onVisible = null }
 const TEMP_KEY = 'iris_temp_inbox'
 const savedTemp = (): TempInbox | null => { try { return JSON.parse(sessionStorage.getItem(TEMP_KEY) ?? 'null') } catch { return null } }
 const saveTemp = (t: TempInbox | null) => { try { t ? sessionStorage.setItem(TEMP_KEY, JSON.stringify(t)) : sessionStorage.removeItem(TEMP_KEY) } catch { /* storage blocked */ } }
@@ -491,7 +542,7 @@ function renderTempInbox(inbox: TempInbox, justCreated = false) {
 
   const countLabel = h('span', { className: 'pane-count' })
   const listHead = h('header', { className: 'temp-list-head' }, h('h2', { className: 'temp-list-title' }, 'Messages'), countLabel,
-    h('span', { className: 'live-status' }, h('span', { className: 'live-dot' }), 'Checking every 10s'))
+    h('span', { className: 'live-status' }, h('span', { className: 'live-dot' }), 'Live'))
 
   const newBtn = () => btn('btn btn-secondary btn-block', 'New address', 'pen', { onclick: discard })
   const rail = h('aside', { className: 'expiry-rail', ariaLabel: 'Expiry' },
@@ -527,6 +578,7 @@ function renderTempInbox(inbox: TempInbox, justCreated = false) {
       current, compact: true,
       empty: query ? emptyState('search', 'No matches', `Nothing matches “${query}”.`) : emptyState('send', 'Waiting for mail', 'Share the address above. New messages show up here automatically.'),
       onOpen: (m, i) => { current = m.id; ui.show(); openMessageAt(`${base}/messages/${encodeURIComponent(m.id)}`, ui.readerBody, auth, expired, `${i + 1} of ${shown.length}`) },
+      onIntent: (m) => prefetchMessage(`${base}/messages/${encodeURIComponent(m.id)}`, auth),
     })
   }
   const load = async () => {
@@ -543,7 +595,8 @@ function renderTempInbox(inbox: TempInbox, justCreated = false) {
     }
   }
   tick(); load()
-  tempTimers = [window.setInterval(tick, 1000), window.setInterval(load, 10_000)]
+  tempTimers = [window.setInterval(tick, 1000), window.setInterval(() => { if (!document.hidden) load() }, 5_000)]
+  onVisible = () => { if (!document.hidden) { tick(); load() } }
   if (justCreated) copyMain.focus()
 }
 
