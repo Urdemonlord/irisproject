@@ -1,0 +1,142 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="0" height="0" style="position:absolute" aria-hidden="true">
+  <defs>
+    <!-- Ink edge: rough brush boundary for mascot silhouettes -->
+    <filter id="ink" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency=".045" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="SourceGraphic" in2="n" scale="3.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+    <filter id="ink-dry" x="-5%" y="-5%" width="110%" height="110%">
+      <feTurbulence type="fractalNoise" baseFrequency=".9" numOctaves="1" seed="3" result="g"/>
+      <feColorMatrix in="g" type="matrix" values="0 0 0 0 0  0 0 0 0 0  0 0 0 0 0  0 0 0 -2.2 1.55" result="m"/>
+      <feComposite in="SourceGraphic" in2="m" operator="in" result="d"/>
+      <feTurbulence type="fractalNoise" baseFrequency=".045" numOctaves="2" seed="7" result="n"/>
+      <feDisplacementMap in="d" in2="n" scale="3.2" xChannelSelector="R" yChannelSelector="G"/>
+    </filter>
+  </defs>
+
+  <!-- ═══ IRIS EYE MARK — 4 pupil states ═══ -->
+  <symbol id="eye-open" viewBox="0 0 48 28">
+    <path d="M2 14C10 3 38 3 46 14C38 25 10 25 2 14Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+    <circle cx="24" cy="14" r="8.5" fill="#B83232"/>
+    <path d="M24 6.5C22 10 22 18 24 21.5C26 18 26 10 24 6.5Z" fill="#16130F"/>
+  </symbol>
+  <symbol id="eye-dilated" viewBox="0 0 48 28">
+    <path d="M2 14C10 3 38 3 46 14C38 25 10 25 2 14Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+    <circle cx="24" cy="14" r="8.5" fill="#B83232"/>
+    <circle cx="24" cy="14" r="5" fill="#16130F"/>
+  </symbol>
+  <symbol id="eye-scan" viewBox="0 0 48 28">
+    <path d="M2 14C10 3 38 3 46 14C38 25 10 25 2 14Z" fill="none" stroke="currentColor" stroke-width="3" stroke-linejoin="round"/>
+    <circle cx="31" cy="14" r="8.5" fill="#B83232"/>
+    <path d="M31 6.5C29 10 29 18 31 21.5C33 18 33 10 31 6.5Z" fill="#16130F"/>
+  </symbol>
+  <symbol id="eye-closed" viewBox="0 0 48 28">
+    <path d="M2 14C10 23 38 23 46 14" fill="none" stroke="currentColor" stroke-width="3" stroke-linecap="round"/>
+    <path d="M12 19.5l-2 4M24 21.5v4.5M36 19.5l2 4" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"/>
+  </symbol>
+
+  <!-- ═══ MASCOT: "Kurir" the black cat ═══ -->
+  <!-- Sitting / watching. Eyes are separate so they can be re-targeted. -->
+  <symbol id="cat-sit" viewBox="0 0 200 250">
+    <g filter="url(#ink)" fill="#16130F">
+      <path d="M58 244C34 214 38 160 66 132C55 116 52 98 56 82L50 34L82 60C93 56 109 56 120 60L152 34L146 82C150 98 147 116 136 132C160 158 166 212 142 244Z"/>
+      <path d="M140 238C178 240 196 214 186 184C180 166 162 168 166 184" fill="none" stroke="#16130F" stroke-width="13" stroke-linecap="round"/>
+    </g>
+    <path d="M84 216C86 228 84 238 80 244M116 216C114 228 116 238 120 244" stroke="#F7F7F2" stroke-width="2" fill="none" stroke-linecap="round" opacity=".55"/>
+    <g>
+      <path d="M70 92Q83 79 96 92Q83 103 70 92Z" fill="#B83232"/>
+      <path d="M83 82.5C81 87 81 97 83 101C85 97 85 87 83 82.5Z" fill="#16130F"/>
+      <path d="M104 92Q117 79 130 92Q117 103 104 92Z" fill="#B83232"/>
+      <path d="M117 82.5C115 87 115 97 117 101C119 97 119 87 117 82.5Z" fill="#16130F"/>
+    </g>
+    <path d="M96 112l4 3 4-3" stroke="#F7F7F2" stroke-width="1.6" fill="none" stroke-linecap="round" opacity=".7"/>
+  </symbol>
+
+  <!-- Sitting, eyes shut (password focus / privacy) -->
+  <symbol id="cat-sit-shut" viewBox="0 0 200 250">
+    <g filter="url(#ink)" fill="#16130F">
+      <path d="M58 244C34 214 38 160 66 132C55 116 52 98 56 82L50 34L82 60C93 56 109 56 120 60L152 34L146 82C150 98 147 116 136 132C160 158 166 212 142 244Z"/>
+      <path d="M140 238C178 240 196 214 186 184C180 166 162 168 166 184" fill="none" stroke="#16130F" stroke-width="13" stroke-linecap="round"/>
+    </g>
+    <path d="M71 92Q83 99 95 92M105 92Q117 99 129 92" stroke="#B83232" stroke-width="3" fill="none" stroke-linecap="round"/>
+    <path d="M96 112l4 3 4-3" stroke="#F7F7F2" stroke-width="1.6" fill="none" stroke-linecap="round" opacity=".7"/>
+  </symbol>
+
+  <!-- Curled asleep (empty inbox) -->
+  <symbol id="cat-sleep" viewBox="0 0 260 150">
+    <g filter="url(#ink)" fill="#16130F">
+      <path d="M40 128C26 92 62 54 130 52C198 50 238 84 234 116C232 128 222 134 208 134L52 134C46 134 42 132 40 128Z"/>
+      <ellipse cx="78" cy="100" rx="44" ry="34"/>
+      <path d="M46 84L40 42L72 70Z M84 68L104 36L112 74Z"/>
+      <path d="M228 108C246 128 222 146 166 146C126 146 98 142 88 132" fill="none" stroke="#16130F" stroke-width="15" stroke-linecap="round"/>
+    </g>
+    <path d="M220 118C206 132 160 136 104 128" stroke="#F7F7F2" stroke-width="2.2" fill="none" stroke-linecap="round"/>
+    <path d="M56 100Q64 107 72 100M86 100Q94 107 102 100" stroke="#B83232" stroke-width="3" fill="none" stroke-linecap="round"/>
+  </symbol>
+
+  <!-- Walking, envelope in mouth (sending / route) -->
+  <symbol id="cat-walk" viewBox="0 0 300 170">
+    <g filter="url(#ink)">
+      <g fill="#16130F">
+        <path d="M60 80C60 54 100 44 150 46C180 47 194 46 200 42L222 60C218 90 204 112 176 116L96 118C72 118 60 102 60 80Z"/>
+        <circle cx="214" cy="56" r="29"/>
+        <path d="M194 38L188 6L214 30Z M220 30L244 6L242 44Z"/>
+      </g>
+      <g stroke="#16130F" stroke-width="16" stroke-linecap="round" fill="none">
+        <path d="M88 108L76 158M116 112L126 158M166 112L150 158M186 106L202 156"/>
+        <path d="M66 82C34 76 22 52 32 20" stroke-width="14"/>
+      </g>
+    </g>
+    <path d="M214 52Q226 41 238 52Q226 62 214 52Z" fill="#B83232"/>
+    <path d="M226 43.5C224.5 47 224.5 57 226 60.5C227.5 57 227.5 47 226 43.5Z" fill="#16130F"/>
+    <g transform="translate(-10 2) rotate(-8 262 80)">
+      <rect x="232" y="66" width="62" height="40" fill="#FFFFFF" stroke="#16130F" stroke-width="2.5"/>
+      <path d="M232 66L263 90L294 66" fill="none" stroke="#16130F" stroke-width="2.5" stroke-linejoin="round"/>
+      <rect x="278" y="72" width="10" height="12" fill="#B83232"/>
+    </g>
+  </symbol>
+
+  <!-- Peeking over an edge (temp inbox address card) -->
+  <symbol id="cat-peek" viewBox="0 -4 160 82">
+    <g filter="url(#ink)" fill="#16130F">
+      <path d="M24 70C24 42 34 28 46 24L42 2L64 18C74 16 86 16 96 18L118 2L114 24C126 28 136 42 136 70Z"/>
+      <ellipse cx="38" cy="66" rx="16" ry="8"/>
+      <ellipse cx="122" cy="66" rx="16" ry="8"/>
+    </g>
+    <path d="M52 44Q63 34 74 44Q63 52 52 44Z" fill="#B83232"/>
+    <path d="M63 37C61.5 40 61.5 48 63 51C64.5 48 64.5 40 63 37Z" fill="#16130F"/>
+    <path d="M86 44Q97 34 108 44Q97 52 86 44Z" fill="#B83232"/>
+    <path d="M97 37C95.5 40 95.5 48 97 51C98.5 48 98.5 40 97 37Z" fill="#16130F"/>
+    <path d="M32 66h12M116 66h12" stroke="#F7F7F2" stroke-width="1.4" opacity=".5"/>
+  </symbol>
+
+  <!-- ═══ UI ICONS — 20px grid, 1.5 stroke, square caps, miter joins ═══ -->
+  <g id="icons" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="square" stroke-linejoin="miter">
+  <symbol id="i-inbox" viewBox="0 0 20 20"><path d="M2.75 11.25h4.5l1.25 2h3l1.25-2h4.5M2.75 11.25L5 3.75h10l2.25 7.5v5H2.75z" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-send" viewBox="0 0 20 20"><path d="M2.75 9.75L17.25 2.75L11 17.25L9 11zM9 11l8.25-8.25" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="miter"/></symbol>
+  <symbol id="i-draft" viewBox="0 0 20 20"><path d="M4.75 2.75h7l3.5 3.5v11h-10.5zM11.75 2.75v3.5h3.5M7.5 10.25h5M7.5 13.25h3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-archive" viewBox="0 0 20 20"><path d="M2.75 3.75h14.5v3.5H2.75zM3.75 7.25v9h12.5v-9M8 10.75h4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-trash" viewBox="0 0 20 20"><path d="M2.75 5.25h14.5M7.25 5.25v-2.5h5.5v2.5M4.75 5.25l.75 12h9l.75-12M8.25 8.75v5M11.75 8.75v5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-search" viewBox="0 0 20 20"><circle cx="8.75" cy="8.75" r="5.75" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13 13l4.25 4.25" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-pen" viewBox="0 0 20 20"><path d="M13.25 2.75l4 4L7 17H3v-4zM11 5l4 4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-clip" viewBox="0 0 20 20"><path d="M15.5 9.5l-6 6a3.5 3.5 0 0 1-5-5l7-7a2.3 2.3 0 0 1 3.3 3.3l-6.8 6.8a1.1 1.1 0 0 1-1.6-1.6l6-6" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt"/></symbol>
+  <symbol id="i-copy" viewBox="0 0 20 20"><path d="M6.75 6.75h10.5v10.5H6.75zM13.25 6.75v-4h-10.5v10.5h4" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-refresh" viewBox="0 0 20 20"><path d="M16.25 10a6.25 6.25 0 1 1-1.8-4.4M16.25 2.75v4h-4" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="butt"/></symbol>
+  <symbol id="i-timer" viewBox="0 0 20 20"><circle cx="10" cy="11" r="6.25" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 11V7.5M7.75 2.75h4.5" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-eye" viewBox="0 0 20 20"><path d="M1.75 10C4.5 5.5 15.5 5.5 18.25 10C15.5 14.5 4.5 14.5 1.75 10Z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 7c-.9 1-.9 5 0 6c.9-1 .9-5 0-6Z" fill="currentColor"/></symbol>
+  <symbol id="i-download" viewBox="0 0 20 20"><path d="M10 2.75v10M5.75 8.75L10 13l4.25-4.25M2.75 17.25h14.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-upload" viewBox="0 0 20 20"><path d="M10 13.25v-10M5.75 7L10 2.75L14.25 7M2.75 17.25h14.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-close" viewBox="0 0 20 20"><path d="M4.5 4.5l11 11M15.5 4.5l-11 11" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-reply" viewBox="0 0 20 20"><path d="M7.75 4.25L2.75 9.25l5 5M2.75 9.25h8.5c3.3 0 6 2.2 6 6.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-forward" viewBox="0 0 20 20"><path d="M12.25 4.25l5 5-5 5M17.25 9.25h-8.5c-3.3 0-6 2.2-6 6.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-more" viewBox="0 0 20 20"><path d="M3.5 9h2v2h-2zM9 9h2v2H9zM14.5 9h2v2h-2z" fill="currentColor"/></symbol>
+  <symbol id="i-check" viewBox="0 0 20 20"><path d="M3.25 10.5l4.25 4.25l9.25-9.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-back" viewBox="0 0 20 20"><path d="M8.25 4.25L2.75 10l5.5 5.75M2.75 10h14.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-menu" viewBox="0 0 20 20"><path d="M2.75 5.25h14.5M2.75 10h14.5M2.75 14.75h9" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-file" viewBox="0 0 20 20"><path d="M4.75 2.75h7l3.5 3.5v11h-10.5zM11.75 2.75v3.5h3.5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-image" viewBox="0 0 20 20"><path d="M2.75 3.75h14.5v12.5H2.75zM2.75 13.25l4-4 3.5 3.5 2-2 5 5" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M13 6.5h1.5V8H13z" fill="currentColor"/></symbol>
+  <symbol id="i-shield" viewBox="0 0 20 20"><path d="M10 2.25l6.25 2.5v4.5c0 4-2.6 7-6.25 8.5c-3.65-1.5-6.25-4.5-6.25-8.5v-4.5z" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  <symbol id="i-alert" viewBox="0 0 20 20"><path d="M10 2.5l8 14.5H2z" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M10 8v4" stroke="currentColor" stroke-width="1.5"/><path d="M9.25 13.75h1.5v1.5h-1.5z" fill="currentColor"/></symbol>
+  <symbol id="i-account" viewBox="0 0 20 20"><circle cx="10" cy="7" r="3.75" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M3 17.25c.8-3.2 3.6-5 7-5s6.2 1.8 7 5" fill="none" stroke="currentColor" stroke-width="1.5"/></symbol>
+  </g>
+</svg>

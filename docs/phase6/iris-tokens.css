@@ -1,0 +1,103 @@
+/* IRIS Phase 6 design tokens — visual lock-in.
+   Source of truth for docs/phase6/MOCKUPS.md + MASCOT.md. Contrast ratios are WCAG 2.x,
+   measured against --iris-cream unless noted. Brand values per Arya: #B83232 / #F7F7F2. */
+:root {
+  color-scheme: light;
+
+  /* ── Raw palette ─────────────────────────────────────────── */
+  --iris-vermilion:        #B83232; /* brand red: fills, selected edge, red text. 5.52:1 on cream */
+  --iris-vermilion-hover:  #982828; /* 7.32:1 */
+  --iris-vermilion-wash:   #F8EAEA; /* tint behind red chips; red on it 5.07:1 */
+  --iris-ink:              #16130F; /* text, rules, mascot. 17.2:1 on cream */
+  --iris-ink-raised:       #2A251F; /* hover on ink surfaces */
+  --iris-graphite:         #5E5E58; /* secondary text. 6.07:1 cream, 5.55:1 sunk */
+  --iris-stone:            #8C8C84; /* input borders. 3.15:1 (non-text >= 3:1) */
+  --iris-rule:             #E2E2DA; /* hairline dividers only, decorative */
+  --iris-cream:            #F7F7F2; /* app background, textured */
+  --iris-cream-raised:     #FFFFFF; /* reading surface, inputs, modal (flat, no texture) */
+  --iris-cream-sunk:       #EDEDE5; /* selected row, active nav */
+
+  --iris-success:          #2F6B3B;
+  --iris-warning:          #8A4A14;
+  --iris-danger:           #9E2F2F; /* always icon + text, never color alone */
+
+  /* ── Semantic aliases (use these in components) ──────────── */
+  --iris-bg:               var(--iris-cream);
+  --iris-surface:          var(--iris-cream-raised);
+  --iris-surface-sunk:     var(--iris-cream-sunk);
+  --iris-text:             var(--iris-ink);
+  --iris-text-secondary:   var(--iris-graphite);
+  --iris-border:           var(--iris-rule);
+  --iris-border-strong:    var(--iris-stone);
+  --iris-accent:           var(--iris-vermilion);
+  --iris-accent-hover:     var(--iris-vermilion-hover);
+  --iris-on-accent:        var(--iris-cream); /* text on red = cream (5.52:1). NOT ink (3.12:1, fails) */
+  --iris-on-ink:           var(--iris-cream);
+  --iris-focus:            var(--iris-ink);   /* 2px ring, 2px offset; red would read as error */
+  --iris-focus-inverse:    var(--iris-cream); /* on ink / red fields */
+
+  /* Paper grain: apply to --iris-bg areas only, never behind message bodies. */
+  --iris-texture-paper: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='240' height='240'%3E%3Cfilter id='g'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.85' numOctaves='3' stitchTiles='stitch'/%3E%3CfeColorMatrix values='0 0 0 0 .086 0 0 0 0 .075 0 0 0 0 .059 0 0 0 .55 -.18'/%3E%3C/filter%3E%3Crect width='240' height='240' filter='url(%23g)' opacity='.22'/%3E%3C/svg%3E");
+
+  /* ── Typography ─────────────────────────────────────────── */
+  --iris-font-display: "Archivo", "Helvetica Neue", Arial, sans-serif;  /* wdth 100–125, wght 600–900 */
+  --iris-font-ui:      "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --iris-font-mono:    "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+
+  /* Scale: 11 / 12 / 13 / 15 / 17 / 20 / 24 / 32 / 48 / 72 / 120 */
+  --iris-text-label:   0.6875rem; /* 11 mono caps, tracking .08em */
+  --iris-text-xs:      0.75rem;   /* 12 */
+  --iris-text-sm:      0.8125rem; /* 13 meta, timestamps */
+  --iris-text-base:    0.9375rem; /* 15 UI */
+  --iris-text-read:    1.0625rem; /* 17 message body, lh 1.6 */
+  --iris-text-h4:      1.25rem;   /* 20 */
+  --iris-text-h3:      1.5rem;    /* 24 */
+  --iris-text-h2:      2rem;      /* 32 pane titles */
+  --iris-text-h1:      3rem;      /* 48 auth/empty headlines */
+  --iris-text-d2:      4.5rem;    /* 72 */
+  --iris-text-d1:      7.5rem;    /* 120 brand field only */
+
+  --iris-leading-tight: 0.95;
+  --iris-leading-snug:  1.2;
+  --iris-leading-ui:    1.4;
+  --iris-leading-read:  1.6;
+  --iris-tracking-display: -0.025em;
+  --iris-tracking-label:    0.08em;
+
+  /* ── Space (4px base) ───────────────────────────────────── */
+  --iris-space-1: 4px;  --iris-space-2: 8px;   --iris-space-3: 12px;
+  --iris-space-4: 16px; --iris-space-5: 20px;  --iris-space-6: 24px;
+  --iris-space-8: 32px; --iris-space-10: 40px; --iris-space-12: 48px;
+  --iris-space-16: 64px;
+
+  /* ── Shape & lines ──────────────────────────────────────── */
+  --iris-radius-0: 0;      /* default: panes, rows, cards */
+  --iris-radius-1: 2px;    /* buttons, inputs, chips */
+  --iris-radius-dot: 50%;  /* status dots, avatar mark only */
+  --iris-rule-hair:   1px solid var(--iris-rule);
+  --iris-rule-ink:    1px solid var(--iris-ink);
+  --iris-rule-bar:    2px solid var(--iris-ink);      /* column heads, section heads */
+  --iris-rule-select: 3px solid var(--iris-vermilion); /* selected row/nav, left edge */
+  --iris-rule-dash:   1.5px dashed var(--iris-ink);   /* dropzones */
+  --iris-shadow-plate: 8px 8px 0 var(--iris-ink);     /* modal, compose — the only shadow */
+  --iris-shadow-chip:  3px 3px 0 var(--iris-vermilion); /* toast */
+
+  /* ── Layout ─────────────────────────────────────────────── */
+  --iris-topbar-height: 56px;
+  --iris-sidebar-width: 232px;
+  --iris-list-width:    384px;
+  --iris-reading-max:   68ch;
+  --iris-control-height: 36px;
+  --iris-touch-target:   48px;
+  --iris-row-height:     88px;  /* desktop list row */
+
+  /* ── Motion ─────────────────────────────────────────────── */
+  --iris-ease: cubic-bezier(.2, 0, 0, 1);
+  --iris-dur-fast: 120ms;
+  --iris-dur-base: 180ms;
+  --iris-dur-slow: 320ms; /* mascot eye transitions only */
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root { --iris-dur-fast: 0ms; --iris-dur-base: 0ms; --iris-dur-slow: 0ms; }
+}
