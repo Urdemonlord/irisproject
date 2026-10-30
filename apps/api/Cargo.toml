@@ -13,17 +13,9 @@ serde_json = { workspace = true }
 sqlx = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-
-[dev-dependencies]
-
-[dependencies.sqlx]
-version = "0.8"
-features = ["runtime-tokio-rustls", "sqlite", "migrate", "chrono", "uuid"]
-
-[dependencies]
-uuid = { version = "1.10", features = ["v4", "serde"] }
-chrono = { version = "0.4", features = ["serde"] }
-reqwest = { version = "0.12", features = ["json"] }
-anyhow = "1.0"
-thiserror = "1.0"
-dotenv = "0.15"
+uuid = { workspace = true }
+chrono = { workspace = true }
+iris-config = { path = "../../crates/config" }
+iris-auth = { path = "../../crates/auth" }
+iris-database = { path = "../../crates/database" }
+iris-mail = { path = "../../crates/mail" }

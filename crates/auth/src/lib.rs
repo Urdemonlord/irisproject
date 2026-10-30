@@ -1,40 +1,52 @@
+use chrono::{Duration, Utc};
+use sha2::{Digest, Sha256};
 use uuid::Uuid;
-use chrono::{DateTime, Utc, Duration};
-use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct Session {
-    pub id: String,
-    pub user_id: String,
-    pub token_hash: String,
-    pub expires_at: String,
-    pub created_at: String,
+pub const SESSION_DAYS: i64 = 30;
+pub const COOKIE_NAME: &str = "iris_session";
+
+/// Random opaque token (UUIDv4 = 122 random bits). Only its hash is stored.
+pub fn new_token() -> String {
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
-impl Session {
-    pub fn new(user_id: String) -> (Self, String) {
-        let id = Uuid::new_v4().to_string();
-        let token = Uuid::new_v4().to_string();
-        let token_hash = format!("{:x}", md5::compute(token.as_bytes()));
-        let now = Utc::now().to_rfc3339();
-        let expires_at = (Utc::now() + Duration::days(30)).to_rfc3339();
-        
-        let session = Self {
-            id,
-            user_id,
-            token_hash,
-            expires_at,
-            created_at: now,
-        };
-        
-        (session, token)
-    }
+pub fn hash_token(token: &str) -> String {
+    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+}
 
-    pub fn is_expired(&self) -> bool {
-        if let Ok(exp) = DateTime::parse_from_rfc3339(&self.expires_at) {
-            exp < Utc::now().with_timezone(&chrono::FixedOffset::east_opt(0).unwrap())
-        } else {
-            true
-        }
+pub fn expiry() -> String {
+    (Utc::now() + Duration::days(SESSION_DAYS)).to_rfc3339()
+}
+
+pub fn now() -> String {
+    Utc::now().to_rfc3339()
+}
+
+/// Extract the session token from a raw Cookie header.
+pub fn token_from_cookie(header: &str) -> Option<&str> {
+    header.split(';').map(str::trim).find_map(|c| c.strip_prefix(COOKIE_NAME)?.strip_prefix('='))
+}
+
+pub fn set_cookie(token: &str, secure: bool) -> String {
+    format!(
+        "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite=Strict; Max-Age={}{}",
+        SESSION_DAYS * 86400,
+        if secure { "; Secure" } else { "" }
+    )
+}
+
+pub fn clear_cookie() -> String {
+    format!("{COOKIE_NAME}=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cookie_and_hash() {
+        assert_eq!(token_from_cookie("a=1; iris_session=abc; b=2"), Some("abc"));
+        assert_eq!(token_from_cookie("iris_sessionx=abc"), None);
+        assert_eq!(hash_token("x").len(), 64);
+        assert_ne!(new_token(), new_token());
     }
 }

@@ -5,7 +5,6 @@ members = [
     "crates/auth",
     "crates/database",
     "crates/mail",
-    "crates/observability",
 ]
 resolver = "2"
 
@@ -20,6 +19,10 @@ tokio = { version = "1.40", features = ["full"] }
 axum = "0.7"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-sqlx = { version = "0.8", features = ["runtime-tokio-native-tls", "sqlite", "migrate"] }
+sqlx = { version = "0.8", features = ["runtime-tokio-rustls", "sqlite", "migrate"] }
 tracing = "0.1"
+uuid = { version = "1.10", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+sha2 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
