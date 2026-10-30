@@ -34,39 +34,131 @@ function h<K extends keyof HTMLElementTagNameMap>(tag: K, props: Record<string, 
 
 const fmtDate = (iso: string) => new Date(iso).toLocaleString(undefined, { dateStyle: 'medium', timeStyle: 'short' })
 
+// ---- Icons: inline 24px line set (stroke via CSS), no external deps ----
+const ICONS: Record<string, string> = {
+  inbox: '<path d="M22 12h-6l-2 3h-4l-2-3H2"/><path d="M5.45 5.11 2 12v6a2 2 0 0 0 2 2h16a2 2 0 0 0 2-2v-6l-3.45-6.89A2 2 0 0 0 16.76 4H7.24a2 2 0 0 0-1.79 1.11z"/>',
+  mail: '<rect x="2" y="4" width="20" height="16" rx="2"/><path d="m22 7-10 6L2 7"/>',
+  send: '<path d="m22 2-7 20-4-9-9-4Z"/><path d="M22 2 11 13"/>',
+  user: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
+  copy: '<rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/>',
+  check: '<path d="M20 6 9 17l-5-5"/>',
+  close: '<path d="M18 6 6 18M6 6l12 12"/>',
+  clock: '<circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/>',
+  refresh: '<path d="M21 12a9 9 0 1 1-3-6.7L21 8"/><path d="M21 3v5h-5"/>',
+  logout: '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><path d="m16 17 5-5-5-5"/><path d="M21 12H9"/>',
+  lock: '<rect x="3" y="11" width="18" height="11" rx="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/>',
+  alert: '<circle cx="12" cy="12" r="10"/><path d="M12 8v4M12 16h.01"/>',
+  back: '<path d="M19 12H5M12 19l-7-7 7-7"/>',
+}
+function icon(name: keyof typeof ICONS, cls = 'icon') {
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  s.setAttribute('viewBox', '0 0 24 24')
+  s.setAttribute('class', cls)
+  s.setAttribute('aria-hidden', 'true')
+  s.innerHTML = ICONS[name] // static strings above, never user data
+  return s
+}
+const btn = (cls: string, label: string, ic?: keyof typeof ICONS, props: Record<string, unknown> = {}) =>
+  h('button', { type: 'button', className: cls, ...props }, ...(ic ? [icon(ic)] : []), h('span', { className: 'btn-label' }, label))
+
+const emptyState = (ic: keyof typeof ICONS, title: string, text: string) =>
+  h('div', { className: 'empty' }, h('span', { className: 'empty-art' }, icon(ic, 'icon icon-xl')),
+    h('p', { className: 'empty-title' }, title), h('p', { className: 'empty-text' }, text))
+const errorState = (text: string) => h('p', { className: 'form-error', role: 'alert' }, icon('alert'), text)
+const skeleton = () => h('ul', { className: 'message-list', ariaBusy: 'true', ariaLabel: 'Loading messages' },
+  ...Array.from({ length: 7 }, () => h('li', { className: 'skel-row' },
+    h('span', { className: 'skel skel-from' }), h('span', { className: 'skel skel-date' }),
+    h('span', { className: 'skel skel-subject' }), h('span', { className: 'skel skel-preview' }))))
+
+const fmtShort = (iso: string) => {
+  const d = new Date(iso)
+  return d.toDateString() === new Date().toDateString()
+    ? d.toLocaleTimeString(undefined, { timeStyle: 'short' })
+    : d.toLocaleDateString(undefined, { month: 'short', day: 'numeric' })
+}
+
 const errorText: Record<string, string> = {
   invalid_credentials: 'Email or password is incorrect.',
   too_many_attempts: 'Too many attempts. Try again in 15 minutes.',
   mail_server_unavailable: 'Mail server is unavailable. Try again shortly.',
 }
 
+const field = (label: string, ic: keyof typeof ICONS, input: HTMLInputElement) =>
+  h('div', { className: 'field' }, h('label', { htmlFor: input.id }, label), h('div', { className: 'input-wrap' }, icon(ic), input))
+
+const brand = (sub?: string) => h('div', { className: 'brand' }, h('span', { className: 'brand-mark' }, 'IRIS'), ...(sub ? [h('span', { className: 'brand-sub' }, sub)] : []))
+
 function renderLogin() {
   const status = h('p', { className: 'form-error', role: 'alert' })
-  const email = h('input', { type: 'email', name: 'email', id: 'email', required: true, autocomplete: 'username' })
+  const email = h('input', { type: 'email', name: 'email', id: 'email', required: true, autocomplete: 'username', placeholder: 'you@meowlabs.id' })
   const password = h('input', { type: 'password', name: 'password', id: 'password', required: true, autocomplete: 'current-password' })
-  const submit = h('button', { type: 'submit', className: 'btn-primary' }, 'Sign in')
-  const form = h('form', { className: 'login-card' },
-    h('h1', {}, 'IRIS'),
-    h('p', { className: 'muted' }, 'Every message finds its way.'),
-    h('label', { htmlFor: 'email' }, 'Email'), email,
-    h('label', { htmlFor: 'password' }, 'Password'), password,
+  const submit = h('button', { type: 'submit', className: 'btn btn-primary btn-block' }, 'Sign in')
+  const form = h('form', { className: 'auth-card' },
+    h('header', { className: 'auth-head' }, brand('by Meow Labs'), h('h1', {}, 'Sign in to your mailbox'), h('p', { className: 'muted' }, 'Every message finds its way.')),
+    field('Email', 'mail', email), field('Password', 'lock', password),
     status, submit,
-    h('a', { href: '#/temp', className: 'temp-link' }, 'Need a disposable address? Get a temporary inbox'))
+    h('a', { href: '#/temp', className: 'link' }, icon('clock'), 'Need a disposable address? Get a temporary inbox'))
+  const clearErr = () => { status.replaceChildren(); [email, password].forEach((i) => i.removeAttribute('aria-invalid')) }
+  email.oninput = password.oninput = clearErr
   form.addEventListener('submit', async (e) => {
     e.preventDefault()
     submit.disabled = true
-    status.textContent = ''
+    submit.textContent = 'Signing in…'
+    clearErr()
     try {
       await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email.value, password: password.value }) })
       await renderMailbox()
     } catch (err) {
-      status.textContent = errorText[(err as HttpError).code] ?? 'Sign-in failed.'
+      const code = (err as HttpError).code
+      if (code === 'invalid_credentials') [email, password].forEach((i) => i.setAttribute('aria-invalid', 'true'))
+      status.replaceChildren(icon('alert'), errorText[code] ?? 'Sign-in failed.')
       submit.disabled = false
+      submit.textContent = 'Sign in'
     }
   })
-  app.className = 'login-shell'
+  app.className = 'auth-shell'
   app.replaceChildren(h('main', {}, form))
   email.focus()
+}
+
+// Shared three-pane shell. Mobile shows one pane at a time via data-view (list | reader).
+function mailShell(opts: { topbar: HTMLElement; nav: HTMLElement[]; listHead: HTMLElement[]; idle: HTMLElement }) {
+  const list = h('div', { className: 'list-body' }, skeleton())
+  const readerBody = h('div', { className: 'reader-body', ariaLive: 'polite' }, opts.idle)
+  const back = btn('btn btn-ghost reader-back', 'Back to list', 'back')
+  const layout = h('main', { className: 'mail-layout' },
+    h('nav', { className: 'sidebar', ariaLabel: 'Mail' }, ...opts.nav),
+    h('section', { className: 'list-pane', ariaLabel: 'Message list' }, ...opts.listHead, list),
+    h('section', { className: 'reader' }, back, readerBody))
+  layout.dataset.view = 'list'
+  back.onclick = () => { layout.dataset.view = 'list'; list.querySelector<HTMLElement>('[aria-current="true"]')?.focus() }
+  app.className = 'app-shell'
+  app.replaceChildren(opts.topbar, layout)
+  return { list, readerBody, show: () => { layout.dataset.view = 'reader'; back.focus({ preventScroll: true }) } }
+}
+
+const navItem = (href: string, ic: keyof typeof ICONS, label: string, current = false, count = '') =>
+  h('a', { href, className: 'nav-item', ...(current ? { ariaCurrent: 'page' } : {}) }, icon(ic), h('span', { className: 'nav-label' }, label),
+    ...(count ? [h('span', { className: 'nav-count' }, count)] : []))
+
+function fillList(list: HTMLElement, messages: Summary[], current: string, empty: HTMLElement, onOpen: (m: Summary, row: HTMLElement) => void) {
+  if (!messages.length) return list.replaceChildren(empty)
+  list.replaceChildren(h('ul', { className: 'message-list', ariaLabel: 'Messages' }, ...messages.map((m) => {
+    const row = h('button', { type: 'button', className: m.is_read ? 'msg' : 'msg unread' },
+      h('span', { className: 'msg-from' }, m.is_read ? '' : h('span', { className: 'unread-dot', title: 'Unread' }, h('span', { className: 'sr-only' }, 'Unread: ')), m.from.replace(/\s*<[^>]*>$/, '') || m.from || '(unknown sender)'),
+      h('time', { className: 'msg-date', dateTime: m.received_at, title: fmtDate(m.received_at) }, fmtShort(m.received_at)),
+      h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
+      h('span', { className: 'msg-preview' }, m.preview))
+    if (m.id === current) row.setAttribute('aria-current', 'true')
+    row.onclick = () => {
+      list.querySelectorAll('.msg').forEach((b) => b.removeAttribute('aria-current'))
+      row.setAttribute('aria-current', 'true')
+      row.classList.remove('unread')
+      row.querySelector('.unread-dot')?.remove()
+      onOpen(m, row)
+    }
+    return h('li', {}, row)
+  })))
 }
 
 async function renderMailbox() {
@@ -74,37 +166,37 @@ async function renderMailbox() {
   const { mailboxes } = await api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes')
   const mb = mailboxes[0].id
 
-  const logout = h('button', { type: 'button', className: 'btn-ghost' }, 'Sign out')
+  const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
   logout.onclick = async () => { await api('/auth/logout', { method: 'POST' }).catch(() => {}); renderLogin() }
-  const list = h('ul', { className: 'message-list', ariaLabel: 'Messages' })
-  const reader = h('section', { className: 'reader', ariaLive: 'polite' }, h('p', { className: 'muted' }, 'Select a message.'))
-  const listPane = h('section', { className: 'list-pane' }, h('h2', { className: 'pane-title' }, 'Inbox'), list)
-
-  app.className = 'app-shell'
-  app.replaceChildren(
-    h('header', { className: 'topbar' }, h('strong', {}, 'IRIS'), h('span', { className: 'muted' }, session.email), logout),
-    h('main', { className: 'mail-layout' }, listPane, reader))
-
-  list.replaceChildren(h('li', { className: 'muted pad' }, 'Loading…'))
-  try {
-    const { messages } = await api<{ messages: Summary[] }>(`/api/v1/mailboxes/${mb}/messages?limit=50`)
-    list.replaceChildren(...(messages.length ? messages.map((m) => {
-      const btn = h('button', { type: 'button', className: m.is_read ? 'msg' : 'msg unread' },
-        h('span', { className: 'msg-from' }, m.from || '(unknown sender)'),
-        h('span', { className: 'msg-date' }, fmtDate(m.received_at)),
-        h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
-        h('span', { className: 'msg-preview' }, m.preview))
-      btn.onclick = () => {
-        list.querySelectorAll('.msg').forEach((b) => b.removeAttribute('aria-current'))
-        btn.setAttribute('aria-current', 'true')
-        btn.classList.remove('unread')
-        openMessage(mb, m.id, reader)
-      }
-      return h('li', {}, btn)
-    }) : [h('li', { className: 'muted pad' }, 'No messages yet.')]))
-  } catch (err) {
-    list.replaceChildren(h('li', { className: 'form-error pad', role: 'alert' }, errorText[(err as HttpError).code] ?? 'Could not load messages.'))
+  const refresh = btn('btn btn-ghost btn-icon', 'Refresh', 'refresh', { title: 'Refresh' })
+  const count = h('span', { className: 'pane-count' })
+  const inboxNav = navItem('#/', 'inbox', 'Inbox', true)
+  const ui = mailShell({
+    topbar: h('header', { className: 'topbar' }, brand(),
+      h('div', { className: 'account' }, h('span', { className: 'account-chip' }, icon('user'), h('span', { className: 'account-email' }, session.email)), logout)),
+    nav: [inboxNav, navItem('#/temp', 'clock', 'Temporary inbox')],
+    listHead: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, 'Inbox'), count, refresh)],
+    idle: emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.'),
+  })
+  let current = ''
+  const load = async () => {
+    ui.list.replaceChildren(skeleton())
+    refresh.disabled = true
+    try {
+      const { messages } = await api<{ messages: Summary[] }>(`/api/v1/mailboxes/${mb}/messages?limit=50`)
+      const unread = messages.filter((m) => !m.is_read).length
+      count.textContent = unread ? `${unread} unread` : ''
+      inboxNav.querySelector('.nav-count')?.remove()
+      if (unread) inboxNav.append(h('span', { className: 'nav-count' }, String(unread)))
+      fillList(ui.list, messages, current,
+        emptyState('inbox', 'Your inbox is clear', 'New mail for this address will appear here.'),
+        (m) => { current = m.id; ui.show(); openMessage(mb, m.id, ui.readerBody) })
+    } catch (err) {
+      ui.list.replaceChildren(h('div', { className: 'pad' }, errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.')))
+    } finally { refresh.disabled = false }
   }
+  refresh.onclick = load
+  await load()
 }
 
 async function openMessage(mb: string, id: string, reader: HTMLElement) {
@@ -112,7 +204,8 @@ async function openMessage(mb: string, id: string, reader: HTMLElement) {
 }
 
 async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void) {
-  reader.replaceChildren(h('p', { className: 'muted' }, 'Loading…'))
+  reader.replaceChildren(h('div', { className: 'reader-skel', ariaBusy: 'true' },
+    h('span', { className: 'skel skel-title' }), h('span', { className: 'skel skel-subject' }), h('span', { className: 'skel skel-preview' })))
   try {
     const { message: m } = await api<{ message: Detail }>(url, init)
     let body: HTMLElement
@@ -125,16 +218,18 @@ async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit
     } else {
       body = h('pre', { className: 'mail-text' }, m.text_body ?? '')
     }
+    const initial = (m.from.replace(/[^\p{L}\p{N}]/gu, '')[0] ?? '?').toUpperCase()
     reader.replaceChildren(
       h('h1', { className: 'reader-subject' }, m.subject || '(no subject)'),
-      h('dl', { className: 'reader-meta' },
-        h('dt', {}, 'From'), h('dd', {}, m.from),
-        h('dt', {}, 'To'), h('dd', {}, m.to.join(', ')),
-        h('dt', {}, 'Date'), h('dd', {}, fmtDate(m.received_at))),
+      h('div', { className: 'reader-head' }, h('span', { className: 'avatar', ariaHidden: 'true' }, initial),
+        h('dl', { className: 'reader-meta' },
+          h('dt', {}, 'From'), h('dd', { className: 'reader-from' }, m.from),
+          h('dt', {}, 'To'), h('dd', {}, m.to.join(', ')),
+          h('dt', {}, 'Date'), h('dd', {}, h('time', { dateTime: m.received_at }, fmtDate(m.received_at))))),
       body)
   } catch (err) {
     if ([401, 410].includes((err as HttpError).status)) return onAuthFail()
-    reader.replaceChildren(h('p', { className: 'form-error', role: 'alert' }, 'Could not open message.'))
+    reader.replaceChildren(errorState('Could not open message.'))
   }
 }
 
@@ -151,25 +246,31 @@ const tempErrors: Record<string, string> = {
 
 function renderTempStart(note = '') {
   stopTemp()
-  const status = h('p', { className: 'form-error', role: 'alert' }, note)
-  const create = h('button', { type: 'button', className: 'btn-primary' }, 'Create temporary address')
+  const status = h('p', { className: 'form-error', role: 'alert' }, ...(note ? [icon('alert'), note] : []))
+  const create = h('button', { type: 'button', className: 'btn btn-primary btn-block' }, 'Create temporary address')
   create.onclick = async () => {
     create.disabled = true
+    create.textContent = 'Creating…'
     try {
       const inbox = await api<TempInbox>('/api/v1/temp-inboxes', { method: 'POST' })
       sessionStorage.setItem(TEMP_KEY, JSON.stringify(inbox))
       renderTempInbox(inbox)
     } catch (err) {
-      status.textContent = tempErrors[(err as HttpError).code] ?? 'Could not create an address.'
+      status.replaceChildren(icon('alert'), tempErrors[(err as HttpError).code] ?? 'Could not create an address.')
       create.disabled = false
+      create.textContent = 'Create temporary address'
     }
   }
-  app.className = 'login-shell'
-  app.replaceChildren(h('main', {}, h('section', { className: 'login-card' },
-    h('h1', {}, 'IRIS'),
-    h('p', { className: 'muted' }, 'Receive-only address that expires after 1 hour. Messages are deleted with it; you cannot send from it.'),
+  app.className = 'auth-shell'
+  app.replaceChildren(h('main', {}, h('section', { className: 'auth-card' },
+    h('header', { className: 'auth-head' }, brand('Temporary inbox'), h('h1', {}, 'Get a disposable address'),
+      h('p', { className: 'muted' }, 'Receive-only. No sign-up needed.')),
+    h('ul', { className: 'facts' },
+      h('li', {}, icon('clock'), 'Expires after 1 hour, messages are deleted with it.'),
+      h('li', {}, icon('inbox'), 'Receive only. You cannot send from it.'),
+      h('li', {}, icon('lock'), 'Not for sensitive or long-term mail.')),
     status, create,
-    h('a', { href: '#/', className: 'temp-link' }, 'Sign in to your mailbox'))))
+    h('a', { href: '#/', className: 'link' }, icon('user'), 'Sign in to your mailbox'))))
   create.focus()
 }
 
@@ -179,54 +280,48 @@ function renderTempInbox(inbox: TempInbox) {
   const base = `/api/v1/temp-inboxes/${inbox.id}`
   const expired = () => { sessionStorage.removeItem(TEMP_KEY); renderTempStart('This temporary address has expired.') }
 
-  const copy = h('button', { type: 'button', className: 'btn-ghost' }, 'Copy')
+  const copy = btn('btn btn-secondary', 'Copy', 'copy')
+  const copyLabel = copy.querySelector('.btn-label')!
   copy.onclick = async () => {
-    await navigator.clipboard.writeText(inbox.address).then(() => { copy.textContent = 'Copied' }, () => { copy.textContent = 'Copy failed' })
-    setTimeout(() => { copy.textContent = 'Copy' }, 1500)
+    const ok = await navigator.clipboard.writeText(inbox.address).then(() => true, () => false)
+    copy.replaceChildren(icon(ok ? 'check' : 'alert'), copyLabel)
+    copyLabel.textContent = ok ? 'Copied' : 'Copy failed'
+    copy.classList.toggle('is-done', ok)
+    setTimeout(() => { copy.replaceChildren(icon('copy'), copyLabel); copyLabel.textContent = 'Copy'; copy.classList.remove('is-done') }, 1500)
   }
-  const countdown = h('span', { className: 'temp-countdown', ariaLive: 'off' })
+  const countdown = h('span', { className: 'countdown' })
+  const badge = h('span', { className: 'expiry-badge', title: `Expires ${fmtDate(inbox.expires_at)}` }, icon('clock'), countdown)
   const tick = () => {
     const s = Math.max(0, Math.floor((Date.parse(inbox.expires_at) - Date.now()) / 1000))
-    countdown.textContent = `Expires in ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`
+    countdown.textContent = `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')} left`
+    badge.classList.toggle('is-urgent', s < 300)
     if (s === 0) expired()
   }
-  const discard = h('button', { type: 'button', className: 'btn-ghost' }, 'New address')
+  const discard = btn('btn btn-ghost btn-icon-sm', 'Discard address', 'close')
   discard.onclick = () => { sessionStorage.removeItem(TEMP_KEY); renderTempStart() }
+  const syncNote = h('p', { className: 'sync-note', ariaLive: 'polite' }, h('span', { className: 'live-dot' }), 'Checking every 10 seconds')
 
-  const list = h('ul', { className: 'message-list', ariaLabel: 'Messages' })
-  const reader = h('section', { className: 'reader', ariaLive: 'polite' }, h('p', { className: 'muted' }, 'Waiting for mail. This list refreshes every 10 seconds.'))
+  const ui = mailShell({
+    topbar: h('header', { className: 'topbar' }, brand('Temporary'), h('div', { className: 'account' }, discard)),
+    nav: [navItem('#/', 'inbox', 'Mailbox'), navItem('#/temp', 'clock', 'Temporary inbox', true)],
+    listHead: [h('div', { className: 'temp-card' },
+      h('span', { className: 'temp-label' }, 'Your temporary address'),
+      h('code', { className: 'temp-address' }, inbox.address),
+      h('div', { className: 'temp-actions' }, copy, badge), syncNote)],
+    idle: emptyState('mail', 'No message selected', 'Messages sent to your temporary address open here.'),
+  })
   let current = ''
   const load = async () => {
     try {
       const { messages } = await api<{ messages: Summary[] }>(`${base}/messages`, auth)
-      list.replaceChildren(...(messages.length ? messages.map((m) => {
-        const btn = h('button', { type: 'button', className: 'msg' },
-          h('span', { className: 'msg-from' }, m.from || '(unknown sender)'),
-          h('span', { className: 'msg-date' }, fmtDate(m.received_at)),
-          h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
-          h('span', { className: 'msg-preview' }, m.preview))
-        if (m.id === current) btn.setAttribute('aria-current', 'true')
-        btn.onclick = () => {
-          current = m.id
-          list.querySelectorAll('.msg').forEach((b) => b.removeAttribute('aria-current'))
-          btn.setAttribute('aria-current', 'true')
-          openMessageAt(`${base}/messages/${encodeURIComponent(m.id)}`, reader, auth, expired)
-        }
-        return h('li', {}, btn)
-      }) : [h('li', { className: 'muted pad' }, 'No messages yet.')]))
+      fillList(ui.list, messages, current,
+        emptyState('send', 'Waiting for mail', 'Share the address above. New messages show up here automatically.'),
+        (m) => { current = m.id; ui.show(); openMessageAt(`${base}/messages/${encodeURIComponent(m.id)}`, ui.readerBody, auth, expired) })
     } catch (err) {
       if ([401, 404, 410].includes((err as HttpError).status)) return expired()
-      list.replaceChildren(h('li', { className: 'form-error pad', role: 'alert' }, 'Could not load messages.'))
+      ui.list.replaceChildren(h('div', { className: 'pad' }, errorState('Could not load messages.')))
     }
   }
-
-  app.className = 'app-shell'
-  app.replaceChildren(
-    h('header', { className: 'topbar' }, h('strong', {}, 'IRIS'),
-      h('code', { className: 'temp-address' }, inbox.address), copy, countdown, discard),
-    h('main', { className: 'mail-layout' },
-      h('section', { className: 'list-pane' }, h('h2', { className: 'pane-title' }, 'Temporary inbox'), list), reader))
-  list.replaceChildren(h('li', { className: 'muted pad' }, 'Loading…'))
   tick(); load()
   tempTimers = [setInterval(tick, 1000), setInterval(load, 10_000)]
 }
@@ -239,7 +334,7 @@ function route() {
   }
   renderMailbox().catch((err) => {
     if ((err as HttpError).status === 401) renderLogin()
-    else app.replaceChildren(h('p', { className: 'form-error pad', role: 'alert' }, 'Service unavailable. Reload to retry.'))
+    else app.replaceChildren(h('div', { className: 'pad' }, errorState('Service unavailable. Reload to retry.')))
   })
 }
 window.addEventListener('hashchange', route)
