@@ -44,10 +44,10 @@ Use the official Meow Labs logo and brand red when available. The colors below a
   --iris-surface: #FFFFFF;
   --iris-surface-subtle: #F1F1EB;
   --iris-text: #171717;
-  --iris-text-secondary: #707070;
-  --iris-text-tertiary: #8A8A83;
-  --iris-border: #D9D9D2;
-  --iris-border-strong: #B8B8AF;
+  --iris-text-secondary: #5E5E58; /* AA on all surfaces */
+  --iris-text-tertiary: #6B6B64;
+  --iris-border: #E2E2DA;
+  --iris-border-strong: #8C8C84; /* inputs: >=3:1 */
 
   /* Replace with official Meow Labs red after confirmation. */
   --iris-accent: #B83232;
@@ -56,7 +56,7 @@ Use the official Meow Labs logo and brand red when available. The colors below a
 
   --iris-success: #2F6B3B;
   --iris-success-subtle: #EAF3EB;
-  --iris-warning: #A35A1C;
+  --iris-warning: #8A4A14;
   --iris-warning-subtle: #FAF0E4;
   --iris-danger: #9E2F2F;
   --iris-danger-subtle: #F8EAEA;
@@ -128,7 +128,7 @@ Use a 4px base scale.
   --iris-radius-lg: 10px;
 
   --iris-sidebar-width: 220px;
-  --iris-list-width: 340px;
+  --iris-list-width: 360px;
   --iris-topbar-height: 60px;
   --iris-control-height: 36px;
 }
@@ -150,7 +150,7 @@ Use a three-pane layout:
 
 Suggested starting widths at 1440px:
 - Sidebar: 220px
-- Message list: 340px
+- Message list: 360px
 - Reading pane: remaining space
 - Top bar: 60px
 
