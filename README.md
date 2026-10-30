@@ -87,10 +87,31 @@ iris.meowlabs.id {
     encode gzip
     handle /api/* { reverse_proxy 127.0.0.1:8000 { header_up X-Real-IP {remote_host} } }
     handle /auth/* { reverse_proxy 127.0.0.1:8000 { header_up X-Real-IP {remote_host} } }
-    handle { root * /srv/iris/dist; file_server }
+    handle {
+        root * /srv/iris/dist
+        @hashed path /assets/*
+        header @hashed Cache-Control "public, max-age=31536000, immutable"
+        file_server
+    }
+    handle_errors 404 {
+        root * /srv/iris/dist
+        rewrite * /404.html
+        file_server
+    }
     header Strict-Transport-Security "max-age=31536000"
 }
 ```
+
+Public site settings (build-time, all optional — defaults in `apps/web/vite.config.ts`):
+
+| Variable | Default | Used for |
+|---|---|---|
+| `VITE_SITE_URL` | `https://iris.meowlabs.id` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
+| `VITE_CONTACT_EMAIL` | `postmaster@meowlabs.id` | footer + Privacy/Terms contact |
+| `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
+| `VITE_ANALYTICS_SRC` / `VITE_ANALYTICS_DOMAIN` | empty (off) | Plausible-compatible script, loaded only after cookie consent. Add its host to your CSP if you set one. |
+
+Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.txt` and `sitemap.xml`.
 
 ### 4. Verify before go-live
 
