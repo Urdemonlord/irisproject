@@ -56,6 +56,15 @@ function svgUse(id: string, viewBox: string, cls: string) {
   return s
 }
 const icon = (id: string, cls = 'icon') => svgUse(`i-${id}`, '0 0 20 20', cls)
+const eyeMark = (cls = 'eye-mark') => {
+  const s = document.createElementNS('http://www.w3.org/2000/svg', 'svg')
+  s.setAttribute('viewBox', '0 0 48 28')
+  s.setAttribute('class', cls)
+  s.setAttribute('aria-hidden', 'true')
+  s.setAttribute('focusable', 'false')
+  s.innerHTML = '<path d="M2 14 C8 3 40 3 46 14 C40 25 8 25 2 14 Z" fill="var(--iris-vermilion)"/><path d="M24 8 C21 11 21 17 24 20 C27 17 27 11 24 8 Z" fill="var(--iris-ink)"/>'
+  return s
+}
 const mascot = (id: 'cat-peek' | 'cat-sleep', cls = 'mascot') => svgUse(id, id === 'cat-peek' ? '0 -4 160 82' : '0 0 260 150', cls)
 
 /** Text button with optional icon. Icon-only variants keep the label for screen readers. */
@@ -94,7 +103,7 @@ const tempErrors: Record<string, string> = {
   network: errorText.network,
 }
 
-const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: 'IRIS home' }, h('span', { className: 'brand-mark' }, 'IRIS'), h('span', { className: 'brand-sub' }, sub))
+const brand = (sub: string) => h('a', { href: '#/', className: 'brand', ariaLabel: 'IRIS home' }, h('span', { className: 'brand-mark' }, eyeMark(), 'IRIS'), h('span', { className: 'brand-sub' }, sub))
 
 // ---------- cat with trackable eyes ----------
 const CAT_BODY = `
@@ -164,7 +173,7 @@ function renderLogin() {
   trackEyes(email, catWrap)
 
   const left = h('div', { className: 'login-left' },
-    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, 'IRIS'), h('span', {}, 'Meow Labs')),
+    h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, eyeMark('eye-mark wordmark-eye'), 'IRIS'), h('span', {}, 'Meow Labs')),
     h('p', { className: 'login-tagline' }, h('span', {}, 'Every'), h('span', {}, 'message'), h('span', {}, 'finds'), h('span', {}, 'its way.')),
     h('div', { className: 'login-route', 'aria-hidden': 'true' }, h('div', { className: 'route-line' }), h('div', { className: 'route-nodes' }, h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-rd' })), catWrap),
     h('div', { className: 'login-footer' }, h('span', {}, 'MX → Auth → Inbox'), h('span', {}, location.hostname)))
