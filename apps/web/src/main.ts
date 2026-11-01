@@ -62,7 +62,7 @@ const eyeMark = (cls = 'eye-mark') => {
   s.setAttribute('class', cls)
   s.setAttribute('aria-hidden', 'true')
   s.setAttribute('focusable', 'false')
-  s.innerHTML = '<path d="M2 14 C8 3 40 3 46 14 C40 25 8 25 2 14 Z" fill="var(--iris-vermilion)"/><path d="M24 8 C21 11 21 17 24 20 C27 17 27 11 24 8 Z" fill="var(--iris-ink)"/>'
+  s.innerHTML = '<path d="M2 14 C8 3 40 3 46 14 C40 25 8 25 2 14 Z" fill="var(--iris-vermilion)" stroke="var(--iris-cream)" stroke-width="1.5" stroke-linejoin="round" paint-order="stroke fill"/><path d="M24 8 C21 11 21 17 24 20 C27 17 27 11 24 8 Z" fill="var(--iris-ink)"/>'
   return s
 }
 const mascot = (id: 'cat-peek' | 'cat-sleep', cls = 'mascot') => svgUse(id, id === 'cat-peek' ? '0 -4 160 82' : '0 0 260 150', cls)
