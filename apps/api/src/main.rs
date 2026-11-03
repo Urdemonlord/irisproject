@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
@@ -8,7 +8,7 @@ use axum::{
 };
 use iris_auth as auth;
 use iris_config::Config;
-use iris_mail::{JmapClient, MailError, ResendClient};
+use iris_mail::{Compose, JmapClient, MailError, ResendClient};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -71,7 +71,7 @@ async fn main() {
     let state = Arc::new(AppState {
         pool,
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
-        relay: (!config.resend_api_key.is_empty()).then(|| ResendClient::new(config.resend_api_key.clone())),
+        relay: (!config.resend_api_key.is_empty()).then(|| ResendClient::with_endpoint(config.resend_api_key.clone(), config.resend_api_url.clone())),
         config: config.clone(),
     });
     tokio::spawn(cleanup::run(state.clone()));
@@ -94,6 +94,7 @@ async fn main() {
         .route("/ready", get(ready))
         .route("/auth/csrf", get(csrf))
         .route("/auth/login", post(login))
+        .route("/internal/v1/timeless-password-reset", post(timeless_password_reset).layer(DefaultBodyLimit::max(1024)))
         .route("/api/v1/temp-inboxes", post(temp::create))
         .route("/api/v1/temp-inboxes/:id", get(temp::status))
         .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
@@ -106,6 +107,71 @@ async fn main() {
     let listener = tokio::net::TcpListener::bind(&addr).await.expect("bind");
     tracing::info!("IRIS API listening on http://{addr}");
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>()).await.expect("server");
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TimelessPasswordResetBody {
+    token: String,
+}
+
+fn valid_reset_token(token: &str) -> bool {
+    token.len() == 43 && token.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+fn valid_dns_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > 253 || !name.is_ascii() {
+        return false;
+    }
+    let labels: Vec<_> = name.split('.').collect();
+    labels.len() >= 2 && labels.iter().all(|label| {
+        !label.is_empty() && label.len() <= 63
+            && label.as_bytes()[0].is_ascii_alphanumeric()
+            && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
+            && label.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-')
+    })
+}
+
+fn reset_email_configured(s: &AppState) -> bool {
+    let valid_email = |email: &str| {
+        email.len() <= 254
+            && email.contains('@')
+            && !email.bytes().any(|b| b.is_ascii_whitespace() || b == b'<' || b == b'>' || b == b'\r' || b == b'\n')
+    };
+    s.config.iris_timeless_service_token.len() >= 32
+        && valid_email(&s.config.iris_timeless_email_from)
+        && valid_email(&s.config.iris_timeless_email_to)
+        && valid_dns_name(&s.config.timeless_public_origin)
+        && s.relay.is_some()
+}
+
+async fn timeless_password_reset(State(s): S, headers: HeaderMap, Json(body): Json<TimelessPasswordResetBody>) -> ApiResult {
+    let supplied = headers.get(header::AUTHORIZATION).and_then(|h| h.to_str().ok())
+        .and_then(|value| value.strip_prefix("Bearer "));
+    if !supplied.is_some_and(|value| auth::ct_eq(&s.config.iris_timeless_service_token, value)) {
+        return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized"));
+    }
+    if !reset_email_configured(&s) {
+        return Err(ApiError(StatusCode::SERVICE_UNAVAILABLE, "service_unavailable"));
+    }
+    if !valid_reset_token(&body.token) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+
+    let link = format!("https://{}/admin/reset#token={}", s.config.timeless_public_origin, body.token);
+    let message = Compose {
+        from: s.config.iris_timeless_email_from.clone(),
+        to: vec![s.config.iris_timeless_email_to.clone()],
+        subject: "Reset your Timeless editor password".to_string(),
+        text: format!("A password reset was requested for the Timeless editor account.\n\nUse this one-time link within 15 minutes:\n{link}\n\nIf you did not request this, ignore this message."),
+        ..Compose::default()
+    };
+    let relay = s.relay.as_ref().expect("reset configuration checks relay");
+    if relay.send(&message).await.is_err() {
+        tracing::warn!("Timeless password reset email relay failed; details redacted");
+        return Err(ApiError(StatusCode::BAD_GATEWAY, "delivery_unavailable"));
+    }
+    Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response())
 }
 
 async fn ready(State(s): S) -> Json<serde_json::Value> {
@@ -328,4 +394,146 @@ async fn get_message(State(s): S, Extension(u): Extension<CurrentUser>, Path((ma
     }
     let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;
     Ok(Json(json!({ "message": m })).into_response())
+}
+
+#[cfg(test)]
+mod timeless_password_reset_tests {
+    use super::*;
+    use serde_json::Value;
+    use sqlx::sqlite::SqlitePoolOptions;
+    use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
+    use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
+
+    const SERVICE_KEY: &str = "test-service-key-never-use-in-production";
+    const GOOD_TOKEN: &str = "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+
+    struct FakeRelay {
+        endpoint: String,
+        calls: Arc<AtomicUsize>,
+        payload: oneshot::Receiver<Value>,
+        task: JoinHandle<()>,
+    }
+
+    async fn fake_relay() -> FakeRelay {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let (tx, payload) = oneshot::channel();
+        let task = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(2), listener.accept()).await else { return };
+            task_calls.fetch_add(1, Ordering::SeqCst);
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut expected = None;
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else { return };
+                if n == 0 { return; }
+                bytes.extend_from_slice(&chunk[..n]);
+                if expected.is_none() {
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers.lines().find_map(|line| {
+                            let (name, value) = line.split_once(':')?;
+                            name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse::<usize>().ok()).flatten()
+                        }).unwrap_or(0);
+                        expected = Some(end + 4 + length);
+                    }
+                }
+                if expected.is_some_and(|end| bytes.len() >= end) { break; }
+            }
+            let body_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+            let body: Value = serde_json::from_slice(&bytes[body_start..]).unwrap();
+            let _ = tx.send(body);
+            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"id\":\"ok\"}").await;
+        });
+        FakeRelay { endpoint: format!("http://{address}"), calls, payload, task }
+    }
+
+    async fn state(service_key: &str, sender: &str, recipient: &str, origin: &str, relay: Option<ResendClient>) -> Arc<AppState> {
+        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        Arc::new(AppState {
+            pool,
+            jmap: JmapClient::new("http://127.0.0.1:9".into()),
+            relay,
+            config: Config {
+                env: "test".into(), host: "127.0.0.1".into(), port: 8000,
+                database_url: "sqlite::memory:".into(), session_secret: "test-secret".into(),
+                stalwart_api_url: "http://127.0.0.1:9".into(), temp_inbox_domain: "example.test".into(),
+                temp_inbox_default_expiry_hours: 1, temp_inbox_mail_user: String::new(),
+                temp_inbox_mail_password: String::new(), send_local_domains: vec![], send_external: false,
+                resend_api_key: "test-resend-key".into(), iris_timeless_service_token: service_key.into(),
+                iris_timeless_email_from: sender.into(), iris_timeless_email_to: recipient.into(),
+                timeless_public_origin: origin.into(), resend_api_url: String::new(),
+            },
+        })
+    }
+
+    fn auth_headers(value: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {value}").parse().unwrap());
+        headers
+    }
+
+    async fn assert_no_relay_call(relay: &mut FakeRelay) {
+        assert!(timeout(Duration::from_millis(40), &mut relay.payload).await.is_err());
+        assert_eq!(relay.calls.load(Ordering::SeqCst), 0);
+        relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_or_wrong_service_key() {
+        let mut relay = fake_relay().await;
+        let app = state(SERVICE_KEY, "no-reply@meowlabs.id", "recovery@example.test", "timeless.meowlabs.id", Some(ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()))).await;
+        let missing = timeless_password_reset(State(app.clone()), HeaderMap::new(), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap_err();
+        assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
+        let wrong = timeless_password_reset(State(app), auth_headers("wrong-service-key"), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap_err();
+        assert_eq!(wrong.0, StatusCode::UNAUTHORIZED);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_malformed_token_without_relay_call() {
+        let mut relay = fake_relay().await;
+        let app = state(SERVICE_KEY, "no-reply@meowlabs.id", "recovery@example.test", "timeless.meowlabs.id", Some(ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()))).await;
+        let result = timeless_password_reset(State(app), auth_headers(SERVICE_KEY), Json(TimelessPasswordResetBody { token: "not-a-reset-token".into() })).await.unwrap_err();
+        assert_eq!(result.0, StatusCode::BAD_REQUEST);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_config_without_relay_call() {
+        let mut relay = fake_relay().await;
+        let app = state(SERVICE_KEY, "", "", "", Some(ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()))).await;
+        let unauthenticated = timeless_password_reset(State(app.clone()), HeaderMap::new(), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap_err();
+        assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
+        let authenticated = timeless_password_reset(State(app), auth_headers(SERVICE_KEY), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap_err();
+        assert_eq!(authenticated.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
+    async fn rejects_missing_recipient_secret_without_relay_call() {
+        let mut relay = fake_relay().await;
+        let app = state(SERVICE_KEY, "admin@meowlabs.id", "", "timeless.meowlabs.id", Some(ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()))).await;
+        let result = timeless_password_reset(State(app), auth_headers(SERVICE_KEY), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap_err();
+        assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
+    async fn builds_email_with_fixed_recipient_sender_and_fragment_link() {
+        let relay = fake_relay().await;
+        let app = state(SERVICE_KEY, "admin@meowlabs.id", "recovery@example.test", "timeless.meowlabs.id", Some(ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()))).await;
+        let response = timeless_password_reset(State(app), auth_headers(SERVICE_KEY), Json(TimelessPasswordResetBody { token: GOOD_TOKEN.into() })).await.unwrap();
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        let payload = timeout(Duration::from_secs(1), relay.payload).await.unwrap().unwrap();
+        assert_eq!(payload["from"], "admin@meowlabs.id");
+        assert_eq!(payload["to"], json!(["recovery@example.test"]));
+        assert_eq!(payload["subject"], "Reset your Timeless editor password");
+        let text = payload["text"].as_str().unwrap();
+        assert!(text.contains(&format!("https://timeless.meowlabs.id/admin/reset#token={GOOD_TOKEN}")));
+        assert!(!text.contains("?token="));
+        relay.task.abort();
+    }
 }

@@ -520,17 +520,23 @@ mod tests {
 #[derive(Clone)]
 pub struct ResendClient {
     api_key: String,
+    endpoint: String,
     http: reqwest::Client,
 }
 
 impl ResendClient {
     pub fn new(api_key: String) -> Self {
+        Self::with_endpoint(api_key, "https://api.resend.com/emails".to_string())
+    }
+
+    /// Creates a client for a configured non-production relay endpoint.
+    pub fn with_endpoint(api_key: String, endpoint: String) -> Self {
         let http = reqwest::Client::builder().timeout(std::time::Duration::from_secs(20)).build().expect("reqwest client");
-        Self { api_key, http }
+        Self { api_key, endpoint, http }
     }
 
     pub async fn send(&self, c: &Compose) -> Result<String, MailError> {
-        let resp = self.http.post("https://api.resend.com/emails")
+        let resp = self.http.post(&self.endpoint)
             .bearer_auth(&self.api_key)
             .json(&resend_json(c))
             .send().await

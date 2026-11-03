@@ -9,6 +9,12 @@ services:
       - "127.0.0.1:8000:8000"
     environment:
       DATABASE_URL: sqlite:///data/iris.db
+      RESEND_API_KEY: ${RESEND_API_KEY:-}
+      IRIS_TIMELESS_SERVICE_TOKEN: ${IRIS_TIMELESS_SERVICE_TOKEN:-}
+      IRIS_TIMELESS_EMAIL_FROM: ${IRIS_TIMELESS_EMAIL_FROM:-}
+      IRIS_TIMELESS_EMAIL_TO: ${IRIS_TIMELESS_EMAIL_TO:-}
+      TIMELESS_PUBLIC_ORIGIN: ${TIMELESS_PUBLIC_ORIGIN:-}
+      IRIS_RESEND_API_URL: ${IRIS_RESEND_API_URL:-}
     volumes:
       - api-data:/data
     depends_on:

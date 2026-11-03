@@ -66,6 +66,8 @@ cp .env.example .env   # then edit
 | `SESSION_SECRET` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
 | `STALWART_API_URL` | `http://127.0.0.1:8092` |
 | `TEMP_INBOX_DOMAIN`, `TEMP_INBOX_MAIL_USER`, `TEMP_INBOX_MAIL_PASSWORD` | catch-all domain + account |
+| `IRIS_TIMELESS_EMAIL_FROM` | verified sender identity for Timeless recovery messages |
+| `IRIS_TIMELESS_EMAIL_TO` | fixed recovery recipient; store only in the ignored, mode-600 `.env` or deployment secret store; never accept from request data |
 
 Migrations run automatically on start. Run under systemd (`Restart=always`) as an unprivileged user.
 The cleanup job runs inside the API every 60 s (log line `cleanup marked=… purged=…`); no cron needed.
