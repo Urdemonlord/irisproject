@@ -142,18 +142,36 @@ async fn require_csrf(headers: HeaderMap, req: Request, next: Next) -> Response 
 struct LoginBody { email: String, password: String }
 
 const MAX_FAILED_LOGINS: i64 = 10; // per email per 15 minutes
+const MAX_FAILED_LOGINS_PER_IP: i64 = 50; // per client IP per 15 minutes (tolerant of shared NAT)
 
-async fn login(State(s): S, headers: HeaderMap, Json(b): Json<LoginBody>) -> ApiResult {
+/// Peer IP; trust X-Real-IP only when the peer is the local reverse proxy.
+fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> String {
+    let fwd = headers.get("x-real-ip").and_then(|h| h.to_str().ok()).map(str::trim);
+    match fwd {
+        Some(ip) if peer.ip().is_loopback() && ip.parse::<std::net::IpAddr>().is_ok() => ip.to_string(),
+        _ => peer.ip().to_string(),
+    }
+}
+
+async fn login(State(s): S, axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>, headers: HeaderMap, Json(b): Json<LoginBody>) -> ApiResult {
     let email = b.email.trim().to_lowercase();
     if email.is_empty() || !email.contains('@') || b.password.is_empty() || email.len() > 254 {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     let subject = auth::hash_token(&format!("login:{email}"));
+    let ip = client_ip(peer, &headers);
+    let ip_subject = auth::hash_token(&format!("login-ip:{ip}"));
     let since = (chrono::Utc::now() - chrono::Duration::minutes(15)).to_rfc3339();
     let failures: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='login' AND outcome='blocked' AND occurred_at>?",
     ).bind(&subject).bind(&since).fetch_one(&s.pool).await?;
     if failures >= MAX_FAILED_LOGINS {
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"));
+    }
+    let ip_failures: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='login' AND outcome='blocked' AND occurred_at>?",
+    ).bind(&ip_subject).bind(&since).fetch_one(&s.pool).await?;
+    if ip_failures >= MAX_FAILED_LOGINS_PER_IP {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"));
     }
 
@@ -162,6 +180,9 @@ async fn login(State(s): S, headers: HeaderMap, Json(b): Json<LoginBody>) -> Api
         Err(MailError::Auth) => {
             sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'login',?,'blocked')")
                 .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now())
+                .execute(&s.pool).await?;
+            sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'login',?,'blocked')")
+                .bind(uuid::Uuid::new_v4().to_string()).bind(&ip_subject).bind(auth::now())
                 .execute(&s.pool).await?;
             return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid_credentials"));
         }
