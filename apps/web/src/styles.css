@@ -253,6 +253,23 @@ button:disabled { cursor: not-allowed; }
 .reader-from { font-weight: 600; }
 .mail-text { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--iris-font-ui); font-size: var(--iris-text-read); line-height: var(--iris-leading-read); margin: 0; max-width: var(--iris-reading-max); }
 .mail-frame { flex: 1; min-height: 60vh; width: 100%; border: var(--iris-rule-hair); background: #fff; }
+.mail-empty-note { border: var(--iris-rule-ink); background: var(--iris-cream); padding: var(--iris-space-3) var(--iris-space-4); max-width: var(--iris-reading-max); }
+.mail-empty-note p { margin: 0 0 var(--iris-space-2); }
+.mail-empty-note p:last-child { margin-bottom: 0; }
+.mail-parts { font-size: var(--iris-text-sm); color: var(--iris-text-secondary); }
+.attach-section { margin-top: var(--iris-space-4); max-width: var(--iris-reading-max); }
+.attach-section h2 { font-size: var(--iris-text-sm); font-family: var(--iris-font-mono); text-transform: uppercase; letter-spacing: var(--iris-tracking-label); margin: 0 0 var(--iris-space-2); }
+.attach-row { display: flex; flex-wrap: wrap; gap: var(--iris-space-2) var(--iris-space-3); justify-content: space-between; align-items: flex-start; border-top: var(--iris-rule-hair); padding: var(--iris-space-3) 0; }
+.attach-meta { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.attach-meta strong { overflow-wrap: anywhere; }
+.attach-meta span { font-size: var(--iris-text-sm); color: var(--iris-text-secondary); }
+.attach-actions { display: flex; gap: var(--iris-space-2); flex-wrap: wrap; }
+.attach-preview { flex-basis: 100%; }
+.attach-inner { font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); margin: 0 0 var(--iris-space-2); overflow-wrap: anywhere; }
+.attach-text, .mail-raw { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); background: #fff; border: var(--iris-rule-hair); padding: var(--iris-space-3); margin: 0; max-height: 60vh; overflow: auto; }
+.raw-section { margin-top: var(--iris-space-4); max-width: var(--iris-reading-max); }
+.raw-box { margin-top: var(--iris-space-2); display: flex; flex-direction: column; gap: var(--iris-space-2); align-items: flex-start; }
+.raw-box .mail-raw { align-self: stretch; }
 .remote-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--iris-space-2) var(--iris-space-3); padding: var(--iris-space-2) var(--iris-space-3); border: var(--iris-rule-ink); background: var(--iris-cream); margin-bottom: var(--iris-space-4); font-size: var(--iris-text-sm); }
 .remote-bar .btn { margin-left: auto; }
 

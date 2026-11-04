@@ -1,7 +1,9 @@
 import { footerLinks, initSite, setPage } from './site'
 
 type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean }
-type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[] }
+type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
+type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
+type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
 type TempInbox = { id: string; address: string; access_token: string; expires_at: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
@@ -239,8 +241,10 @@ const errorState = (text: string, retry?: () => void) => h('div', { className: '
   h('p', { className: 'form-error' }, icon('alert'), text), ...(retry ? [btn('btn btn-secondary', 'Try again', 'refresh', { onclick: retry })] : []))
 
 const REMOTE_IMG = /<img\b[^>]*\bsrc\s*=\s*["']?\s*(https?:)?\/\//i
+const fmtBytes = (n: number) => n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`
+const previewable = (a: Attachment) => /\.gz$|\.zip$|\.xml$/i.test(a.name) || /gzip|zip|xml/i.test(a.content_type)
 function messageBody(m: Detail) {
-  if (!m.html_body) return [h('pre', { className: 'mail-text' }, m.text_body ?? '')]
+  if (!m.html_body) return m.text_body ? [h('pre', { className: 'mail-text' }, m.text_body)] : []
   const frame = (allowRemote: boolean) => {
     const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${allowRemote ? ' https:' : ''}">`
     const f = h('iframe', { className: 'mail-frame', title: 'Message body', srcdoc: csp + m.html_body, loading: 'lazy' })
@@ -254,6 +258,91 @@ function messageBody(m: Detail) {
   const bar = h('div', { className: 'remote-bar' }, icon('eye'), h('span', {}, h('strong', {}, 'Remote images blocked'), ' to protect your privacy.'), load)
   load.onclick = () => { const next = frame(true); body.replaceWith(next); body = next; bar.remove() }
   return [bar, body]
+}
+
+/** Attachments, the no-body fallback note, and View Original. Rendered
+ *  after the body for both permanent mailboxes and temp inboxes, since
+ *  both go through openMessageAt with their own detail URL + auth init.
+ *  Attachment downloads are fetched (not plain links) so temp-inbox
+ *  bearer auth travels with the request too. */
+function messageExtras(url: string, init: RequestInit | undefined, m: Detail) {
+  const nodes: HTMLElement[] = []
+  const hasBody = !!(m.html_body || m.text_body)
+  if (!hasBody) {
+    const parts = [...new Set((m.mime_parts ?? []).map((p) => p.content_type))].join(', ')
+    nodes.push(h('div', { className: 'mail-empty-note', role: 'note' },
+      h('p', {}, 'This message has no readable text body.'),
+      h('p', {}, m.attachments?.length
+        ? `It carries ${m.attachments.length} attachment${m.attachments.length > 1 ? 's' : ''} instead — open one below, or check View original to see the raw message.`
+        : 'It has no text part and no attachment, so there is nothing to render.'),
+      ...(parts ? [h('p', { className: 'mail-parts' }, `MIME parts: ${parts}`)] : [])))
+  }
+  if (m.attachments?.length) {
+    const rows = m.attachments.map((a) => {
+      const box = h('div', { className: 'attach-preview' })
+      const dl = btn('btn btn-secondary btn-sm', 'Download')
+      dl.onclick = async () => {
+        const restore = busy(dl, 'Downloading…')
+        try {
+          const res = await fetch(`${url}/attachments/${encodeURIComponent(a.part_id)}`, { credentials: 'same-origin', ...init })
+          if (!res.ok) throw new Error(`download failed (${res.status})`)
+          const blob = await res.blob()
+          const href = URL.createObjectURL(blob)
+          const link = h('a', { href, download: a.name })
+          document.body.append(link); link.click(); link.remove()
+          setTimeout(() => URL.revokeObjectURL(href), 5000)
+        } catch { box.replaceChildren(h('p', { className: 'form-error' }, 'Could not download this attachment.')) }
+        restore()
+      }
+      const actions = [dl]
+      if (previewable(a)) {
+        const pv = btn('btn btn-secondary btn-sm', 'Preview')
+        pv.onclick = async () => {
+          if (box.childNodes.length) { box.replaceChildren(); return }
+          const restore = busy(pv, 'Loading…')
+          try {
+            const p = await api<{ inner_name: string; text: string; truncated: boolean }>(`${url}/attachments/${encodeURIComponent(a.part_id)}/preview`, init)
+            box.replaceChildren(
+              h('p', { className: 'attach-inner' }, p.inner_name),
+              h('pre', { className: 'attach-text' }, p.text),
+              ...(p.truncated ? [h('p', { className: 'mail-parts' }, 'Preview truncated — download the attachment for the full file.')] : []))
+          } catch (err) {
+            box.replaceChildren(h('p', { className: 'form-error' },
+              (err as HttpError).code === 'not_previewable'
+                ? 'Preview is not available for this file type — download it instead.'
+                : 'Could not preview this attachment. Try downloading it instead.'))
+          }
+          restore()
+        }
+        actions.push(pv)
+      }
+      return h('div', { className: 'attach-row' },
+        h('div', { className: 'attach-meta' }, h('strong', {}, a.name), h('span', {}, `${a.content_type} · ${fmtBytes(a.size)}`)),
+        h('div', { className: 'attach-actions' }, ...actions), box)
+    })
+    nodes.push(h('section', { className: 'attach-section' }, h('h2', {}, 'Attachments'), ...rows))
+  }
+  const rawBox = h('div', { className: 'raw-box' })
+  const rawBtn = btn('btn btn-secondary btn-sm', 'View original')
+  rawBtn.onclick = async () => {
+    if (rawBox.childNodes.length) { rawBox.replaceChildren(); rawBtn.replaceChildren(h('span', { className: 'btn-label' }, 'View original')); return }
+    const restore = busy(rawBtn, 'Loading…')
+    try {
+      const res = await fetch(`${url}/raw`, { credentials: 'same-origin', ...init })
+      if (!res.ok) throw new Error(`raw failed (${res.status})`)
+      const text = await res.text()
+      const copy = btn('btn btn-secondary btn-sm', 'Copy')
+      copy.onclick = async () => { try { await navigator.clipboard.writeText(text) } catch { /* clipboard unavailable */ } copy.replaceChildren(h('span', { className: 'btn-label' }, 'Copied')) }
+      rawBox.replaceChildren(copy, h('pre', { className: 'mail-raw' }, text))
+      restore()
+      rawBtn.replaceChildren(h('span', { className: 'btn-label' }, 'Hide original'))
+    } catch {
+      restore()
+      rawBox.replaceChildren(h('p', { className: 'form-error' }, 'Could not load the original message.'))
+    }
+  }
+  nodes.push(h('div', { className: 'raw-section' }, rawBtn, rawBox))
+  return nodes
 }
 
 // Message bodies don't change: keep them (as promises) for instant re-open and hover prefetch.
@@ -299,7 +388,8 @@ async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit
           h('dt', {}, 'To'), h('dd', {}, m.to.join(', ') || '—'),
           ...(m.cc?.length ? [h('dt', {}, 'Cc'), h('dd', {}, m.cc.join(', '))] : []),
           h('dt', {}, 'Date'), h('dd', {}, h('time', { dateTime: m.received_at }, fmtDate(m.received_at))))),
-      ...messageBody(m))
+      ...messageBody(m),
+      ...messageExtras(url, init, m))
     reader.focus({ preventScroll: true })
   } catch (err) {
     if ([401, 410].includes((err as HttpError).status)) return onAuthFail()
