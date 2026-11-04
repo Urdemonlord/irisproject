@@ -19,6 +19,10 @@ pub struct Config {
     pub send_external: bool,
     /// Resend API key; when set, mail to other domains is relayed through Resend.
     pub resend_api_key: String,
+    /// Fixed sender identity for the Iris transactional-email API.
+    pub integration_email_from: String,
+    /// Explicit opt-in for integration email delivery; defaults to disabled.
+    pub integration_email_enabled: bool,
     /// Dedicated capability shared only with Timeless for password-reset requests.
     pub iris_timeless_service_token: String,
     /// Fixed sender identity for Timeless password-reset messages.
@@ -62,6 +66,8 @@ impl Config {
                 .split(',').map(|d| d.trim().to_lowercase()).filter(|d| !d.is_empty()).collect(),
             send_external: std::env::var("SEND_EXTERNAL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
+            integration_email_from: std::env::var("IRIS_INTEGRATION_EMAIL_FROM").unwrap_or_default(),
+            integration_email_enabled: std::env::var("IRIS_INTEGRATION_EMAIL_ENABLED").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             iris_timeless_service_token: std::env::var("IRIS_TIMELESS_SERVICE_TOKEN").unwrap_or_default(),
             iris_timeless_email_from: std::env::var("IRIS_TIMELESS_EMAIL_FROM").unwrap_or_default(),
             iris_timeless_email_to: std::env::var("IRIS_TIMELESS_EMAIL_TO").unwrap_or_default(),

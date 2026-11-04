@@ -16,7 +16,9 @@ use std::sync::Arc;
 
 mod cleanup;
 mod compose;
+mod integration_keys;
 mod temp;
+mod transactional_email;
 
 pub(crate) struct AppState {
     pool: SqlitePool,
@@ -68,6 +70,18 @@ async fn main() {
         panic!("SESSION_SECRET must be a random value of at least 32 chars in production");
     }
     let pool = iris_database::init_pool(&config.database_url).await.expect("database");
+    let mut args = std::env::args().skip(1);
+    if args.next().as_deref() == Some("integration-key") {
+        let command: Vec<String> = args.collect();
+        match integration_keys::run(&pool, &command).await {
+            Ok(output) => print!("{output}"),
+            Err(code) => {
+                eprintln!("integration-key error: {code}");
+                std::process::exit(2);
+            }
+        }
+        return;
+    }
     let state = Arc::new(AppState {
         pool,
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
@@ -95,6 +109,8 @@ async fn main() {
         .route("/auth/csrf", get(csrf))
         .route("/auth/login", post(login))
         .route("/internal/v1/timeless-password-reset", post(timeless_password_reset).layer(DefaultBodyLimit::max(1024)))
+        .route("/api/v1/integrations/email", post(transactional_email::send).layer(DefaultBodyLimit::max(8192)))
+        .route("/api/v1/integrations/email-requests/:request_id", get(transactional_email::status))
         .route("/api/v1/temp-inboxes", post(temp::create))
         .route("/api/v1/temp-inboxes/:id", get(temp::status))
         .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
@@ -400,7 +416,6 @@ async fn get_message(State(s): S, Extension(u): Extension<CurrentUser>, Path((ma
 mod timeless_password_reset_tests {
     use super::*;
     use serde_json::Value;
-    use sqlx::sqlite::SqlitePoolOptions;
     use std::{sync::{Arc, atomic::{AtomicUsize, Ordering}}, time::Duration};
     use tokio::{io::{AsyncReadExt, AsyncWriteExt}, net::TcpListener, sync::oneshot, task::JoinHandle, time::timeout};
 
@@ -451,7 +466,7 @@ mod timeless_password_reset_tests {
     }
 
     async fn state(service_key: &str, sender: &str, recipient: &str, origin: &str, relay: Option<ResendClient>) -> Arc<AppState> {
-        let pool = SqlitePoolOptions::new().max_connections(1).connect("sqlite::memory:").await.unwrap();
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         Arc::new(AppState {
             pool,
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
@@ -462,7 +477,8 @@ mod timeless_password_reset_tests {
                 stalwart_api_url: "http://127.0.0.1:9".into(), temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1, temp_inbox_mail_user: String::new(),
                 temp_inbox_mail_password: String::new(), send_local_domains: vec![], send_external: false,
-                resend_api_key: "test-resend-key".into(), iris_timeless_service_token: service_key.into(),
+                resend_api_key: "test-resend-key".into(), integration_email_from: "no-reply@meowlabs.id".into(), integration_email_enabled: true,
+                iris_timeless_service_token: service_key.into(),
                 iris_timeless_email_from: sender.into(), iris_timeless_email_to: recipient.into(),
                 timeless_public_origin: origin.into(), resend_api_url: String::new(),
             },
@@ -535,5 +551,150 @@ mod timeless_password_reset_tests {
         assert!(text.contains(&format!("https://timeless.meowlabs.id/admin/reset#token={GOOD_TOKEN}")));
         assert!(!text.contains("?token="));
         relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn transactional_email_is_fail_closed_when_delivery_is_disabled() {
+        let mut relay = fake_relay().await;
+        let mut app = state(
+            SERVICE_KEY,
+            "no-reply@meowlabs.id",
+            "unused@example.test",
+            "example.test",
+            Some(ResendClient::with_endpoint("test-relay-key".into(), relay.endpoint.clone())),
+        ).await;
+        Arc::get_mut(&mut app).unwrap().config.integration_email_enabled = false;
+        let generated = auth::generate_api_key();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES (?,?,?,?,?)")
+            .bind(&generated.key_id)
+            .bind("gencv")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify"]).to_string())
+            .bind(auth::now())
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", generated.token).parse().unwrap());
+        headers.insert("idempotency-key", "disabled-check".parse().unwrap());
+        let result = transactional_email::send(
+            State(app.clone()),
+            headers,
+            Json(transactional_email::SendEmailBody {
+                template_id: "auth.verify".into(),
+                recipient: "user@example.test".into(),
+                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            }),
+        ).await.unwrap_err();
+        assert_eq!(result.0, StatusCode::SERVICE_UNAVAILABLE);
+        let stored_requests: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_email_requests")
+            .fetch_one(&app.pool).await.unwrap();
+        assert_eq!(stored_requests, 0);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
+    async fn transactional_email_uses_fixed_sender_and_deduplicates_retries() {
+        let relay = fake_relay().await;
+        let app = state(
+            SERVICE_KEY,
+            "no-reply@meowlabs.id",
+            "unused@example.test",
+            "example.test",
+            Some(ResendClient::with_endpoint("test-relay-key".into(), relay.endpoint.clone())),
+        ).await;
+        let generated = auth::generate_api_key();
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
+            .bind(&generated.key_id)
+            .bind("gencv")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify", "email:status"]).to_string())
+            .bind(auth::now())
+            .bind(expiry)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", generated.token).parse().unwrap());
+        headers.insert("idempotency-key", "verify-user-42".parse().unwrap());
+        let body = || transactional_email::SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+        };
+        let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body())).await.unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let first_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), 4096).await.unwrap(),
+        ).unwrap();
+        let request_id = first_json["request_id"].as_str().unwrap().to_owned();
+        assert_eq!(first_json["status"], "accepted");
+
+        let payload = timeout(Duration::from_secs(1), relay.payload).await.unwrap().unwrap();
+        assert_eq!(payload["from"], "no-reply@meowlabs.id");
+        assert_eq!(payload["to"], json!(["user@example.test"]));
+        assert_eq!(payload["subject"], "Verify your GenCV email");
+        assert!(payload["text"].as_str().unwrap().contains("https://gencv.meowlabs.id/verify?token=opaque"));
+
+        let retry = transactional_email::send(State(app.clone()), headers.clone(), Json(body())).await.unwrap();
+        assert_eq!(retry.status(), StatusCode::ACCEPTED);
+        let retry_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(retry.into_body(), 4096).await.unwrap(),
+        ).unwrap();
+        assert_eq!(retry_json["request_id"], request_id);
+        assert_eq!(retry_json["status"], "accepted");
+
+        let conflict = transactional_email::send(
+            State(app.clone()),
+            headers.clone(),
+            Json(transactional_email::SendEmailBody {
+                template_id: "auth.verify".into(),
+                recipient: "different@example.test".into(),
+                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            }),
+        ).await.unwrap_err();
+        assert_eq!(conflict.0, StatusCode::CONFLICT);
+
+        let request_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_email_requests")
+            .fetch_one(&app.pool).await.unwrap();
+        assert_eq!(request_count, 1);
+        assert_eq!(relay.calls.load(Ordering::SeqCst), 1);
+
+        let status = transactional_email::status(
+            State(app),
+            headers,
+            Path(request_id),
+        ).await.unwrap();
+        assert_eq!(status.status(), StatusCode::OK);
+        relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn migration_creates_scoped_integration_key_and_idempotency_tables() {
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&pool).await.unwrap();
+        let sends: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_email_requests")
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(keys, 0);
+        assert_eq!(sends, 0);
+    }
+
+    #[tokio::test]
+    async fn migration_enforces_idempotency_per_integration_key() {
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES ('test-key','gencv',?,'[\\\"email:template:auth.verify\\\"]',?)")
+            .bind("a".repeat(64)).bind(auth::now()).execute(&pool).await.unwrap();
+        let insert = "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'accepted',?,?)";
+        let now = auth::now();
+        sqlx::query(insert).bind("request-1").bind("test-key").bind("same-key")
+            .bind("auth.verify").bind("b".repeat(64)).bind("c".repeat(64)).bind(&now).bind(&now)
+            .execute(&pool).await.unwrap();
+        let duplicate = sqlx::query(insert).bind("request-2").bind("test-key").bind("same-key")
+            .bind("auth.verify").bind("b".repeat(64)).bind("c".repeat(64)).bind(&now).bind(&now)
+            .execute(&pool).await;
+        assert!(duplicate.is_err(), "a retry must not create a second provider request");
     }
 }

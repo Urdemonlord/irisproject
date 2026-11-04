@@ -18,6 +18,65 @@ pub fn hash_token(token: &str) -> String {
     Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// Newly issued integration key. Expose `token` once; never log or persist it in plaintext.
+/// Intentionally does not implement `Debug` to reduce accidental secret disclosure.
+pub struct GeneratedApiKey {
+    pub key_id: String,
+    pub token: String,
+    pub token_hash: String,
+}
+
+/// Parsed bearer key metadata. Contains no plaintext secret.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ParsedApiKey {
+    pub key_id: String,
+    pub token_hash: String,
+}
+
+pub fn generate_api_key() -> GeneratedApiKey {
+    let mut secret = [0u8; 32];
+    SystemRandom::new().fill(&mut secret).expect("rng");
+    let secret_hex: String = secret.iter().map(|b| format!("{b:02x}")).collect();
+    let key_id = Uuid::new_v4().simple().to_string();
+    let token = format!("iris1_{key_id}_{secret_hex}");
+    let token_hash = hash_token(&token);
+    GeneratedApiKey {
+        key_id,
+        token,
+        token_hash,
+    }
+}
+
+pub fn parse_api_key(token: &str) -> Option<ParsedApiKey> {
+    let mut parts = token.split('_');
+    let prefix = parts.next()?;
+    let key_id = parts.next()?;
+    let secret = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    if prefix != "iris1" {
+        return None;
+    }
+    if key_id.len() != 32 || secret.len() != 64 {
+        return None;
+    }
+    if !key_id
+        .bytes()
+        .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+        || !secret
+            .bytes()
+            .all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
+    {
+        return None;
+    }
+    let token_hash = hash_token(token);
+    Some(ParsedApiKey {
+        key_id: key_id.to_string(),
+        token_hash,
+    })
+}
+
 pub fn expiry_at() -> chrono::DateTime<Utc> {
     Utc::now() + Duration::days(SESSION_DAYS)
 }
@@ -132,5 +191,53 @@ mod tests {
         assert_eq!(open("other", &tok, &s), None); // other server secret
         assert_eq!(open("srv", &tok, &s[..s.len() - 2]), None); // tampered
         assert_ne!(s, seal("srv", &tok, "app_secret")); // random nonce
+    }
+
+    #[test]
+    fn integration_api_key_roundtrip_and_rejects_malformed_tokens() {
+        let generated = generate_api_key();
+        assert_eq!(generated.key_id.len(), 32);
+        assert!(generated
+            .key_id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+        assert_eq!(generated.token_hash, hash_token(&generated.token));
+
+        let parts: Vec<_> = generated.token.split('_').collect();
+        assert_eq!(parts.len(), 3);
+        assert_eq!(parts[0], "iris1");
+        assert_eq!(parts[1], generated.key_id);
+        assert_eq!(parts[2].len(), 64);
+        assert!(parts[2]
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase()));
+
+        let parsed = parse_api_key(&generated.token).expect("valid generated key parses");
+        assert_eq!(parsed.key_id, generated.key_id);
+        assert_eq!(parsed.token_hash, generated.token_hash);
+        assert_ne!(generated.token, generate_api_key().token);
+
+        let key_id = "a".repeat(32);
+        let secret = "b".repeat(64);
+        let valid = format!("iris1_{key_id}_{secret}");
+        let malformed = [
+            String::new(),
+            "nope".to_string(),
+            "iris1_bad".to_string(),
+            format!("iris2_{key_id}_{secret}"),
+            format!("iris1_{}_{}", "a".repeat(31), secret),
+            format!("iris1_{key_id}_{}", "b".repeat(63)),
+            format!("iris1_{}_{}", key_id.to_uppercase(), secret),
+            format!("iris1_{key_id}_B{}", &secret[1..]),
+            format!("iris1_{key_id}_{}x", secret),
+            format!("{valid}_extra"),
+        ];
+        for token in malformed {
+            assert!(
+                parse_api_key(&token).is_none(),
+                "accepted malformed token: {token}"
+            );
+        }
+        assert!(parse_api_key(&valid).is_some());
     }
 }
