@@ -8,7 +8,10 @@ use axum::{
 };
 use iris_auth as auth;
 use iris_config::Config;
-use iris_mail::{Compose, JmapClient, MailError, ResendClient};
+use iris_mail::{
+    extract_text_attachment, Attachment, Compose, JmapClient, MailError, MessageDetail, ResendClient,
+    MAX_ATTACHMENT_BYTES, MAX_PREVIEW_BYTES, MAX_RAW_BYTES,
+};
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
@@ -96,6 +99,9 @@ async fn main() {
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
         .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id", get(get_message).delete(compose::delete_message))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/raw", get(get_message_raw))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/attachments/:attachment_id", get(get_attachment))
+        .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/attachments/:attachment_id/preview", get(get_attachment_preview))
         .route("/api/v1/mailboxes/:mailbox_id/folders", get(compose::folders))
         .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/move", post(compose::move_message))
         .route("/api/v1/mailboxes/:mailbox_id/messages/:message_id/seen", post(compose::set_seen))
@@ -115,6 +121,9 @@ async fn main() {
         .route("/api/v1/temp-inboxes/:id", get(temp::status))
         .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
         .route("/api/v1/temp-inboxes/:id/messages/:message_id", get(temp::message))
+        .route("/api/v1/temp-inboxes/:id/messages/:message_id/raw", get(temp::message_raw))
+        .route("/api/v1/temp-inboxes/:id/messages/:message_id/attachments/:attachment_id", get(temp::message_attachment))
+        .route("/api/v1/temp-inboxes/:id/messages/:message_id/attachments/:attachment_id/preview", get(temp::message_attachment_preview))
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
         .with_state(state);
@@ -410,6 +419,117 @@ async fn get_message(State(s): S, Extension(u): Extension<CurrentUser>, Path((ma
     }
     let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;
     Ok(Json(json!({ "message": m })).into_response())
+}
+
+/// JMAP part ids look like `2` or `2.1`: only these characters, so a
+/// path segment can never smuggle a different blob id or a path.
+pub(crate) fn valid_part_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64
+        && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+}
+
+/// The attachment a request names must be one the opened message actually
+/// carries. The blob id used for download always comes from here, never
+/// from the request, so one message's attachments cannot be used to fetch
+/// another message's blobs.
+pub(crate) fn find_attachment<'a>(m: &'a MessageDetail, part_id: &str) -> Option<&'a Attachment> {
+    m.attachments.iter().find(|a| a.part_id == part_id)
+}
+
+fn sanitized_filename(name: &str) -> String {
+    let mut s: String = name.chars().map(|c| {
+        if c.is_ascii_alphanumeric() || c == '.' || c == '-' || c == '_' { c } else { '_' }
+    }).collect();
+    while s.starts_with('.') { s.remove(0); }
+    s.truncate(128);
+    if s.is_empty() { "attachment".to_string() } else { s }
+}
+
+/// View Original: the whole message blob, as plain text. Refused over
+/// `MAX_RAW_BYTES` instead of buffering an arbitrarily large message.
+pub(crate) async fn raw_response(
+    s: &AppState, user: &str, pass: &str, account: &str, m: &MessageDetail,
+) -> ApiResult {
+    let blob_id = m.raw_blob_id.as_deref().ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    if m.summary.size_bytes > MAX_RAW_BYTES {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    }
+    let bytes = s.jmap.download_blob_bytes(user, pass, account, blob_id, "message.eml").await?;
+    Ok((
+        [(header::CONTENT_TYPE, "text/plain; charset=utf-8"),
+         (header::CONTENT_DISPOSITION, "inline")],
+        bytes,
+    ).into_response())
+}
+
+/// One attachment, downloaded with the caller's own mail credentials and
+/// served under the attachment's own (sanitized) name and content type.
+pub(crate) async fn attachment_response(
+    s: &AppState, user: &str, pass: &str, account: &str, m: &MessageDetail, part_id: &str,
+) -> ApiResult {
+    let a = find_attachment(m, part_id).ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    if a.size > MAX_ATTACHMENT_BYTES {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    }
+    let bytes = s.jmap.download_blob_bytes(user, pass, account, &a.blob_id, &sanitized_filename(&a.name)).await?;
+    let content_type = a.content_type.parse().unwrap_or_else(|_| "application/octet-stream".parse().unwrap());
+    let disposition = format!("attachment; filename=\"{}\"", sanitized_filename(&a.name));
+    Ok((
+        [(header::CONTENT_TYPE, content_type),
+         (header::CONTENT_DISPOSITION, disposition)],
+        bytes,
+    ).into_response())
+}
+
+/// Decompressed text preview of a gzip / zip / XML attachment (DMARC
+/// reports). Anything else answers 415, so the UI offers a download
+/// instead of rendering binary bytes as text.
+pub(crate) async fn attachment_preview_response(
+    s: &AppState, user: &str, pass: &str, account: &str, m: &MessageDetail, part_id: &str,
+) -> ApiResult {
+    let a = find_attachment(m, part_id).ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    if a.size > MAX_PREVIEW_BYTES {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    }
+    let bytes = s.jmap.download_blob_bytes(user, pass, account, &a.blob_id, &sanitized_filename(&a.name)).await?;
+    let out = match extract_text_attachment(&a.name, &a.content_type, &bytes) {
+        Ok(out) => out,
+        Err(MailError::Protocol(msg)) if msg == "not_previewable" => {
+            return Err(ApiError(StatusCode::UNSUPPORTED_MEDIA_TYPE, "not_previewable"));
+        }
+        Err(e) => return Err(ApiError::from(e)),
+    };
+    Ok(Json(json!({
+        "attachment": {"name": a.name, "content_type": a.content_type, "size": a.size},
+        "inner_name": out.inner_name, "text": out.text, "truncated": out.truncated,
+    })).into_response())
+}
+
+async fn get_message_raw(State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, message_id)): Path<(String, String)>) -> ApiResult {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    if !valid_message_id(&message_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;
+    raw_response(&s, &u.creds.user, &u.creds.pass, &account, &m).await
+}
+
+async fn get_attachment(State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, message_id, attachment_id)): Path<(String, String, String)>) -> ApiResult {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;
+    attachment_response(&s, &u.creds.user, &u.creds.pass, &account, &m, &attachment_id).await
+}
+
+async fn get_attachment_preview(State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, message_id, attachment_id)): Path<(String, String, String)>) -> ApiResult {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let m = s.jmap.get_message(&u.creds.user, &u.creds.pass, &account, &message_id).await?;
+    attachment_preview_response(&s, &u.creds.user, &u.creds.pass, &account, &m, &attachment_id).await
 }
 
 #[cfg(test)]

@@ -1,7 +1,10 @@
 //! Anonymous temporary inboxes: random receive-only address, capability token, hard expiry.
 //! Mail for *@TEMP_INBOX_DOMAIN lands in one catch-all mailbox; each inbox sees only
 //! messages whose To: header is its address and that arrived after it was created.
-use crate::{valid_message_id, ApiError, ApiResult, S};
+use crate::{
+    attachment_preview_response, attachment_response, raw_response, valid_message_id, valid_part_id,
+    ApiError, ApiResult, S,
+};
 use axum::{
     extract::{ConnectInfo, Path},
     http::{header, HeaderMap, StatusCode},
@@ -152,6 +155,49 @@ pub async fn message(axum::extract::State(s): S, Path((id, message_id)): Path<(S
         return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
     }
     Ok(Json(json!({ "message": m })).into_response())
+}
+
+/// Shared detail lookup for the temp raw / attachment endpoints: same
+/// capability-token check, same To: check, same received-after-creation
+/// check as `message`, so a temp token can never open another inbox's mail.
+/// Returns the catch-all account id alongside the detail, so callers do
+/// not repeat the session lookup.
+async fn temp_message(s: &crate::AppState, id: &str, message_id: &str, headers: &HeaderMap) -> Result<(String, iris_mail::MessageDetail), ApiError> {
+    let i = authorize(s, id, headers).await?;
+    if !valid_message_id(message_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let c = &s.config;
+    let account = mail_account(s).await?;
+    let m = s.jmap.get_message_to(&c.temp_inbox_mail_user, &c.temp_inbox_mail_password, &account, message_id, &i.address).await?;
+    if m.summary.received_at.as_str() < i.created_at.as_str() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    }
+    Ok((account, m))
+}
+
+pub async fn message_raw(axum::extract::State(s): S, Path((id, message_id)): Path<(String, String)>, headers: HeaderMap) -> ApiResult {
+    let (account, m) = temp_message(&s, &id, &message_id, &headers).await?;
+    let c = &s.config;
+    raw_response(&s, &c.temp_inbox_mail_user, &c.temp_inbox_mail_password, &account, &m).await
+}
+
+pub async fn message_attachment(axum::extract::State(s): S, Path((id, message_id, attachment_id)): Path<(String, String, String)>, headers: HeaderMap) -> ApiResult {
+    if !valid_part_id(&attachment_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let (account, m) = temp_message(&s, &id, &message_id, &headers).await?;
+    let c = &s.config;
+    attachment_response(&s, &c.temp_inbox_mail_user, &c.temp_inbox_mail_password, &account, &m, &attachment_id).await
+}
+
+pub async fn message_attachment_preview(axum::extract::State(s): S, Path((id, message_id, attachment_id)): Path<(String, String, String)>, headers: HeaderMap) -> ApiResult {
+    if !valid_part_id(&attachment_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    let (account, m) = temp_message(&s, &id, &message_id, &headers).await?;
+    let c = &s.config;
+    attachment_preview_response(&s, &c.temp_inbox_mail_user, &c.temp_inbox_mail_password, &account, &m, &attachment_id).await
 }
 
 #[cfg(test)]

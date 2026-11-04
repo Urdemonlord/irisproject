@@ -43,6 +43,59 @@ pub struct MessageDetail {
     /// Message-ID header (without angle brackets), for threading replies.
     pub message_id: Option<String>,
     pub references: Vec<String>,
+    /// Every attachment JMAP reports, plus any `disposition: attachment` leaf
+    /// found by walking `bodyStructure`. Download uses `part_id`, never a
+    /// caller-supplied blob id, so a blob can only be fetched for a message
+    /// the caller already opened.
+    pub attachments: Vec<Attachment>,
+    /// Flat walk of `bodyStructure` (multipart containers omitted), in MIME
+    /// order. This is what lets the UI say *why* a message looks empty
+    /// instead of rendering a blank pane.
+    pub mime_parts: Vec<MimePart>,
+    /// Where the displayed body came from: `jmap` (textBody/htmlBody),
+    /// `structure` (a text part JMAP did not classify as a body part), or
+    /// `none` (no displayable text part at all, e.g. attachment-only mail).
+    pub body_source: String,
+    /// JMAP blob id of the whole message, for View Original / Raw Source.
+    pub raw_blob_id: Option<String>,
+}
+
+/// One attachment (or inline file part) of a message.
+#[derive(Debug, Clone, Serialize)]
+pub struct Attachment {
+    pub part_id: String,
+    pub blob_id: String,
+    pub name: String,
+    pub content_type: String,
+    pub size: u64,
+    pub disposition: Option<String>,
+}
+
+/// One leaf of the MIME tree, in order.
+#[derive(Debug, Clone, Serialize)]
+pub struct MimePart {
+    pub part_id: String,
+    pub content_type: String,
+    pub name: Option<String>,
+    pub disposition: Option<String>,
+    pub size: u64,
+}
+
+/// Caps for the raw / attachment endpoints. A raw message over this is
+/// refused with 413 rather than buffered; previews are truncated at
+/// `MAX_PREVIEW_TEXT` instead of refused, so a big DMARC report still
+/// shows its first records.
+pub const MAX_RAW_BYTES: u64 = 5_000_000;
+pub const MAX_ATTACHMENT_BYTES: u64 = 25_000_000;
+pub const MAX_PREVIEW_BYTES: u64 = 5_000_000;
+pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
+
+/// A decompressed / extracted text preview of one attachment.
+#[derive(Debug, Clone)]
+pub struct ExtractedText {
+    pub inner_name: String,
+    pub text: String,
+    pub truncated: bool,
 }
 
 /// A folder (JMAP mailbox) with its standard role.
@@ -394,35 +447,241 @@ impl JmapClient {
         &self, user: &str, pass: &str, account: &str, id: &str,
     ) -> Result<MessageDetail, MailError> {
         let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
-        props.extend(["textBody", "htmlBody", "bodyValues", "cc", "messageId", "references"]);
+        props.extend(["textBody", "htmlBody", "bodyValues", "bodyStructure", "attachments", "blobId", "cc", "messageId", "references"]);
         let r = self
             .call(user, pass, json!([["Email/get", {"accountId": account, "ids": [id],
                 "properties": props, "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                // Classified body parts alone are not enough: a text part nested
+                // under multipart/mixed or multipart/report (the usual DMARC
+                // shape) may not appear in textBody/htmlBody at all, so also
+                // fetch values for every part and walk bodyStructure below.
+                "fetchAllBodyValues": true,
                 "maxBodyValueBytes": 1_000_000}, "g"]]))
             .await?;
         let e = r[0]["list"].get(0).ok_or(MailError::NotFound)?;
-        let body = |kind: &str| -> Option<String> {
-            let parts = e[kind].as_array()?;
-            let s: String = parts
-                .iter()
-                .filter_map(|p| e["bodyValues"][p["partId"].as_str()?]["value"].as_str())
-                .collect::<Vec<_>>()
-                .join("\n");
-            (!s.is_empty()).then_some(s)
-        };
-        let html = e["htmlBody"]
-            .as_array()
-            .is_some_and(|p| p.iter().any(|p| p["type"] == "text/html"))
-            .then(|| body("htmlBody"))
-            .flatten();
-        let strings = |k: &str| e[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
-        Ok(MessageDetail {
-            summary: summary(e), text_body: body("textBody"), html_body: html,
-            cc: e["cc"].as_array().map(|a| a.iter().map(addr).collect()).unwrap_or_default(),
-            message_id: strings("messageId").into_iter().next(),
-            references: strings("references"),
-        })
+        Ok(detail_from_email(e))
     }
+
+    /// Streams one JMAP blob (a whole message, or one attachment part) with
+    /// the caller's own credentials. Callers must have resolved `blob_id`
+    /// from a message they already opened; the id is never taken from an
+    /// untrusted request body on its own (see the API layer, which looks
+    /// the attachment up in `MessageDetail` first).
+    pub async fn download_blob(
+        &self, user: &str, pass: &str, account: &str, blob_id: &str, name: &str,
+    ) -> Result<reqwest::Response, MailError> {
+        // JMAP download URL, mirroring the {base}/jmap/ API prefix used by
+        // `call_using` (Stalwart advertises a public hostname in its session
+        // downloadUrl, so the loopback prefix is used here instead).
+        let url = format!("{}/jmap/download/{}/{}/{}", self.base_url, account, blob_id, name);
+        let resp = self
+            .http
+            .get(url)
+            .basic_auth(user, Some(pass))
+            .send()
+            .await
+            .map_err(|e| MailError::Unavailable(e.to_string()))?;
+        match resp.status().as_u16() {
+            401 | 403 => Err(MailError::Auth),
+            404 => Err(MailError::NotFound),
+            s if s >= 400 => Err(MailError::Unavailable(format!("HTTP {s}"))),
+            _ => Ok(resp),
+        }
+    }
+
+    /// Whole blob as bytes, capped by the caller (the API layer checks the
+    /// known message/attachment size before calling this).
+    pub async fn download_blob_bytes(
+        &self, user: &str, pass: &str, account: &str, blob_id: &str, name: &str,
+    ) -> Result<Vec<u8>, MailError> {
+        let resp = self.download_blob(user, pass, account, blob_id, name).await?;
+        resp.bytes().await.map(|b| b.to_vec()).map_err(|e| MailError::Unavailable(e.to_string()))
+    }
+}
+
+/// Builds a `MessageDetail` from one JMAP Email object. Pure, so the DMARC
+/// shape can be tested from a fixture without a mail server.
+fn detail_from_email(e: &Value) -> MessageDetail {
+    let body_value = |part_id: &str| -> Option<String> {
+        let v = e["bodyValues"][part_id]["value"].as_str()?;
+        (!v.is_empty()).then_some(v.to_string())
+    };
+    let classified = |kind: &str| -> Option<String> {
+        let parts = e[kind].as_array()?;
+        let s: String = parts
+            .iter()
+            .filter_map(|p| body_value(p["partId"].as_str()?))
+            .collect::<Vec<_>>()
+            .join("\n");
+        (!s.is_empty()).then_some(s)
+    };
+    let mut text_body = classified("textBody");
+    let mut html_body = {
+        let has_html = e["htmlBody"]
+            .as_array()
+            .is_some_and(|p| p.iter().any(|p| p["type"] == "text/html"));
+        if has_html { classified("htmlBody") } else { None }
+    };
+    let mime_parts = walk_structure(&e["bodyStructure"]);
+    let mut body_source = if html_body.is_some() {
+        "jmap".to_string()
+    } else if text_body.is_some() {
+        "jmap".to_string()
+    } else {
+        "none".to_string()
+    };
+    // Fallback: walk the MIME tree in order for a displayable text part
+    // that JMAP did not classify as a body part. Attachment parts are
+    // skipped on purpose: a .xml.gz attachment must not become the body.
+    if text_body.is_none() && html_body.is_none() {
+        for part in &mime_parts {
+            if part.disposition.as_deref() == Some("attachment") { continue; }
+            if part.content_type == "text/html" {
+                if let Some(v) = body_value(&part.part_id) { html_body = Some(v); body_source = "structure".to_string(); break; }
+            }
+        }
+    }
+    if text_body.is_none() {
+        for part in &mime_parts {
+            if part.disposition.as_deref() == Some("attachment") { continue; }
+            if part.content_type == "text/plain" {
+                if let Some(v) = body_value(&part.part_id) { text_body = Some(v); body_source = "structure".to_string(); break; }
+            }
+        }
+    }
+    if text_body.is_none() && html_body.is_none() {
+        for part in &mime_parts {
+            if part.disposition.as_deref() == Some("attachment") { continue; }
+            if part.content_type.starts_with("text/") {
+                if let Some(v) = body_value(&part.part_id) { text_body = Some(v); body_source = "structure".to_string(); break; }
+            }
+        }
+    }
+    let strings = |k: &str| e[k].as_array().map(|a| a.iter().filter_map(|v| v.as_str().map(str::to_string)).collect::<Vec<_>>()).unwrap_or_default();
+    MessageDetail {
+        summary: summary(e),
+        text_body, html_body,
+        cc: e["cc"].as_array().map(|a| a.iter().map(addr).collect()).unwrap_or_default(),
+        message_id: strings("messageId").into_iter().next(),
+        references: strings("references"),
+        attachments: attachments_from(e, &mime_parts),
+        mime_parts,
+        body_source,
+        raw_blob_id: e["blobId"].as_str().map(str::to_string),
+    }
+}
+
+/// Flattens a JMAP `bodyStructure` tree into leaves, in MIME order.
+/// Multipart containers have `subParts` and no usable body of their own.
+fn walk_structure(v: &Value) -> Vec<MimePart> {
+    let mut out = Vec::new();
+    walk_structure_into(v, &mut out);
+    out
+}
+
+fn walk_structure_into(v: &Value, out: &mut Vec<MimePart>) {
+    if let Some(subs) = v["subParts"].as_array() {
+        for s in subs { walk_structure_into(s, out); }
+        return;
+    }
+    if v["partId"].as_str().is_none() && v["type"].as_str().is_none() { return; }
+    out.push(MimePart {
+        part_id: v["partId"].as_str().unwrap_or_default().to_string(),
+        content_type: v["type"].as_str().unwrap_or("application/octet-stream").to_string(),
+        name: v["name"].as_str().map(str::to_string),
+        disposition: v["disposition"].as_str().map(str::to_string),
+        size: v["size"].as_u64().unwrap_or(0),
+    });
+}
+
+/// Attachment list: JMAP's `attachments` first, then any leaf with
+/// `disposition: attachment` that JMAP did not list (defensive, same shape).
+fn attachments_from(e: &Value, parts: &[MimePart]) -> Vec<Attachment> {
+    let mut out: Vec<Attachment> = Vec::new();
+    if let Some(list) = e["attachments"].as_array() {
+        for a in list {
+            out.push(Attachment {
+                part_id: a["partId"].as_str().unwrap_or_default().to_string(),
+                blob_id: a["blobId"].as_str().unwrap_or_default().to_string(),
+                name: a["name"].as_str().unwrap_or("attachment").to_string(),
+                content_type: a["type"].as_str().unwrap_or("application/octet-stream").to_string(),
+                size: a["size"].as_u64().unwrap_or(0),
+                disposition: a["disposition"].as_str().map(str::to_string),
+            });
+        }
+    }
+    for p in parts {
+        if p.disposition.as_deref() != Some("attachment") { continue; }
+        if out.iter().any(|a| a.part_id == p.part_id) { continue; }
+        out.push(Attachment {
+            part_id: p.part_id.clone(),
+            blob_id: String::new(),
+            name: p.name.clone().unwrap_or_else(|| "attachment".to_string()),
+            content_type: p.content_type.clone(),
+            size: p.size,
+            disposition: p.disposition.clone(),
+        });
+    }
+    out.retain(|a| !a.part_id.is_empty() && !a.blob_id.is_empty());
+    out
+}
+
+fn read_limited<R: std::io::Read>(r: R) -> std::io::Result<(Vec<u8>, bool)> {
+    let mut buf = Vec::new();
+    let mut limited = r.take((MAX_PREVIEW_TEXT + 1) as u64);
+    std::io::Read::read_to_end(&mut limited, &mut buf)?;
+    let truncated = buf.len() > MAX_PREVIEW_TEXT;
+    if truncated { buf.truncate(MAX_PREVIEW_TEXT); }
+    Ok((buf, truncated))
+}
+
+/// Extracts previewable text from an attachment: plain XML, a gzip stream
+/// (`.xml.gz`, the usual DMARC shape), or a zip archive (Google also ships
+/// `.zip`; the first `.xml` entry wins). Anything else is an error, so the
+/// UI can fall back to "download" instead of showing binary garbage.
+/// Decompression is capped at `MAX_PREVIEW_TEXT`; oversized output is
+/// truncated, never buffered without bound.
+pub fn extract_text_attachment(name: &str, content_type: &str, bytes: &[u8]) -> Result<ExtractedText, MailError> {
+    let lower_name = name.to_lowercase();
+    let lower_type = content_type.to_lowercase();
+    let is_gzip = lower_name.ends_with(".gz") || lower_type.contains("gzip") || lower_type.contains("x-gzip");
+    let is_zip = lower_name.ends_with(".zip") || lower_type.contains("zip");
+    let is_xml = lower_name.ends_with(".xml") || lower_type.contains("xml");
+    if is_gzip {
+        use flate2::read::GzDecoder;
+        let (raw, truncated) = read_limited(GzDecoder::new(bytes))
+            .map_err(|e| MailError::Protocol(format!("gzip decode failed: {e}")))?;
+        let inner = lower_name.strip_suffix(".gz").unwrap_or(&lower_name).to_string();
+        return Ok(ExtractedText { inner_name: inner, text: String::from_utf8_lossy(&raw).into_owned(), truncated });
+    }
+    if is_zip {
+        use std::io::Cursor;
+        let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
+            .map_err(|e| MailError::Protocol(format!("zip open failed: {e}")))?;
+        let mut pick: Option<usize> = None;
+        for i in 0..archive.len() {
+            let file = archive.by_index(i).map_err(|e| MailError::Protocol(e.to_string()))?;
+            if file.is_dir() { continue; }
+            let fname = file.name().to_string();
+            if fname.to_lowercase().ends_with(".xml") { pick = Some(i); break; }
+            if pick.is_none() { pick = Some(i); }
+        }
+        let i = pick.ok_or_else(|| MailError::Protocol("empty archive".into()))?;
+        let mut file = archive.by_index(i).map_err(|e| MailError::Protocol(e.to_string()))?;
+        let inner_name = file.name().to_string();
+        let (raw, truncated) = read_limited(&mut file)
+            .map_err(|e| MailError::Protocol(format!("zip entry read failed: {e}")))?;
+        return Ok(ExtractedText { inner_name, text: String::from_utf8_lossy(&raw).into_owned(), truncated });
+    }
+    if is_xml {
+        let (raw, truncated) = if bytes.len() > MAX_PREVIEW_TEXT {
+            (bytes[..MAX_PREVIEW_TEXT].to_vec(), true)
+        } else {
+            (bytes.to_vec(), false)
+        };
+        return Ok(ExtractedText { inner_name: name.to_string(), text: String::from_utf8_lossy(&raw).into_owned(), truncated });
+    }
+    Err(MailError::Protocol("not_previewable".into()))
 }
 
 async fn check(resp: reqwest::Response) -> Result<Value, MailError> {
@@ -512,6 +771,82 @@ mod tests {
     fn updated_maps_results() {
         assert!(updated(&json!({"updated": {"x": null}}), "x").is_ok());
         assert!(matches!(updated(&json!({"notUpdated": {"x": {"type": "notFound"}}}), "x"), Err(MailError::NotFound)));
+    }
+
+    /// Google DMARC shape: multipart/mixed, no classified body, one
+    /// .xml.gz attachment. The old code rendered this as an empty pane;
+    /// the detail must now surface the attachment and say body_source=none.
+    fn dmarc_email() -> Value {
+        json!({
+            "id": "dmarc1",
+            "from": [{"email": "noreply-dmarc-support@google.com"}],
+            "to": [{"email": "admin@meowlabs.id"}],
+            "subject": "Report domain: meowlabs.id Submitter: google.com Report-ID: 1",
+            "preview": "", "receivedAt": "2026-11-04T00:00:00Z",
+            "keywords": {"$seen": true}, "size": 12345, "hasAttachment": true,
+            "blobId": "msg-blob-1",
+            "textBody": [], "htmlBody": [], "bodyValues": {},
+            "bodyStructure": {"type": "multipart/mixed", "subParts": [
+                {"type": "text/plain", "partId": "1", "blobId": "b1", "size": 0},
+                {"type": "application/gzip", "partId": "2", "blobId": "b2", "size": 1234,
+                 "name": "google.com!meowlabs.id!1700000000!1700086400.xml.gz", "disposition": "attachment"}
+            ]},
+            "attachments": [{"type": "application/gzip", "partId": "2", "blobId": "b2", "size": 1234,
+                "name": "google.com!meowlabs.id!1700000000!1700086400.xml.gz", "disposition": "attachment"}]
+        })
+    }
+
+    #[test]
+    fn dmarc_attachment_only_is_not_an_empty_message() {
+        let d = detail_from_email(&dmarc_email());
+        assert!(d.text_body.is_none() && d.html_body.is_none());
+        assert_eq!(d.body_source, "none");
+        assert_eq!(d.attachments.len(), 1);
+        assert_eq!(d.attachments[0].part_id, "2");
+        assert_eq!(d.attachments[0].content_type, "application/gzip");
+        assert_eq!(d.mime_parts.len(), 2);
+        assert_eq!(d.raw_blob_id.as_deref(), Some("msg-blob-1"));
+    }
+
+    #[test]
+    fn nested_text_part_is_found_by_structure_walk() {
+        let mut e = dmarc_email();
+        e["bodyStructure"] = json!({"type": "multipart/mixed", "subParts": [
+            {"type": "text/plain", "partId": "t1", "blobId": "bt", "size": 12}
+        ]});
+        e["bodyValues"] = json!({"t1": {"value": "Nested hello"}});
+        e["attachments"] = json!([]);
+        e["hasAttachment"] = json!(false);
+        let d = detail_from_email(&e);
+        assert_eq!(d.text_body.as_deref(), Some("Nested hello"));
+        assert_eq!(d.body_source, "structure");
+    }
+
+    #[test]
+    fn extract_gzip_and_zip_dmarc_reports() {
+        use flate2::{write::GzEncoder, Compression};
+        use std::io::Write;
+        let xml = "<feedback><report_metadata><org_name>google.com</org_name></report_metadata></feedback>";
+        let mut enc = GzEncoder::new(Vec::new(), Compression::default());
+        enc.write_all(xml.as_bytes()).unwrap();
+        let gz = enc.finish().unwrap();
+        let out = extract_text_attachment("google.com!meowlabs.id!1!2.xml.gz", "application/gzip", &gz).unwrap();
+        assert_eq!(out.inner_name, "google.com!meowlabs.id!1!2.xml");
+        assert!(out.text.contains("google.com"));
+        assert!(!out.truncated);
+
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("google.com!meowlabs.id!1!2.xml", zip::write::SimpleFileOptions::default()).unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let out = extract_text_attachment("google.com!meowlabs.id!1!2.zip", "application/zip", buf.get_ref()).unwrap();
+        assert!(out.inner_name.ends_with(".xml"));
+        assert!(out.text.contains("<feedback>"));
+
+        assert!(extract_text_attachment("photo.png", "image/png", b"not-text").is_err());
     }
 }
 
