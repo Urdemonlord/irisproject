@@ -86,7 +86,23 @@ fn valid_recipient(value: &str) -> bool {
     let mut parts = value.split('@');
     let Some(local) = parts.next() else { return false; };
     let Some(domain) = parts.next() else { return false; };
-    if parts.next().is_some() || local.is_empty() || local.len() > 64 || domain.is_empty() {
+    let valid_local = !local.starts_with('.')
+        && !local.ends_with('.')
+        && !local.contains("..")
+        && local.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(
+                    byte,
+                    b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'/' | b'='
+                        | b'?' | b'^' | b'_' | b'`' | b'{' | b'|' | b'}' | b'~' | b'.'
+                )
+        });
+    if parts.next().is_some()
+        || local.is_empty()
+        || local.len() > 64
+        || !valid_local
+        || domain.is_empty()
+    {
         return false;
     }
     let labels: Vec<_> = domain.split('.').collect();
@@ -206,8 +222,10 @@ pub async fn send(
         return match existing.2.as_str() {
             "accepted" => send_response(StatusCode::ACCEPTED, &existing.0, "accepted"),
             "failed" => send_response(StatusCode::UNPROCESSABLE_ENTITY, &existing.0, "failed"),
-            "unknown" => send_response(StatusCode::ACCEPTED, &existing.0, "unknown"),
-            _ => send_response(StatusCode::ACCEPTED, &existing.0, "sending"),
+            "unknown" | "sending" => {
+                send_response(StatusCode::SERVICE_UNAVAILABLE, &existing.0, &existing.2)
+            }
+            _ => send_response(StatusCode::SERVICE_UNAVAILABLE, &existing.0, "unknown"),
         };
     }
 
@@ -243,7 +261,7 @@ pub async fn send(
             sqlx::query("UPDATE integration_email_requests SET status='unknown',updated_at=? WHERE id=?")
                 .bind(auth::now()).bind(&request_id).execute(&state.pool).await
                 .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
-            send_response(StatusCode::ACCEPTED, &request_id, "unknown")
+            send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
         }
     }
 }
@@ -304,6 +322,20 @@ mod tests {
             "https://gencv.meowlabs.id/verify?token=abc",
         )
         .is_err());
+    }
+
+    #[test]
+    fn rejects_invalid_recipient_local_part_syntax() {
+        for recipient in [
+            "bad,other@example.test",
+            "bad;local@example.test",
+            "bad..local@example.test",
+            ".leading@example.test",
+            "trailing.@example.test",
+        ] {
+            assert!(!valid_recipient(recipient), "must reject {recipient}");
+        }
+        assert!(valid_recipient("first.last+auth@example.test"));
     }
 
     #[test]

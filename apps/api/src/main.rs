@@ -430,6 +430,10 @@ mod timeless_password_reset_tests {
     }
 
     async fn fake_relay() -> FakeRelay {
+        fake_relay_with_response("200 OK", r#"{"id":"ok"}"#).await
+    }
+
+    async fn fake_relay_with_response(status_line: &'static str, response_body: &'static str) -> FakeRelay {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let calls = Arc::new(AtomicUsize::new(0));
@@ -460,7 +464,11 @@ mod timeless_password_reset_tests {
             let body_start = bytes.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
             let body: Value = serde_json::from_slice(&bytes[body_start..]).unwrap();
             let _ = tx.send(body);
-            let _ = stream.write_all(b"HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: 11\r\nconnection: close\r\n\r\n{\"id\":\"ok\"}").await;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
         });
         FakeRelay { endpoint: format!("http://{address}"), calls, payload, task }
     }
@@ -668,6 +676,68 @@ mod timeless_password_reset_tests {
             Path(request_id),
         ).await.unwrap();
         assert_eq!(status.status(), StatusCode::OK);
+        relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn transactional_email_unknown_relay_outcome_is_not_success_and_is_not_retried() {
+        let relay = fake_relay_with_response(
+            "500 Internal Server Error",
+            r#"{"message":"temporary failure"}"#,
+        ).await;
+        let app = state(
+            SERVICE_KEY,
+            "no-reply@meowlabs.id",
+            "unused@example.test",
+            "example.test",
+            Some(ResendClient::with_endpoint("test-relay-key".into(), relay.endpoint.clone())),
+        ).await;
+        let generated = auth::generate_api_key();
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
+            .bind(&generated.key_id)
+            .bind("gencv")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify"]).to_string())
+            .bind(auth::now())
+            .bind(expiry)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+        let mut headers = HeaderMap::new();
+        headers.insert(header::AUTHORIZATION, format!("Bearer {}", generated.token).parse().unwrap());
+        headers.insert("idempotency-key", "unknown-relay-outcome".parse().unwrap());
+        let body = || transactional_email::SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+        };
+
+        let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body())).await.unwrap();
+        assert_eq!(first.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let first_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(first.into_body(), 4096).await.unwrap(),
+        ).unwrap();
+        assert_eq!(first_json["status"], "unknown");
+        let _payload = timeout(Duration::from_secs(1), relay.payload).await.unwrap().unwrap();
+
+        let stored_status: String = sqlx::query_scalar(
+            "SELECT status FROM integration_email_requests WHERE id=?",
+        )
+        .bind(first_json["request_id"].as_str().unwrap())
+        .fetch_one(&app.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored_status, "unknown");
+
+        let retry = transactional_email::send(State(app), headers, Json(body())).await.unwrap();
+        assert_eq!(retry.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let retry_json: Value = serde_json::from_slice(
+            &axum::body::to_bytes(retry.into_body(), 4096).await.unwrap(),
+        ).unwrap();
+        assert_eq!(retry_json["status"], "unknown");
+        assert_eq!(retry_json["request_id"], first_json["request_id"]);
+        assert_eq!(relay.calls.load(Ordering::SeqCst), 1);
         relay.task.abort();
     }
 
