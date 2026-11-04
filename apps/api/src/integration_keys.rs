@@ -6,6 +6,7 @@ fn scope_allowed(app_id: &str, scope: &str) -> bool {
         (app_id, scope),
         ("gencv", "email:template:auth.verify")
             | ("gencv", "email:template:auth.recovery")
+            | ("aksaria", "email:template:auth.recovery")
             | ("academy", "email:template:auth.login_link")
             | (_, "email:status")
     )
@@ -25,7 +26,7 @@ async fn issue(
     expires_days: u32,
     daily_limit: u32,
 ) -> Result<auth::GeneratedApiKey, &'static str> {
-    if !matches!(app_id, "gencv" | "academy") {
+    if !matches!(app_id, "gencv" | "academy" | "aksaria") {
         return Err("unsupported_app");
     }
     if !(1..=365).contains(&expires_days) || !(1..=10_000).contains(&daily_limit) {
@@ -93,7 +94,7 @@ pub(crate) async fn run(pool: &SqlitePool, args: &[String]) -> Result<String, &'
             revoke(pool, key_id).await?;
             Ok(format!("revoked key_id={key_id}\n"))
         }
-        _ => Err("usage: integration-key create <gencv|academy> <expires-days> <daily-limit> <comma-separated-scopes> | integration-key revoke <key-id>"),
+        _ => Err("usage: integration-key create <gencv|academy|aksaria> <expires-days> <daily-limit> <comma-separated-scopes> | integration-key revoke <key-id>"),
     }
 }
 

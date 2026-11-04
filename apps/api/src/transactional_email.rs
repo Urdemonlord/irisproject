@@ -65,6 +65,7 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
     let allowed_host = match app_id {
         "gencv" => "gencv.meowlabs.id",
         "academy" => "academy.meowlabs.id",
+        "aksaria" => "aksaria.meowlabs.id",
         _ => return false,
     };
 
@@ -138,6 +139,11 @@ fn render_message(
             "Your MeowLabs Academy sign-in link",
             "Use this one-time link to sign in to MeowLabs Academy.",
             "If you did not request this link, ignore this message.",
+        ),
+        ("aksaria", "auth.recovery") => (
+            "Reset kata sandi Aksaria",
+            "Gunakan tautan ini untuk mengatur ulang kata sandi Aksaria.",
+            "Jika kamu tidak meminta reset ini, abaikan pesan ini.",
         ),
         _ => return Err("unknown template"),
     };
@@ -300,6 +306,8 @@ mod tests {
         assert!(!action_url_allowed("gencv", "https://gencv.meowlabs.id@attacker.invalid/verify"));
         assert!(!action_url_allowed("gencv", "https://gencv.meowlabs.id:8443/verify"));
         assert!(!action_url_allowed("unknown", "https://gencv.meowlabs.id/verify"));
+        assert!(action_url_allowed("aksaria", "https://aksaria.meowlabs.id/reset-sandi/?token=abc"));
+        assert!(!action_url_allowed("aksaria", "https://gencv.meowlabs.id/reset-sandi/?token=abc"));
     }
 
     #[test]
