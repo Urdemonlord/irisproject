@@ -546,6 +546,20 @@ function toast(text: string, action?: { label: string; run: () => void }) {
   setTimeout(() => t.remove(), action ? 7000 : 4000)
 }
 
+/**
+ * Warning toast for a send that delivered but left no copy in Sent
+ * (`sent: true, sent_copy: false`). Unlike `toast` it stays until dismissed:
+ * the user must not miss it and re-send the same message, which would
+ * deliver it a second time. The action opens Sent so they can check.
+ */
+function toastWarn(text: string, action?: { label: string; run: () => void }) {
+  document.querySelector('.toast')?.remove()
+  const t = h('div', { className: 'toast toast-warn', role: 'alert' }, icon('alert', 'icon icon-sm'), h('span', {}, text))
+  if (action) t.append(h('button', { type: 'button', className: 'toast-action', onclick: () => { t.remove(); action.run() } }, action.label))
+  t.append(h('button', { type: 'button', className: 'toast-dismiss', ariaLabel: 'Dismiss warning', onclick: () => t.remove() }, icon('close', 'icon icon-sm')))
+  document.body.append(t)
+}
+
 function confirmDialog(title: string, text: string, confirmLabel: string): Promise<boolean> {
   return new Promise((resolve) => {
     const ok = h('button', { type: 'button', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, confirmLabel))
@@ -706,12 +720,16 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
     if (saving) await saving
     const restore = busy(send, 'Sending…')
     try {
-      await api(`${base}/send`, { method: 'POST', body: JSON.stringify({ ...p, draft_id: draftId ?? null }) })
+      const r = await api<{ sent: boolean; sent_copy: boolean }>(`${base}/send`, { method: 'POST', body: JSON.stringify({ ...p, draft_id: draftId ?? null }) })
       closed = true; closeComposer = null
       document.removeEventListener('keydown', onKey)
       panel.classList.add('is-closing')
       setTimeout(() => panel.remove(), 160)
-      toast('Message sent')
+      if (r.sent_copy === false) {
+        toastWarn('Message sent, but the copy wasn’t saved in Sent. Don’t send it again — the recipient already got it.', { label: 'Check Sent', run: () => { location.hash = '#/sent' } })
+      } else {
+        toast('Message sent')
+      }
       onChange()
     } catch (err) {
       restore()

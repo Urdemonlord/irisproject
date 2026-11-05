@@ -529,6 +529,10 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
 }
 .toast-action { background: none; border: 0; padding: 0; color: #F2B8B8; font-weight: 600; font-family: var(--iris-font-mono); font-size: var(--iris-text-xs); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; }
 .toast-action:hover { color: var(--iris-cream); text-decoration: underline; }
+.toast-warn { background: var(--iris-danger); box-shadow: 4px 4px 0 var(--iris-ink); }
+.toast-warn .toast-action { color: var(--iris-cream); }
+.toast-warn .toast-dismiss { background: none; border: 0; padding: 0; color: var(--iris-cream); display: flex; }
+.toast-warn .toast-dismiss:hover { opacity: 0.75; }
 @keyframes iris-toast { from { opacity: 0; transform: translate(-50%, 12px); } }
 
 /* Confirm dialog */
