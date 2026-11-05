@@ -37,8 +37,14 @@ async fn issue(
     if scopes.is_empty()
         || scopes.len() > 4
         || scopes.iter().any(|scope| !scope_allowed(app_id, scope))
-        || scopes.iter().collect::<std::collections::HashSet<_>>().len() != scopes.len()
-        || !scopes.iter().any(|scope| scope.starts_with("email:template:"))
+        || scopes
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len()
+            != scopes.len()
+        || !scopes
+            .iter()
+            .any(|scope| scope.starts_with("email:template:"))
     {
         return Err("invalid_scopes");
     }
@@ -130,22 +136,44 @@ mod tests {
         assert_eq!(row.4, 25);
 
         revoke(&pool, &generated.key_id).await.unwrap();
-        let status: String = sqlx::query_scalar("SELECT status FROM integration_keys WHERE key_id=?")
-            .bind(&generated.key_id)
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM integration_keys WHERE key_id=?")
+                .bind(&generated.key_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(status, "revoked");
-        assert_eq!(revoke(&pool, &generated.key_id).await, Err("key_not_active"));
+        assert_eq!(
+            revoke(&pool, &generated.key_id).await,
+            Err("key_not_active")
+        );
     }
 
     #[tokio::test]
     async fn rejects_cross_app_scopes_and_unbounded_limits() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
-        assert_eq!(issue(&pool, "academy", "email:template:auth.verify", 30, 10).await.err(), Some("invalid_scopes"));
-        assert_eq!(issue(&pool, "gencv", "email:template:auth.verify", 366, 10).await.err(), Some("invalid_limits"));
-        assert_eq!(issue(&pool, "gencv", "email:template:auth.verify", 30, 10_001).await.err(), Some("invalid_limits"));
-        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            issue(&pool, "academy", "email:template:auth.verify", 30, 10)
+                .await
+                .err(),
+            Some("invalid_scopes")
+        );
+        assert_eq!(
+            issue(&pool, "gencv", "email:template:auth.verify", 366, 10)
+                .await
+                .err(),
+            Some("invalid_limits")
+        );
+        assert_eq!(
+            issue(&pool, "gencv", "email:template:auth.verify", 30, 10_001)
+                .await
+                .err(),
+            Some("invalid_limits")
+        );
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
         assert_eq!(rows, 0);
     }
 }

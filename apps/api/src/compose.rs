@@ -17,24 +17,44 @@ const MAX_BODY: usize = 1_000_000;
 const SENDS_PER_HOUR: i64 = 100;
 
 pub(crate) fn folder_role(name: &str) -> Result<&'static str, ApiError> {
-    FOLDER_ROLES.iter().map(|(r, _)| *r).find(|r| *r == name).ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"))
+    FOLDER_ROLES
+        .iter()
+        .map(|(r, _)| *r)
+        .find(|r| *r == name)
+        .ok_or(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"))
 }
 
 fn message_id(id: &str) -> Result<(), ApiError> {
-    if valid_message_id(id) { Ok(()) } else { Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request")) }
+    if valid_message_id(id) {
+        Ok(())
+    } else {
+        Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"))
+    }
 }
 
-pub(crate) async fn folders(State(s): S, Extension(u): Extension<CurrentUser>, Path(mailbox_id): Path<String>) -> ApiResult {
+pub(crate) async fn folders(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(mailbox_id): Path<String>,
+) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
-    let folders = s.jmap.folders(&u.creds.user, &u.creds.pass, &account).await?;
+    let folders = s
+        .jmap
+        .folders(&u.creds.user, &u.creds.pass, &account)
+        .await?;
     Ok(Json(json!({ "folders": folders })).into_response())
 }
 
 #[derive(Deserialize)]
-pub(crate) struct MoveBody { folder: String }
+pub(crate) struct MoveBody {
+    folder: String,
+}
 
 pub(crate) async fn move_message(
-    State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, id)): Path<(String, String)>, Json(b): Json<MoveBody>,
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path((mailbox_id, id)): Path<(String, String)>,
+    Json(b): Json<MoveBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     message_id(&id)?;
@@ -43,80 +63,129 @@ pub(crate) async fn move_message(
         // Drafts/Sent are filled by composing and sending, not by moving mail in.
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
     }
-    s.jmap.move_to(&u.creds.user, &u.creds.pass, &account, &id, role).await?;
+    s.jmap
+        .move_to(&u.creds.user, &u.creds.pass, &account, &id, role)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize)]
-pub(crate) struct SeenBody { seen: bool }
+pub(crate) struct SeenBody {
+    seen: bool,
+}
 
 pub(crate) async fn set_seen(
-    State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, id)): Path<(String, String)>, Json(b): Json<SeenBody>,
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path((mailbox_id, id)): Path<(String, String)>,
+    Json(b): Json<SeenBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     message_id(&id)?;
-    s.jmap.set_seen(&u.creds.user, &u.creds.pass, &account, &id, b.seen).await?;
+    s.jmap
+        .set_seen(&u.creds.user, &u.creds.pass, &account, &id, b.seen)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 /// Permanent delete — only for messages already in Trash, or drafts.
 pub(crate) async fn delete_message(
-    State(s): S, Extension(u): Extension<CurrentUser>, Path((mailbox_id, id)): Path<(String, String)>,
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path((mailbox_id, id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     message_id(&id)?;
-    let roles = s.jmap.message_roles(&u.creds.user, &u.creds.pass, &account, &id).await?;
+    let roles = s
+        .jmap
+        .message_roles(&u.creds.user, &u.creds.pass, &account, &id)
+        .await?;
     if !roles.iter().any(|r| r == "trash" || r == "drafts") {
         return Err(ApiError(StatusCode::CONFLICT, "move_to_trash_first"));
     }
-    s.jmap.destroy_one(&u.creds.user, &u.creds.pass, &account, &id).await?;
+    s.jmap
+        .destroy_one(&u.creds.user, &u.creds.pass, &account, &id)
+        .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
 #[derive(Deserialize, Default)]
 pub(crate) struct ComposeBody {
-    #[serde(default)] to: Vec<String>,
-    #[serde(default)] cc: Vec<String>,
-    #[serde(default)] bcc: Vec<String>,
-    #[serde(default)] subject: String,
-    #[serde(default)] text: String,
+    #[serde(default)]
+    to: Vec<String>,
+    #[serde(default)]
+    cc: Vec<String>,
+    #[serde(default)]
+    bcc: Vec<String>,
+    #[serde(default)]
+    subject: String,
+    #[serde(default)]
+    text: String,
     in_reply_to: Option<String>,
-    #[serde(default)] references: Vec<String>,
+    #[serde(default)]
+    references: Vec<String>,
     /// Existing draft this replaces (deleted on save/send).
     draft_id: Option<String>,
 }
 
 /// A plain, conservative address check (no display names, no quoted local parts).
 pub(crate) fn valid_address(a: &str) -> bool {
-    let Some((local, domain)) = a.rsplit_once('@') else { return false };
-    a.len() <= 254 && !local.is_empty() && local.len() <= 64
-        && domain.contains('.') && !domain.starts_with('.') && !domain.ends_with('.') && !domain.contains("..")
-        && a.chars().all(|c| c.is_ascii_graphic() && !"<>()[]\\,;:\"".contains(c))
+    let Some((local, domain)) = a.rsplit_once('@') else {
+        return false;
+    };
+    a.len() <= 254
+        && !local.is_empty()
+        && local.len() <= 64
+        && domain.contains('.')
+        && !domain.starts_with('.')
+        && !domain.ends_with('.')
+        && !domain.contains("..")
+        && a.chars()
+            .all(|c| c.is_ascii_graphic() && !"<>()[]\\,;:\"".contains(c))
 }
 
 fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
-    v.iter().map(|a| a.trim().to_lowercase()).filter(|a| !a.is_empty())
-        .map(|a| if valid_address(&a) { Ok(a) } else { Err(ApiError(StatusCode::BAD_REQUEST, "invalid_recipient")) })
+    v.iter()
+        .map(|a| a.trim().to_lowercase())
+        .filter(|a| !a.is_empty())
+        .map(|a| {
+            if valid_address(&a) {
+                Ok(a)
+            } else {
+                Err(ApiError(StatusCode::BAD_REQUEST, "invalid_recipient"))
+            }
+        })
         .collect()
 }
 
 /// Header ids for threading: angle brackets stripped, no whitespace.
 fn clean_ids(v: impl IntoIterator<Item = String>) -> Vec<String> {
-    v.into_iter().map(|x| x.trim().trim_matches(|c| c == '<' || c == '>').to_string())
-        .filter(|x| !x.is_empty() && x.len() <= 250 && !x.chars().any(char::is_whitespace)).take(20).collect()
+    v.into_iter()
+        .map(|x| x.trim().trim_matches(|c| c == '<' || c == '>').to_string())
+        .filter(|x| !x.is_empty() && x.len() <= 250 && !x.chars().any(char::is_whitespace))
+        .take(20)
+        .collect()
 }
 
 fn build(u: &CurrentUser, b: ComposeBody) -> Result<(Compose, Option<String>), ApiError> {
-    if b.subject.len() > MAX_SUBJECT || b.text.len() > MAX_BODY || b.subject.contains(['\r', '\n']) {
+    if b.subject.len() > MAX_SUBJECT || b.text.len() > MAX_BODY || b.subject.contains(['\r', '\n'])
+    {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     let (to, cc, bcc) = (clean_list(&b.to)?, clean_list(&b.cc)?, clean_list(&b.bcc)?);
     if to.len() + cc.len() + bcc.len() > MAX_RECIPIENTS {
         return Err(ApiError(StatusCode::BAD_REQUEST, "too_many_recipients"));
     }
-    if let Some(d) = &b.draft_id { message_id(d)?; }
+    if let Some(d) = &b.draft_id {
+        message_id(d)?;
+    }
     let c = Compose {
-        from: u.email.clone(), to, cc, bcc, subject: b.subject, text: b.text,
+        from: u.email.clone(),
+        to,
+        cc,
+        bcc,
+        subject: b.subject,
+        text: b.text,
         in_reply_to: clean_ids(b.in_reply_to).into_iter().next(),
         references: clean_ids(b.references),
     };
@@ -124,24 +193,43 @@ fn build(u: &CurrentUser, b: ComposeBody) -> Result<(Compose, Option<String>), A
 }
 
 pub(crate) async fn save_draft(
-    State(s): S, Extension(u): Extension<CurrentUser>, Path(mailbox_id): Path<String>, Json(b): Json<ComposeBody>,
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(mailbox_id): Path<String>,
+    Json(b): Json<ComposeBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     let (c, replace) = build(&u, b)?;
-    let id = s.jmap.save_draft(&u.creds.user, &u.creds.pass, &account, &c, replace.as_deref()).await?;
+    let id = s
+        .jmap
+        .save_draft(
+            &u.creds.user,
+            &u.creds.pass,
+            &account,
+            &c,
+            replace.as_deref(),
+        )
+        .await?;
     Ok(Json(json!({ "id": id })).into_response())
 }
 
 /// First recipient outside our own domains, if any.
 fn first_external<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
-    c.to.iter().chain(&c.cc).chain(&c.bcc).find(|a| {
-        let d = a.rsplit_once('@').map(|x| x.1).unwrap_or_default();
-        !s.config.send_local_domains.iter().any(|l| d == l)
-    }).map(String::as_str)
+    c.to.iter()
+        .chain(&c.cc)
+        .chain(&c.bcc)
+        .find(|a| {
+            let d = a.rsplit_once('@').map(|x| x.1).unwrap_or_default();
+            !s.config.send_local_domains.iter().any(|l| d == l)
+        })
+        .map(String::as_str)
 }
 
 pub(crate) async fn send(
-    State(s): S, Extension(u): Extension<CurrentUser>, Path(mailbox_id): Path<String>, Json(b): Json<ComposeBody>,
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(mailbox_id): Path<String>,
+    Json(b): Json<ComposeBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     let (c, draft) = build(&u, b)?;
@@ -150,7 +238,10 @@ pub(crate) async fn send(
     }
     let external = first_external(&s, &c).is_some();
     if external && s.relay.is_none() && !s.config.send_external {
-        return Err(ApiError(StatusCode::UNPROCESSABLE_ENTITY, "external_sending_disabled"));
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "external_sending_disabled",
+        ));
     }
 
     let subject = auth::hash_token(&format!("send:{}", u.user_id));
@@ -167,11 +258,19 @@ pub(crate) async fn send(
         // the copy for Sent is filed afterwards. A failed copy doesn't undo a sent message.
         (Some(relay), true) => {
             relay.send(&c).await?;
-            if let Err(e) = s.jmap.store_sent(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref()).await {
+            if let Err(e) = s
+                .jmap
+                .store_sent(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
+                .await
+            {
                 tracing::error!("sent via relay but Sent copy failed: {e}");
             }
         }
-        _ => s.jmap.send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref()).await?,
+        _ => {
+            s.jmap
+                .send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
+                .await?
+        }
     }
     sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
         .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await?;
@@ -186,7 +285,10 @@ mod tests {
     fn addresses() {
         assert!(valid_address("a@meowlabs.id"));
         assert!(valid_address("first.last+tag@sub.example.co"));
-        for bad in ["", "a", "@x.id", "a@", "a@x", "a@.x", "a@x.", "a b@x.id", "a@x..id", "<a@x.id>", "a,b@x.id", "a@x.id\n"] {
+        for bad in [
+            "", "a", "@x.id", "a@", "a@x", "a@.x", "a@x.", "a b@x.id", "a@x..id", "<a@x.id>",
+            "a,b@x.id", "a@x.id\n",
+        ] {
             assert!(!valid_address(bad), "{bad:?}");
         }
     }
@@ -200,6 +302,9 @@ mod tests {
 
     #[test]
     fn header_ids_are_cleaned() {
-        assert_eq!(clean_ids(vec!["<a@b>".into(), " ".into(), "x y".into()]), vec!["a@b".to_string()]);
+        assert_eq!(
+            clean_ids(vec!["<a@b>".into(), " ".into(), "x y".into()]),
+            vec!["a@b".to_string()]
+        );
     }
 }

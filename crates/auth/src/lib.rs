@@ -15,7 +15,10 @@ pub fn new_token() -> String {
 }
 
 pub fn hash_token(token: &str) -> String {
-    Sha256::digest(token.as_bytes()).iter().map(|b| format!("{b:02x}")).collect()
+    Sha256::digest(token.as_bytes())
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 /// Newly issued integration key. Expose `token` once; never log or persist it in plaintext.
@@ -91,7 +94,10 @@ pub fn now() -> String {
 
 /// Extract a named cookie from a raw Cookie header.
 pub fn cookie<'a>(header: &'a str, name: &str) -> Option<&'a str> {
-    header.split(';').map(str::trim).find_map(|c| c.strip_prefix(name)?.strip_prefix('='))
+    header
+        .split(';')
+        .map(str::trim)
+        .find_map(|c| c.strip_prefix(name)?.strip_prefix('='))
 }
 
 /// Extract the session token from a raw Cookie header.
@@ -101,12 +107,19 @@ pub fn token_from_cookie(header: &str) -> Option<&str> {
 
 /// Constant-time equality for secrets of public length.
 pub fn ct_eq(a: &str, b: &str) -> bool {
-    a.len() == b.len() && a.bytes().zip(b.bytes()).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    a.len() == b.len()
+        && a.bytes()
+            .zip(b.bytes())
+            .fold(0u8, |acc, (x, y)| acc | (x ^ y))
+            == 0
 }
 
 /// Double-submit CSRF: unsafe requests must echo the `iris_csrf` cookie in `X-CSRF-Token`.
 pub fn csrf_ok(cookie_header: Option<&str>, header_token: Option<&str>) -> bool {
-    match (cookie_header.and_then(|c| cookie(c, CSRF_COOKIE)), header_token) {
+    match (
+        cookie_header.and_then(|c| cookie(c, CSRF_COOKIE)),
+        header_token,
+    ) {
         (Some(c), Some(h)) => c.len() == 64 && ct_eq(c, h),
         _ => false,
     }
@@ -114,7 +127,11 @@ pub fn csrf_ok(cookie_header: Option<&str>, header_token: Option<&str>) -> bool 
 
 /// Readable by JS (not HttpOnly) so the SPA can echo it; SameSite=Strict keeps it first-party.
 pub fn set_csrf_cookie(token: &str, secure: bool) -> String {
-    format!("{CSRF_COOKIE}={token}; Path=/; SameSite=Strict; Max-Age={}{}", SESSION_DAYS * 86400, if secure { "; Secure" } else { "" })
+    format!(
+        "{CSRF_COOKIE}={token}; Path=/; SameSite=Strict; Max-Age={}{}",
+        SESSION_DAYS * 86400,
+        if secure { "; Secure" } else { "" }
+    )
 }
 
 /// Mail credential sealed with a key derived from the session cookie token. The DB only holds
@@ -131,11 +148,16 @@ pub fn seal(server_secret: &str, token: &str, plaintext: &str) -> String {
     session_key(server_secret, token)
         .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
         .expect("seal");
-    nonce.iter().chain(&buf).map(|b| format!("{b:02x}")).collect()
+    nonce
+        .iter()
+        .chain(&buf)
+        .map(|b| format!("{b:02x}"))
+        .collect()
 }
 
 pub fn open(server_secret: &str, token: &str, sealed: &str) -> Option<String> {
-    let bytes: Vec<u8> = (0..sealed.len()).step_by(2)
+    let bytes: Vec<u8> = (0..sealed.len())
+        .step_by(2)
         .map(|i| u8::from_str_radix(sealed.get(i..i + 2)?, 16).ok())
         .collect::<Option<_>>()?;
     if bytes.len() < NONCE_LEN + 16 {
@@ -144,7 +166,9 @@ pub fn open(server_secret: &str, token: &str, sealed: &str) -> Option<String> {
     let (nonce, ct) = bytes.split_at(NONCE_LEN);
     let mut ct = ct.to_vec();
     let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
-    let pt = session_key(server_secret, token).open_in_place(nonce, Aad::empty(), &mut ct).ok()?;
+    let pt = session_key(server_secret, token)
+        .open_in_place(nonce, Aad::empty(), &mut ct)
+        .ok()?;
     String::from_utf8(pt.to_vec()).ok()
 }
 
