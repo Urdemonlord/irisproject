@@ -11,6 +11,7 @@ const DEFAULTS: Record<string, string> = {
   VITE_CONTACT_ADDRESS: '', // postal address shown on Privacy/Terms; empty = hidden
   VITE_ANALYTICS_SRC: 'https://analytics.meowlabs.id/script.js', // Umami
   VITE_ANALYTICS_WEBSITE_ID: '', // Umami website ID — empty = analytics off
+  VITE_MAIL_CONTENT_ORIGIN: '', // separate HTML-mail origin — empty = srcdoc frame
 }
 for (const [k, v] of Object.entries(DEFAULTS)) process.env[k] ??= v
 

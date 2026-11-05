@@ -5,5 +5,5 @@ edition.workspace = true
 
 [dependencies]
 serde = { workspace = true }
-dotenv = "0.15"
+dotenvy = "0.15"
 anyhow = "1.0"

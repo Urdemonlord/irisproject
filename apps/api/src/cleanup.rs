@@ -138,6 +138,7 @@ mod tests {
             pool: pool.clone(),
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             relay: None,
+            html_bodies: crate::html_body::HtmlBodyStore::new(),
             config: iris_config::Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -159,6 +160,7 @@ mod tests {
                 iris_timeless_email_to: String::new(),
                 timeless_public_origin: String::new(),
                 resend_api_url: String::new(),
+                mail_content_origin: String::new(),
             },
         });
         super::run_once(&state).await.unwrap();
