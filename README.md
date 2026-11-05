@@ -124,6 +124,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_HOST` / `IRIS_PORT` | `127.0.0.1` / `8000` | API listen address (put a proxy in front) |
 | `DATABASE_URL` | `sqlite:iris.db` | SQLite; use an absolute path on a persistent volume in production, e.g. `sqlite:/var/lib/iris/iris.db` |
 | `SESSION_SECRET` | `dev-secret-change-in-prod` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
+| `TURNSTILE_SECRET_KEY` | (empty) | Cloudflare Turnstile secret key for login verification; empty = logins skip the challenge. The public half is the web build-time variable `VITE_TURNSTILE_SITE_KEY` — see "Login CAPTCHA" below |
 | `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
 | `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
 | `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
@@ -137,6 +138,26 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
 | `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
 | `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
+
+### Login CAPTCHA (Cloudflare Turnstile)
+
+Optional bot gate on the sign-in form. When `TURNSTILE_SECRET_KEY` is
+set, `POST /auth/login` accepts an optional `turnstile_token` and
+verifies it server-side against Cloudflare's Siteverify API *before*
+the mail server is contacted; a missing/invalid token is rejected with
+`turnstile_failed` (400), a Siteverify outage fails closed with
+`turnstile_unavailable` (503). When the secret is unset, logins work
+exactly as before and the API logs a startup warning.
+
+The web widget needs the public site key at build time:
+`VITE_TURNSTILE_SITE_KEY` (empty = no widget; see
+`apps/web/vite.config.ts`). Keep the site key in `.env` as
+`TURNSTILE_SITE_KEY` and pass it to the web build as
+`VITE_TURNSTILE_SITE_KEY`. Create both keys in the Cloudflare
+dashboard → Turnstile → Add site (hostname: your mail domain, e.g.
+`mail.meowlabs.id`), then set the secret in `.env` and rebuild the web
+with the site key. Tokens are single-use and expire after 5 minutes;
+the form mints a fresh one after every failed login.
 
 ### Password-reset webhook
 
