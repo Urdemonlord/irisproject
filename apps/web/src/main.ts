@@ -100,6 +100,8 @@ const errorText: Record<string, string> = {
   mail_server_unavailable: 'Mail server is unavailable. Try again shortly.',
   mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
   database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
+  turnstile_failed: 'Verification failed. Please try again.',
+  turnstile_unavailable: 'Verification is temporarily unavailable. Please try again shortly.',
   network: 'Can’t reach IRIS. Check your connection and try again.',
 }
 const tempErrors: Record<string, string> = {
@@ -146,6 +148,45 @@ function trackEyes(email: HTMLInputElement, wrap: HTMLElement) {
   ;['input', 'keyup', 'click'].forEach((ev) => email.addEventListener(ev, update))
 }
 
+// ---------- Turnstile (login bot gate) ----------
+// Explicit rendering (the app is an SPA, so the form does not exist at
+// page load). Only used when a site key is baked into the build
+// (SITE.turnstileSiteKey); without one the login form works as before.
+declare global {
+  interface Window {
+    turnstile?: {
+      render: (
+        container: HTMLElement,
+        params: {
+          sitekey: string
+          theme?: 'light' | 'dark' | 'auto'
+          callback?: (token: string) => void
+          'expired-callback'?: () => void
+          'error-callback'?: (code: string) => void
+        },
+      ) => string
+      reset: (widgetId?: string) => void
+    }
+  }
+}
+
+const TURNSTILE_SCRIPT = 'https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit'
+let turnstileScript: Promise<void> | null = null
+function loadTurnstileScript(): Promise<void> {
+  if (window.turnstile) return Promise.resolve()
+  if (!turnstileScript) {
+    turnstileScript = new Promise<void>((resolve, reject) => {
+      const s = document.createElement('script')
+      s.src = TURNSTILE_SCRIPT
+      s.defer = true
+      s.onload = () => resolve()
+      s.onerror = () => reject(new Error('turnstile script failed to load'))
+      document.head.append(s)
+    })
+  }
+  return turnstileScript
+}
+
 // ---------- Login ----------
 function field(id: string, label: string, ic: string, input: HTMLInputElement, extra?: HTMLElement) {
   const err = h('p', { className: 'field-error', id: `${id}-error`, 'aria-live': 'polite' })
@@ -177,13 +218,46 @@ function renderLogin() {
   const catWrap = h('div', { className: 'mascot-wrap' }, catSitSVG(false))
   trackEyes(email, catWrap)
 
+  // Turnstile widget, only when a site key is baked into the build.
+  // The token is single-use and expires after 5 minutes: it is cleared
+  // (and the widget reset) on every failed login, and when it expires,
+  // so the next attempt always mints a fresh token.
+  let turnstileToken: string | null = null
+  let turnstileWidgetId: string | null = null
+  let turnstileFailed = false
+  const turnstileBox = h('div', { className: 'turnstile-box' })
+  const resetTurnstile = () => {
+    turnstileToken = null
+    if (turnstileWidgetId && window.turnstile) window.turnstile.reset(turnstileWidgetId)
+  }
+  if (SITE.turnstileSiteKey) {
+    loadTurnstileScript()
+      .then(() => {
+        if (!window.turnstile) return
+        turnstileWidgetId = window.turnstile.render(turnstileBox, {
+          sitekey: SITE.turnstileSiteKey,
+          theme: 'light',
+          callback: (token) => { turnstileToken = token },
+          'expired-callback': resetTurnstile,
+          'error-callback': () => {
+            turnstileToken = null
+            status.replaceChildren(icon('alert'), h('span', {}, 'Verification failed to load. Refresh the page and try again.'))
+          },
+        })
+      })
+      .catch(() => {
+        turnstileFailed = true
+        turnstileBox.replaceChildren(h('p', { className: 'field-error' }, 'Verification could not load. Check your connection and refresh.'))
+      })
+  }
+
   const left = h('div', { className: 'login-left' },
     h('div', { className: 'topline' }, h('span', { className: 'wordmark' }, eyeMark('eye-mark wordmark-eye'), 'IRIS'), h('span', {}, 'Meow Labs')),
     h('p', { className: 'login-tagline' }, h('span', {}, 'Every'), h('span', {}, 'message'), h('span', {}, 'finds'), h('span', {}, 'its way.')),
     h('div', { className: 'login-route', 'aria-hidden': 'true' }, h('div', { className: 'route-line' }), h('div', { className: 'route-nodes' }, h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-sq' }), h('span', { className: 'route-node-rd' })), catWrap),
     h('div', { className: 'login-footer' }, h('span', {}, 'MX → Auth → Inbox'), h('span', {}, location.hostname)))
   const form = h('form', { className: 'login-form', noValidate: true },
-    emailF.wrap, pwF.wrap, status, submit,
+    emailF.wrap, pwF.wrap, ...(SITE.turnstileSiteKey ? [turnstileBox] : []), status, submit,
     h('p', { className: 'login-foot' }, 'Need a throwaway? ', h('a', { href: '#/temp', className: 'link' }, 'Temporary inbox →')))
   const right = h('main', { className: 'login-right' },
     h('div', { className: 'login-panel' }, h('h1', {}, 'Sign in'), form),
@@ -208,12 +282,23 @@ function renderLogin() {
     e.preventDefault()
     clearStatus()
     if (!validate()) return
+    // With the widget on, a submit without a token means the challenge
+    // has not finished (or the script failed to load): say so instead
+    // of spending a login attempt the server would reject.
+    if (SITE.turnstileSiteKey && !turnstileToken) {
+      status.replaceChildren(icon('alert'), h('span', {}, turnstileFailed ? 'Verification could not load. Check your connection and refresh.' : 'Please wait for the verification to finish.'))
+      return
+    }
     const restore = busy(submit, 'Signing in…')
     try {
-      await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email.value.trim(), password: password.value }) })
+      await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email.value.trim(), password: password.value, turnstile_token: turnstileToken ?? undefined }) })
       await renderMailbox()
     } catch (err) {
       const code = (err as HttpError).code
+      // The token was already spent on the failed attempt (or never
+      // minted one): reset so the next attempt gets a fresh token.
+      // No-op when the widget is off.
+      resetTurnstile()
       if (code === 'invalid_credentials') { [email, password].forEach((i) => i.setAttribute('aria-invalid', 'true')); password.select() }
       status.replaceChildren(icon('alert'), h('span', {}, errorText[code] ?? 'Sign-in failed. Please try again.'))
       restore()

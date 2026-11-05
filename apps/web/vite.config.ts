@@ -12,6 +12,7 @@ const DEFAULTS: Record<string, string> = {
   VITE_ANALYTICS_SRC: '', // Umami — empty = analytics off
   VITE_ANALYTICS_WEBSITE_ID: '', // Umami website ID — empty = analytics off
   VITE_MAIL_CONTENT_ORIGIN: '', // separate HTML-mail origin — empty = srcdoc frame
+  VITE_TURNSTILE_SITE_KEY: '', // Turnstile site key for the login widget — empty = no widget
 }
 for (const [k, v] of Object.entries(DEFAULTS)) process.env[k] ??= v
 
