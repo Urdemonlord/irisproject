@@ -9,5 +9,5 @@ serde_json = { workspace = true }
 reqwest = { workspace = true }
 thiserror = "1.0"
 flate2 = "1.0"
-zip = "2.0"
+zip = "9"
 iris-config = { path = "../config" }

@@ -1084,7 +1084,13 @@ pub fn extract_text_attachment(
             if file.is_dir() {
                 continue;
             }
-            if file.name().to_lowercase().ends_with(".xml") {
+            // zip 9: `name()` returns `Result<Cow<str>, ZipError>` — an entry
+            // whose name cannot be decoded is never the `.xml` preview pick.
+            let is_xml_entry = file
+                .name()
+                .map(|n| n.to_lowercase().ends_with(".xml"))
+                .unwrap_or(false);
+            if is_xml_entry {
                 pick = Some(i);
                 break;
             }
@@ -1093,7 +1099,10 @@ pub fn extract_text_attachment(
         let mut file = archive
             .by_index(i)
             .map_err(|e| MailError::Protocol(e.to_string()))?;
-        let inner_name = file.name().to_string();
+        let inner_name = file
+            .name()
+            .map_err(|e| MailError::Protocol(e.to_string()))?
+            .into_owned();
         let (raw, truncated) = read_limited(&mut file)
             .map_err(|e| MailError::Protocol(format!("zip entry read failed: {e}")))?;
         return Ok(ExtractedText {
@@ -1384,6 +1393,47 @@ mod tests {
         .unwrap();
         assert!(out.inner_name.ends_with(".xml"));
         assert!(out.text.contains("<feedback>"));
+    }
+
+    #[test]
+    fn malicious_zip_symlink_huge_entry_does_not_panic() {
+        use std::io::Write;
+        // Regression (zip 2.6.1 RUSTSEC-2026-0367/-0368/-0369/-0429, "Zip
+        // Cloaking"): a crafted archive whose symlink entry declares a huge
+        // uncompressed size must never abort or panic the preview path, never
+        // follow the link, and never buffer unbounded output. IRIS only ever
+        // reads a single entry bytes through read_limited and never calls
+        // extract, so there is no path on disk to escape to.
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file(
+                "link.xml",
+                zip::write::SimpleFileOptions::default()
+                    .compression_method(zip::CompressionMethod::Stored)
+                    .unix_permissions(0o120777),
+            )
+            .unwrap();
+            zip.write_all(b"/etc/passwd").unwrap();
+            zip.finish().unwrap();
+        }
+        let mut bytes = buf.into_inner();
+        // Lie in both headers: the symlink entry claims 4 GiB - 1 of
+        // uncompressed data while only 11 bytes are actually present.
+        let huge = u32::MAX.to_le_bytes();
+        // Local file header: uncompressed size at offset 22.
+        bytes[22..26].copy_from_slice(&huge);
+        // Central directory header: uncompressed size at offset 24.
+        let cd = bytes
+            .windows(4)
+            .position(|w| w == b"PK\x01\x02")
+            .expect("central directory header present");
+        bytes[cd + 24..cd + 28].copy_from_slice(&huge);
+        if let Ok(out) = extract_text_attachment("evil.zip", "application/zip", &bytes) {
+            assert_eq!(out.inner_name, "link.xml");
+            assert!(out.text.len() <= MAX_PREVIEW_TEXT);
+            assert!(!out.text.contains("root:"));
+        }
     }
 
     #[test]
