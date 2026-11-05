@@ -97,8 +97,37 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_INTEGRATION_APPS` | (unset) | JSON registry of apps allowed to send transactional email; when unset, a built-in example registry is used — see `apps/api/src/integration_apps.rs` |
 | `RESEND_API_KEY` | (empty) | When set, mail to other domains is relayed through Resend |
 | `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
-| `IRIS_TIMELESS_SERVICE_TOKEN`, `IRIS_TIMELESS_EMAIL_FROM`, `IRIS_TIMELESS_EMAIL_TO`, `TIMELESS_PUBLIC_ORIGIN` | (empty) | Optional password-reset integration for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer |
+| `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
 | `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
+
+### Password-reset webhook
+
+An optional integration for a trusted companion app that needs to email a
+password-reset link but has no mail-sending capability of its own:
+`POST /internal/v1/password-reset-webhook` with
+`Authorization: Bearer <IRIS_PASSWORD_RESET_SERVICE_TOKEN>` and JSON body
+`{"token": "<43-char url-safe token>"}`. IRIS sends a fixed-template
+message from `IRIS_PASSWORD_RESET_EMAIL_FROM` to the fixed recipient
+`IRIS_PASSWORD_RESET_EMAIL_TO` (never taken from the request), containing
+a link to `https://<IRIS_PASSWORD_RESET_PUBLIC_ORIGIN>/admin/reset#token=<token>`.
+The endpoint answers `202 {"accepted": true}`; `401` for a wrong or
+missing bearer token, `503` while any of the four variables (or the relay,
+`RESEND_API_KEY`) is unset, `400` for a malformed token, `502` when
+delivery fails. It is opt-in: with any variable unset the route still
+exists but always answers `503`.
+
+Deprecated names, kept as fallback when the generic name is unset or
+empty: `IRIS_TIMELESS_SERVICE_TOKEN`, `IRIS_TIMELESS_EMAIL_FROM`,
+`IRIS_TIMELESS_EMAIL_TO`, `TIMELESS_PUBLIC_ORIGIN`. The deprecated route
+`POST /internal/v1/timeless-password-reset` serves the same handler.
+
+The first companion app (Timeless) still calls the deprecated route, and
+its client allow-lists that exact path — moving it to the generic route
+is a coordinated change on the caller side: accept
+`/internal/v1/password-reset-webhook` in its endpoint check (currently
+`web/src/lib/server/password-recovery.js`, the `pathname !== ...` guard)
+and point its reset URL at the new path. No IRIS-side change is needed
+for that switch.
 
 Public site settings (build-time, all optional — defaults in `apps/web/vite.config.ts`):
 
