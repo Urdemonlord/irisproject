@@ -1,8 +1,13 @@
 # Rencana: origin terpisah untuk render HTML mail
 
-Status: **persiapan kode selesai, infra BELUM ada — menunggu persetujuan maintainer.**
-Dokumen ini adalah rencana konkret langkah demi langkah. Tidak ada subdomain,
-DNS, nginx, sertifikat, atau service live yang diubah oleh slice ini.
+Status: **LIVE sejak 2026-11-05 ~23:45 WIB** — DNS subdomain konten,
+sertifikat, dan vhost nginx sudah ada, dan `MAIL_CONTENT_ORIGIN` sudah
+disetel di environment `iris-api` (systemd `iris-api`,
+`127.0.0.1:8000`). Dokumen ini sekarang adalah catatan implementasi +
+sisa pekerjaan, bukan lagi rencana yang menunggu persetujuan. Satu
+langkah masih terbuka: build web belum dibaking dengan
+`VITE_MAIL_CONTENT_ORIGIN`, jadi browser masih memakai fallback
+`srcdoc` (lihat §5).
 
 Subdomain yang diusulkan: **`mail-content.example.com`**
 App origin tetap: `https://mail.example.com`
@@ -150,30 +155,38 @@ tidak berubah: default semua flag kosong/mati.
 | `apps/web/src/site.ts` | `SITE.mailContentOrigin` dari `import.meta.env`. |
 | `apps/web/src/main.ts` | `messageBody(m, mintUrl?)` menjadi async; bila minter ada, iframe memakai `src` dari token URL (tetap `sandbox=""`, `referrerpolicy="no-referrer"`); bila mint gagal → fallback srcdoc. `openMessageAt()` meneruskan minter; hanya caller mailbox permanen yang memasang `htmlBodyMinter(messageUrl)`; temp inbox tidak memasang apa-apa. |
 
-Perilaku bila flag mati (keadaan live hari ini): `VITE_MAIL_CONTENT_ORIGIN`
-kosong → `htmlBodyMinter()` mengembalikan `undefined` → `messageBody`
-persis seperti sebelumnya. `MAIL_CONTENT_ORIGIN` kosong → endpoint mint
-menjawab 409 dan tidak pernah dipanggil web.
+Perilaku bila flag mati: `VITE_MAIL_CONTENT_ORIGIN` kosong →
+`htmlBodyMinter()` mengembalikan `undefined` → `messageBody` persis
+seperti sebelumnya. `MAIL_CONTENT_ORIGIN` kosong → endpoint mint
+menjawab 409 dan tidak pernah dipanggil web. Keadaan live hari ini:
+flag server sudah hidup (`MAIL_CONTENT_ORIGIN` disetel), tetapi flag
+web belum — build web yang ter-deploy tidak mengandung origin konten,
+jadi browser masih memakai `srcdoc` sampai web di-build ulang dengan
+flag itu (lihat §5, langkah 5).
 
-## 5. Langkah infra — MENUNGGU PERSETUJUAN MAINTAINER (jangan jalankan dulu)
+## 5. Langkah infra — SELESAI kecuali langkah 5 (live 2026-11-05)
 
-Urutan yang diusulkan. Setiap langkah butuh persetujuan terpisah; tidak
-ada satu pun yang dikerjakan slice ini.
+Langkah 1–4 dan 6 sudah dikerjakan saat deploy 2026-11-05 ~23:45 WIB:
+DNS subdomain konten menunjuk ke VPS, sertifikat ECDSA terbit, vhost
+nginx aktif (hanya mem-proxy path render HTML ke `iris-api` di
+`127.0.0.1:8000`; `/` menjawab 404), dan `MAIL_CONTENT_ORIGIN`
+disetel di environment `iris-api`. Tersisa langkah 5 — build web
+dengan flag — sebelum browser memakai origin terpisah.
 
-1. **DNS.** Tambah `mail-content.example.com` → A/AAAA ke IP VPS yang
+1. **DNS — SELESAI.** `mail-content.example.com` → A/AAAA ke IP VPS yang
    sama dengan `mail.example.com` (atau CNAME ke `mail.example.com` bila
    itu pola yang dipakai). Verifikasi: `dig +short mail-content.example.com`
    menjawab IP VPS.
-2. **Sertifikat.** Terbitkan sertifikat untuk nama itu mengikuti pola
+2. **Sertifikat — SELESAI.** Sertifikat ECDSA untuk nama itu mengikuti pola
    `mail.example.com` (saat ini Let's Encrypt via certbot). Verifikasi:
    `curl -I https://mail-content.example.com/` menjawab 404 (bukan
    error TLS) sebelum vhost dipasang.
-3. **Vhost nginx baru** (draf — simpan sebagai
-   `/etc/nginx/sites-available/mail-content.example.com`, JANGAN
-   mengaktifkan sebelum langkah 1–2):
+3. **Vhost nginx baru — SELESAI.** Draf di bawah ini yang diterapkan
+   (disimpan sebagai `/etc/nginx/sites-available/mail-content.example.com`
+   dan diaktifkan); bandingkan dengan vhost live sebelum mengubahnya:
 
    ```nginx
-   # DRAFT — belum diterapkan.
+   # Diterapkan 2026-11-05 (draf ini yang dipakai).
    server {
        server_name mail-content.example.com;
        include /etc/nginx/snippets/cloudflare-realip.conf;
@@ -226,21 +239,25 @@ ada satu pun yang dikerjakan slice ini.
    Catatan draf: `limit_req_zone mail_content` (misal `10r/m` per IP)
    harus didefinisikan di konteks `http` nginx; nilai pastinya diputuskan
    saat deploy. `nginx -t` sebelum reload; `systemctl reload nginx`.
-4. **Konfigurasi service.** Di environment iris-api (systemd unit /
+4. **Konfigurasi service — SELESAI.** Di environment iris-api (systemd unit /
    secret file yang sama dengan `SESSION_SECRET`, bukan di repo):
    `MAIL_CONTENT_ORIGIN=https://mail-content.example.com`.
    Restart `iris-api` (deploy biasa) agar config terbaca.
-5. **Build web dengan flag.** `VITE_MAIL_CONTENT_ORIGIN=https://mail-content.example.com`
+5. **Build web dengan flag — TERBUKA.** `VITE_MAIL_CONTENT_ORIGIN=https://mail-content.example.com`
    saat `npm run build` (pola deploy sandbox-built release yang sudah
    dipakai), lalu deploy dist seperti biasa. Tanpa langkah ini web tetap
    srcdoc meskipun server sudah siap — kedua flag harus hidup bersamaan.
-6. **Smoke test pasca-deploy** (lihat §6), lalu centang checklist di
+6. **Smoke test pasca-deploy — SEBAGIAN SELESAI** (pemeriksaan origin,
+   lihat §6), lalu centang checklist di
    `docs/07-PRODUCTION-READINESS.md`.
 
-## 6. Verifikasi — SEMUA MENUNGGU INFRA (§5)
+## 6. Verifikasi — infra live, pemeriksaan browser MASIH TERBUKA
 
-Tidak satu pun di bawah ini bisa diuji tanpa subdomain + vhost live.
-Jangan klaim sudah teruji sebelum §5 selesai.
+Infra (§5) sudah live. Yang sudah terverifikasi di origin (2026-11-05):
+`/` di origin konten menjawab 404, `html-body` tanpa token menjawab
+404 dengan header `frame-ancestors`, dan app origin tetap menjawab 200
+di `/ready`. Pemeriksaan browser di bawah ini belum diuji — jangan
+klaim sudah teruji sebelum dilakukan.
 
 ### 6.1 Cookie tidak bocor ke subdomain
 
@@ -302,8 +319,6 @@ flag web hidup = `src`), di desktop + satu ponsel:
   (`index.html`: early fetch; kemungkinan inline lain di partial).
   Sampai inline script dipindah ke file eksternal + nonce/hash, CSP
   halaman utama akan memblokir aplikasi sendiri. Pekerjaan terpisah.
-- **Subdomain / DNS / vhost / sertifikat.** Butuh persetujuan terpisah
-  dari maintainer (§5).
 - **Endpoint mint untuk temp inbox.** Temp inbox memakai auth header
   sendiri (`x-temp-token`); mint-nya butuh varian route + store yang
   terikat ke inbox id, bukan `CurrentUser`. Sengaja ditunda: temp inbox
