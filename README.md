@@ -45,6 +45,40 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - DNS for your domains: MX, SPF, DKIM, DMARC, PTR — see
   [`docs/07-PRODUCTION-READINESS.md`](docs/07-PRODUCTION-READINESS.md) §4.
 
+## Install with your AI agent
+
+The fastest path on a fresh server: paste this into your coding agent
+(Claude Code, Codex, Cursor, or any agent with shell access):
+
+```text
+Install IRIS on this server. Repo: https://github.com/Urdemonlord/irisproject
+Read README.md and docs/07-PRODUCTION-READINESS.md first — do not guess
+setup steps from memory.
+Ask me for: the public mail domain (e.g. mail.example.com), and whether
+a mail server already exists.
+If there is no mail server yet, install Stalwart from its official image
+(Stalwart is the only mail server IRIS is built against) and create one
+permanent account plus one catch-all account for the temp inbox.
+Then run: git clone <repo> && ./scripts/install.sh
+Follow README Deployment to wire systemd + nginx/Caddy + DNS (MX, SPF,
+DKIM, DMARC, PTR). Verify with the README checklist and show me the URLs
+plus the health output.
+Never commit .env, never print secrets, never invent a domain or DNS
+value — ask when unsure.
+```
+
+What the agent will ask you (it cannot invent these): the public mail
+domain, and whether a mail server already exists.
+
+What [`scripts/install.sh`](scripts/install.sh) does: checks for cargo,
+Node.js 22+, npm, openssl and curl; creates `.env` (mode 600) with a
+generated `SESSION_SECRET`; builds the release API binary and the web
+bundle; warns when the mail server is unreachable.
+
+What it does NOT do: install a mail server, touch DNS, enable systemd
+units, issue TLS certificates, or send any mail. Those need your domain
+and are covered in [Deployment](#deployment).
+
 ## Quick start (local dev)
 
 ```bash
