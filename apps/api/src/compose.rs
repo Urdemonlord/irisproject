@@ -1,6 +1,9 @@
 //! Folders, message actions (move / read / delete), drafts and sending.
 use crate::email_address::valid_compose_address;
-use crate::{owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser, S};
+use crate::{
+    check_read_limit, owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser,
+    S,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -37,6 +40,7 @@ pub(crate) async fn folders(
     Path(mailbox_id): Path<String>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    check_read_limit(&s, &u).await?;
     let folders = s
         .jmap
         .folders(&u.creds.user, &u.creds.pass, &account)

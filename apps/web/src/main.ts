@@ -96,6 +96,7 @@ const senderName = (from: string) => from.replace(/\s*<[^>]*>$/, '').replace(/^"
 const errorText: Record<string, string> = {
   invalid_credentials: 'Email or password is incorrect.',
   too_many_attempts: 'Too many attempts. Try again in 15 minutes.',
+  too_many_reads: 'Too many reads. Wait a moment and try again.',
   mail_server_unavailable: 'Mail server is unavailable. Try again shortly.',
   network: 'Can’t reach IRIS. Check your connection and try again.',
 }

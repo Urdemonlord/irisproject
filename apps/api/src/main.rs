@@ -9,8 +9,8 @@ use axum::{
 use iris_auth as auth;
 use iris_config::limits::{
     DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
-    MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_SEARCH_QUERY_CHARS,
-    MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES,
+    MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
+    MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
 use iris_mail::{
@@ -637,6 +637,52 @@ pub(crate) async fn owned_account(
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))
 }
 
+/// Fixed-window limiter for authenticated message reads, reusing the same
+/// `rate_limit_events` mechanism as login (`login`), send (`compose::send`)
+/// and temp-inbox creation (`temp::create`): count this user's `allowed`
+/// `read` rows inside the window, refuse with 429 once the cap is hit,
+/// otherwise log the read before doing the JMAP work.
+///
+/// The row is written *before* the JMAP call on purpose: concurrent
+/// requests must see each other, and a failed mail-server call still
+/// consumed a slot (same pay-for-the-attempt shape as login's `blocked`
+/// rows). A refused read logs one `blocked` row for forensics — best
+/// effort only, so a bookkeeping failure never turns a refusal into a 500;
+/// only `allowed` rows count toward the cap. Rows older than 2 days are
+/// pruned by `cleanup::mark`, so read volume cannot grow the table
+/// unboundedly. Callers run this after the cheap local checks
+/// (`owned_account`, id validation) so only reads about to hit JMAP pay.
+pub(crate) async fn check_read_limit(s: &AppState, u: &CurrentUser) -> Result<(), ApiError> {
+    let subject = auth::hash_token(&format!("read:{}", u.user_id));
+    let since = (chrono::Utc::now() - chrono::Duration::minutes(READ_WINDOW_MINUTES)).to_rfc3339();
+    let reads: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='read' AND outcome='allowed' AND occurred_at>?",
+    )
+    .bind(&subject)
+    .bind(&since)
+    .fetch_one(&s.pool)
+    .await?;
+    if reads >= MAX_READS_PER_WINDOW {
+        if let Err(e) = sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'read',?,'blocked')")
+            .bind(uuid::Uuid::new_v4().to_string())
+            .bind(&subject)
+            .bind(auth::now())
+            .execute(&s.pool)
+            .await
+        {
+            tracing::error!("rate-limit event insert failed after read refusal: {e}");
+        }
+        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_reads"));
+    }
+    sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'read',?,'allowed')")
+        .bind(uuid::Uuid::new_v4().to_string())
+        .bind(&subject)
+        .bind(auth::now())
+        .execute(&s.pool)
+        .await?;
+    Ok(())
+}
+
 #[derive(Deserialize)]
 struct Page {
     limit: Option<u32>,
@@ -652,6 +698,7 @@ async fn list_messages(
     Query(p): Query<Page>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    check_read_limit(&s, &u).await?;
     let limit = p
         .limit
         .unwrap_or(DEFAULT_LIST_LIMIT)
@@ -697,6 +744,7 @@ async fn get_message(
     if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
+    check_read_limit(&s, &u).await?;
     let m = s
         .jmap
         .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
@@ -864,6 +912,7 @@ async fn get_message_raw(
     if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
+    check_read_limit(&s, &u).await?;
     let m = s
         .jmap
         .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
@@ -880,6 +929,7 @@ async fn get_attachment(
     if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
+    check_read_limit(&s, &u).await?;
     let m = s
         .jmap
         .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
@@ -904,6 +954,7 @@ async fn get_attachment_preview(
     if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
+    check_read_limit(&s, &u).await?;
     let m = s
         .jmap
         .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
@@ -1681,5 +1732,94 @@ mod timeless_password_reset_tests {
             duplicate.is_err(),
             "a retry must not create a second provider request"
         );
+    }
+}
+
+#[cfg(test)]
+mod read_limit_tests {
+    use super::*;
+
+    async fn test_state() -> Arc<AppState> {
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        Arc::new(AppState {
+            pool,
+            jmap: JmapClient::new("http://127.0.0.1:9".into()),
+            relay: None,
+            config: Config {
+                env: "test".into(),
+                host: "127.0.0.1".into(),
+                port: 8000,
+                database_url: "sqlite::memory:".into(),
+                session_secret: "test-secret".into(),
+                stalwart_api_url: "http://127.0.0.1:9".into(),
+                temp_inbox_domain: "example.test".into(),
+                temp_inbox_default_expiry_hours: 1,
+                temp_inbox_mail_user: String::new(),
+                temp_inbox_mail_password: String::new(),
+                send_local_domains: vec![],
+                send_external: false,
+                resend_api_key: String::new(),
+                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_enabled: false,
+                iris_timeless_service_token: String::new(),
+                iris_timeless_email_from: String::new(),
+                iris_timeless_email_to: String::new(),
+                timeless_public_origin: String::new(),
+                resend_api_url: String::new(),
+            },
+        })
+    }
+
+    fn user(id: &str) -> CurrentUser {
+        CurrentUser {
+            user_id: id.to_string(),
+            email: format!("{id}@example.test"),
+            creds: Creds {
+                user: id.to_string(),
+                pass: "secret".into(),
+            },
+        }
+    }
+
+    /// Seed `n` allowed `read` rows for `user_id` at `occurred_at`, the way
+    /// `check_read_limit` writes them.
+    async fn seed_reads(pool: &SqlitePool, user_id: &str, n: i64, occurred_at: &str) {
+        let subject = auth::hash_token(&format!("read:{user_id}"));
+        for _ in 0..n {
+            sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'read',?,'allowed')")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&subject)
+                .bind(occurred_at)
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    fn assert_too_many_reads(r: Result<(), ApiError>) {
+        let err = r.expect_err("a read past the cap must be refused");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.1, "too_many_reads");
+    }
+
+    #[tokio::test]
+    async fn refuses_at_cap_and_scopes_per_user() {
+        let s = test_state().await;
+        seed_reads(&s.pool, "alice", MAX_READS_PER_WINDOW - 1, &auth::now()).await;
+        // The 600th read is still allowed; the 601st is refused.
+        check_read_limit(&s, &user("alice")).await.unwrap();
+        assert_too_many_reads(check_read_limit(&s, &user("alice")).await);
+        // A refused read logs `blocked`, which never counts toward the cap,
+        // and another user is unaffected by alice's cap.
+        check_read_limit(&s, &user("bob")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn rows_older_than_window_do_not_count() {
+        let s = test_state().await;
+        let old =
+            (chrono::Utc::now() - chrono::Duration::minutes(READ_WINDOW_MINUTES + 1)).to_rfc3339();
+        seed_reads(&s.pool, "alice", MAX_READS_PER_WINDOW, &old).await;
+        check_read_limit(&s, &user("alice")).await.unwrap();
     }
 }

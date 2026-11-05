@@ -57,6 +57,22 @@ pub const MAX_FAILED_LOGINS: i64 = 10;
 /// Max failed logins per client IP per 15 minutes (tolerant of shared NAT).
 pub const MAX_FAILED_LOGINS_PER_IP: i64 = 50;
 
+// --- Authenticated message reads (debt round 2, slice 9) -------------------
+// One shared bucket for every JMAP-backed read behind the session:
+// list_messages, get_message, get_message_raw, get_attachment,
+// get_attachment_preview and compose::folders. The web polls list +
+// folders every 30 s while visible (4 reads/min per tab) and debounces
+// search to one list call per 300 ms pause, so 600 reads per 10 minutes
+// leaves ~15x headroom for a single tab — search bursts, load-more paging
+// and opening messages included — while a client hammering the API tops
+// out at ~1 read/sec per user instead of unbounded JMAP round-trips.
+// Keyed per user, not per IP: reads are authenticated, so one user's
+// hammering must never block another user behind the same NAT.
+/// Max authenticated message reads per user per window.
+pub const MAX_READS_PER_WINDOW: i64 = 600;
+/// Window for MAX_READS_PER_WINDOW, in minutes.
+pub const READ_WINDOW_MINUTES: i64 = 10;
+
 // --- Request caps (were `apps/api/src/main.rs`) ----------------------------
 
 /// Default page size for message listing.
@@ -94,6 +110,8 @@ mod tests {
         assert_eq!(TEMP_INBOX_MESSAGE_LIMIT, 50);
         assert_eq!(MAX_FAILED_LOGINS, 10);
         assert_eq!(MAX_FAILED_LOGINS_PER_IP, 50);
+        assert_eq!(MAX_READS_PER_WINDOW, 600);
+        assert_eq!(READ_WINDOW_MINUTES, 10);
         assert_eq!(DEFAULT_LIST_LIMIT, 50);
         assert_eq!(MAX_LIST_LIMIT, 100);
         assert_eq!(MAX_SEARCH_QUERY_CHARS, 200);
