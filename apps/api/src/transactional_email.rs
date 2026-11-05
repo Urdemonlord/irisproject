@@ -77,77 +77,15 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
         && url.password().is_none()
 }
 
-fn valid_recipient(value: &str) -> bool {
-    if value.len() > 254
-        || value.bytes().any(|byte| {
-            byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'<' | b'>')
-        })
-    {
-        return false;
-    }
-    let mut parts = value.split('@');
-    let Some(local) = parts.next() else {
-        return false;
-    };
-    let Some(domain) = parts.next() else {
-        return false;
-    };
-    let valid_local = !local.starts_with('.')
-        && !local.ends_with('.')
-        && !local.contains("..")
-        && local.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'/'
-                        | b'='
-                        | b'?'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'{'
-                        | b'|'
-                        | b'}'
-                        | b'~'
-                        | b'.'
-                )
-        });
-    if parts.next().is_some()
-        || local.is_empty()
-        || local.len() > 64
-        || !valid_local
-        || domain.is_empty()
-    {
-        return false;
-    }
-    let labels: Vec<_> = domain.split('.').collect();
-    labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.as_bytes()[0].is_ascii_alphanumeric()
-                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
 fn render_message(
     app_id: &str,
     template_id: &str,
     recipient: &str,
     action_url: &str,
 ) -> Result<iris_mail::Compose, &'static str> {
-    if !valid_recipient(recipient) || !action_url_allowed(app_id, action_url) {
+    if !crate::email_address::valid_email_address(recipient)
+        || !action_url_allowed(app_id, action_url)
+    {
         return Err("invalid request");
     }
     let Some(template) =
@@ -206,7 +144,7 @@ pub async fn send(
         .map_err(auth_error)?;
     if !state.config.integration_email_enabled
         || state.relay.is_none()
-        || !valid_recipient(&state.config.integration_email_from)
+        || !crate::email_address::valid_email_address(&state.config.integration_email_from)
     {
         return Err(crate::ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -450,9 +388,14 @@ mod tests {
             ".leading@example.test",
             "trailing.@example.test",
         ] {
-            assert!(!valid_recipient(recipient), "must reject {recipient}");
+            assert!(
+                !crate::email_address::valid_email_address(recipient),
+                "must reject {recipient}"
+            );
         }
-        assert!(valid_recipient("first.last+auth@example.test"));
+        assert!(crate::email_address::valid_email_address(
+            "first.last+auth@example.test"
+        ));
     }
 
     #[test]

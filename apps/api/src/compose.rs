@@ -1,4 +1,5 @@
 //! Folders, message actions (move / read / delete), drafts and sending.
+use crate::email_address::valid_compose_address;
 use crate::{owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser, S};
 use axum::{
     extract::{Path, State},
@@ -128,28 +129,12 @@ pub(crate) struct ComposeBody {
     draft_id: Option<String>,
 }
 
-/// A plain, conservative address check (no display names, no quoted local parts).
-pub(crate) fn valid_address(a: &str) -> bool {
-    let Some((local, domain)) = a.rsplit_once('@') else {
-        return false;
-    };
-    a.len() <= 254
-        && !local.is_empty()
-        && local.len() <= 64
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..")
-        && a.chars()
-            .all(|c| c.is_ascii_graphic() && !"<>()[]\\,;:\"".contains(c))
-}
-
 fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
     v.iter()
         .map(|a| a.trim().to_lowercase())
         .filter(|a| !a.is_empty())
         .map(|a| {
-            if valid_address(&a) {
+            if valid_compose_address(&a) {
                 Ok(a)
             } else {
                 Err(ApiError(StatusCode::BAD_REQUEST, "invalid_recipient"))
@@ -301,13 +286,13 @@ mod tests {
 
     #[test]
     fn addresses() {
-        assert!(valid_address("a@meowlabs.id"));
-        assert!(valid_address("first.last+tag@sub.example.co"));
+        assert!(valid_compose_address("a@meowlabs.id"));
+        assert!(valid_compose_address("first.last+tag@sub.example.co"));
         for bad in [
             "", "a", "@x.id", "a@", "a@x", "a@.x", "a@x.", "a b@x.id", "a@x..id", "<a@x.id>",
             "a,b@x.id", "a@x.id\n",
         ] {
-            assert!(!valid_address(bad), "{bad:?}");
+            assert!(!valid_compose_address(bad), "{bad:?}");
         }
     }
 

@@ -2,7 +2,7 @@
 //! Mail for *@TEMP_INBOX_DOMAIN lands in one catch-all mailbox; each inbox sees only
 //! messages whose To: header is its address and that arrived after it was created.
 use crate::{
-    attachment_preview_response, attachment_response, raw_response, valid_message_id,
+    attachment_preview_response, attachment_response, client_ip, raw_response, valid_message_id,
     valid_part_id, ApiError, ApiResult, S,
 };
 use axum::{
@@ -32,20 +32,6 @@ fn cookie<'a>(headers: &'a HeaderMap, name: &str) -> Option<&'a str> {
         .split(';')
         .map(str::trim)
         .find_map(|c| c.strip_prefix(name)?.strip_prefix('='))
-}
-
-/// Peer IP; trust X-Real-IP only when the peer is a local reverse proxy.
-fn client_ip(peer: SocketAddr, headers: &HeaderMap) -> String {
-    let fwd = headers
-        .get("x-real-ip")
-        .and_then(|h| h.to_str().ok())
-        .map(str::trim);
-    match fwd {
-        Some(ip) if peer.ip().is_loopback() && ip.parse::<std::net::IpAddr>().is_ok() => {
-            ip.to_string()
-        }
-        _ => peer.ip().to_string(),
-    }
 }
 
 /// 12 chars of [a-z0-9] (~62 bits) from two UUIDv4s.

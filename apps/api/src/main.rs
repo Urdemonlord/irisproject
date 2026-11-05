@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 mod cleanup;
 mod compose;
+mod email_address;
 mod integration_apps;
 mod integration_keys;
 mod temp;
@@ -353,7 +354,7 @@ const MAX_FAILED_LOGINS: i64 = 10; // per email per 15 minutes
 const MAX_FAILED_LOGINS_PER_IP: i64 = 50; // per client IP per 15 minutes (tolerant of shared NAT)
 
 /// Peer IP; trust X-Real-IP only when the peer is the local reverse proxy.
-fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> String {
+pub(crate) fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> String {
     let fwd = headers
         .get("x-real-ip")
         .and_then(|h| h.to_str().ok())
