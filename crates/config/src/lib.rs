@@ -39,7 +39,7 @@ pub struct Config {
 
 impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
-        dotenv::dotenv().ok();
+        dotenvy::dotenv().ok();
         let env = std::env::var("IRIS_ENV").unwrap_or_else(|_| "development".to_string());
         let resend_api_url =
             resend_api_endpoint(&env, std::env::var("IRIS_RESEND_API_URL").ok().as_deref());
