@@ -8,14 +8,12 @@ use axum::{
     Extension, Json,
 };
 use iris_auth as auth;
+use iris_config::limits::{
+    MAX_BODY, MAX_HEADER_IDS, MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
+};
 use iris_mail::{Compose, FOLDER_ROLES};
 use serde::Deserialize;
 use serde_json::json;
-
-const MAX_RECIPIENTS: usize = 50;
-const MAX_SUBJECT: usize = 998;
-const MAX_BODY: usize = 1_000_000;
-const SENDS_PER_HOUR: i64 = 100;
 
 pub(crate) fn folder_role(name: &str) -> Result<&'static str, ApiError> {
     FOLDER_ROLES
@@ -147,8 +145,10 @@ fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
 fn clean_ids(v: impl IntoIterator<Item = String>) -> Vec<String> {
     v.into_iter()
         .map(|x| x.trim().trim_matches(|c| c == '<' || c == '>').to_string())
-        .filter(|x| !x.is_empty() && x.len() <= 250 && !x.chars().any(char::is_whitespace))
-        .take(20)
+        .filter(|x| {
+            !x.is_empty() && x.len() <= MAX_HEADER_ID_LEN && !x.chars().any(char::is_whitespace)
+        })
+        .take(MAX_HEADER_IDS)
         .collect()
 }
 

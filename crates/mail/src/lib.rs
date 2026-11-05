@@ -1,5 +1,6 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
+use iris_config::limits::{MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -80,15 +81,6 @@ pub struct MimePart {
     pub disposition: Option<String>,
     pub size: u64,
 }
-
-/// Caps for the raw / attachment endpoints. A raw message over this is
-/// refused with 413 rather than buffered; previews are truncated at
-/// `MAX_PREVIEW_TEXT` instead of refused, so a big DMARC report still
-/// shows its first records.
-pub const MAX_RAW_BYTES: u64 = 5_000_000;
-pub const MAX_ATTACHMENT_BYTES: u64 = 25_000_000;
-pub const MAX_PREVIEW_BYTES: u64 = 5_000_000;
-pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
 
 /// A decompressed / extracted text preview of one attachment.
 #[derive(Debug, Clone)]
@@ -294,7 +286,7 @@ impl JmapClient {
     ) -> Result<usize, MailError> {
         let r = self
             .call(user, pass, json!([
-                ["Email/query", {"accountId": account, "filter": {"to": to}, "limit": 500}, "q"],
+                ["Email/query", {"accountId": account, "filter": {"to": to}, "limit": MAX_DESTROY_PER_CALL}, "q"],
                 ["Email/get", {"accountId": account,
                     "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"}, "properties": ["to"]}, "g"]
             ]))
@@ -319,7 +311,7 @@ impl JmapClient {
         before: &str,
     ) -> Result<usize, MailError> {
         let r = self
-            .call(user, pass, json!([["Email/query", {"accountId": account, "filter": {"before": before}, "limit": 500}, "q"]]))
+            .call(user, pass, json!([["Email/query", {"accountId": account, "filter": {"before": before}, "limit": MAX_DESTROY_PER_CALL}, "q"]]))
             .await?;
         let ids: Vec<&str> = r[0]["ids"]
             .as_array()

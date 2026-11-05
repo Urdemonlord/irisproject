@@ -13,11 +13,10 @@ use axum::{
 };
 use chrono::{DateTime, Duration, SecondsFormat, Utc};
 use iris_auth as auth;
+use iris_config::limits::{ACTIVE_PER_CLIENT, IP_CREATES_PER_HOUR, TEMP_INBOX_MESSAGE_LIMIT};
 use serde_json::json;
 use std::net::SocketAddr;
 
-const IP_CREATES_PER_HOUR: i64 = 10;
-const ACTIVE_PER_CLIENT: i64 = 3;
 const CLIENT_COOKIE: &str = "iris_temp_client";
 
 fn ts(t: DateTime<Utc>) -> String {
@@ -205,7 +204,7 @@ pub async fn messages(
             &account,
             &i.address,
             &i.created_at,
-            50,
+            TEMP_INBOX_MESSAGE_LIMIT,
         )
         .await?;
     Ok(

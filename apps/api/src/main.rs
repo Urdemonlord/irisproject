@@ -7,10 +7,15 @@ use axum::{
     Extension, Json, Router,
 };
 use iris_auth as auth;
+use iris_config::limits::{
+    DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
+    MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_SEARCH_QUERY_CHARS,
+    MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES,
+};
 use iris_config::Config;
 use iris_mail::{
     extract_text_attachment, Attachment, Compose, JmapClient, ListPage, MailError, MessageDetail,
-    ResendClient, MAX_ATTACHMENT_BYTES, MAX_PREVIEW_BYTES, MAX_RAW_BYTES,
+    ResendClient,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -161,11 +166,13 @@ async fn main() {
         .route("/auth/login", post(login))
         .route(
             "/internal/v1/timeless-password-reset",
-            post(timeless_password_reset).layer(DefaultBodyLimit::max(1024)),
+            post(timeless_password_reset)
+                .layer(DefaultBodyLimit::max(MAX_TIMELESS_RESET_BODY_BYTES)),
         )
         .route(
             "/api/v1/integrations/email",
-            post(transactional_email::send).layer(DefaultBodyLimit::max(8192)),
+            post(transactional_email::send)
+                .layer(DefaultBodyLimit::max(MAX_TRANSACTIONAL_EMAIL_BODY_BYTES)),
         )
         .route(
             "/api/v1/integrations/email-requests/:request_id",
@@ -349,9 +356,6 @@ struct LoginBody {
     email: String,
     password: String,
 }
-
-const MAX_FAILED_LOGINS: i64 = 10; // per email per 15 minutes
-const MAX_FAILED_LOGINS_PER_IP: i64 = 50; // per client IP per 15 minutes (tolerant of shared NAT)
 
 /// Peer IP; trust X-Real-IP only when the peer is the local reverse proxy.
 pub(crate) fn client_ip(peer: std::net::SocketAddr, headers: &HeaderMap) -> String {
@@ -636,7 +640,10 @@ async fn list_messages(
     Query(p): Query<Page>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
-    let limit = p.limit.unwrap_or(50).clamp(1, 100);
+    let limit = p
+        .limit
+        .unwrap_or(DEFAULT_LIST_LIMIT)
+        .clamp(1, MAX_LIST_LIMIT);
     let position = p.position.unwrap_or(0);
     let folder = compose::folder_role(p.folder.as_deref().unwrap_or("inbox"))?;
     // Search terms are capped so a huge `q` is never forwarded verbatim to JMAP.
@@ -644,7 +651,7 @@ async fn list_messages(
         p.q.as_deref()
             .map(str::trim)
             .filter(|q| !q.is_empty())
-            .map(|q| q.chars().take(200).collect::<String>());
+            .map(|q| q.chars().take(MAX_SEARCH_QUERY_CHARS).collect::<String>());
     let (messages, total) = s
         .jmap
         .list_folder(
