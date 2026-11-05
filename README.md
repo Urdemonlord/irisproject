@@ -1,3 +1,7 @@
+<p align="left">
+  <img src="docs/assets/iris-logo.svg" alt="IRIS — self-hosted webmail" width="360">
+</p>
+
 # IRIS
 
 [![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
