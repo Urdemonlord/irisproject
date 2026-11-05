@@ -1,4 +1,17 @@
-version: '3.8'
+# IRIS all-in-one stack: API + web + Stalwart mail server.
+#
+#   SESSION_SECRET=$(openssl rand -hex 32) docker compose -f deploy/compose/docker-compose.yaml up -d --build
+#
+# Then open http://127.0.0.1:8080. Before real use you must still:
+#   - create Stalwart accounts (one permanent user per mailbox + the
+#     catch-all TEMP_INBOX_MAIL_USER) — see README Deployment §1;
+#   - set a real TEMP_INBOX_DOMAIN (the default is the example value);
+#   - put TLS + a public domain in front for anything beyond localhost.
+#
+# Known limitation: the API trusts X-Real-IP only from a loopback proxy
+# (see apps/api/src/main.rs: client_ip). In this stack nginx runs in its
+# own container, so per-IP rate limits see the proxy's IP, not the real
+# client IP. The systemd + nginx deployment does not have this problem.
 
 services:
   api:
@@ -8,12 +21,20 @@ services:
     ports:
       - "127.0.0.1:8000:8000"
     environment:
+      IRIS_ENV: ${IRIS_ENV:-production}
+      IRIS_HOST: 0.0.0.0
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET first, e.g. SESSION_SECRET=$(openssl rand -hex 32)}
       DATABASE_URL: sqlite:///data/iris.db
+      STALWART_API_URL: http://stalwart:8080
+      TEMP_INBOX_DOMAIN: ${TEMP_INBOX_DOMAIN:-inbox.example.com}
+      TEMP_INBOX_MAIL_USER: ${TEMP_INBOX_MAIL_USER:-}
+      TEMP_INBOX_MAIL_PASSWORD: ${TEMP_INBOX_MAIL_PASSWORD:-}
+      SEND_LOCAL_DOMAINS: ${SEND_LOCAL_DOMAINS:-example.com}
       RESEND_API_KEY: ${RESEND_API_KEY:-}
-      IRIS_TIMELESS_SERVICE_TOKEN: ${IRIS_TIMELESS_SERVICE_TOKEN:-}
-      IRIS_TIMELESS_EMAIL_FROM: ${IRIS_TIMELESS_EMAIL_FROM:-}
-      IRIS_TIMELESS_EMAIL_TO: ${IRIS_TIMELESS_EMAIL_TO:-}
-      TIMELESS_PUBLIC_ORIGIN: ${TIMELESS_PUBLIC_ORIGIN:-}
+      IRIS_PASSWORD_RESET_SERVICE_TOKEN: ${IRIS_PASSWORD_RESET_SERVICE_TOKEN:-}
+      IRIS_PASSWORD_RESET_EMAIL_FROM: ${IRIS_PASSWORD_RESET_EMAIL_FROM:-}
+      IRIS_PASSWORD_RESET_EMAIL_TO: ${IRIS_PASSWORD_RESET_EMAIL_TO:-}
+      IRIS_PASSWORD_RESET_PUBLIC_ORIGIN: ${IRIS_PASSWORD_RESET_PUBLIC_ORIGIN:-}
       IRIS_RESEND_API_URL: ${IRIS_RESEND_API_URL:-}
     volumes:
       - api-data:/data
@@ -22,9 +43,12 @@ services:
 
   web:
     build:
-      context: ../../apps/web
+      context: ../../
+      dockerfile: ./apps/web/Dockerfile
     ports:
-      - "127.0.0.1:5173:5173"
+      - "127.0.0.1:8080:80"
+    depends_on:
+      - api
 
   stalwart:
     image: stalwartlabs/stalwart:latest
