@@ -39,7 +39,8 @@ impl Config {
     pub fn from_env() -> anyhow::Result<Self> {
         dotenv::dotenv().ok();
         let env = std::env::var("IRIS_ENV").unwrap_or_else(|_| "development".to_string());
-        let resend_api_url = resend_api_endpoint(&env, std::env::var("IRIS_RESEND_API_URL").ok().as_deref());
+        let resend_api_url =
+            resend_api_endpoint(&env, std::env::var("IRIS_RESEND_API_URL").ok().as_deref());
         Ok(Self {
             env,
             host: std::env::var("IRIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -63,12 +64,19 @@ impl Config {
             temp_inbox_mail_password: std::env::var("TEMP_INBOX_MAIL_PASSWORD").unwrap_or_default(),
             send_local_domains: std::env::var("SEND_LOCAL_DOMAINS")
                 .unwrap_or_else(|_| "meowlabs.id,iris.meowlabs.id,inbox.meowlabs.id".to_string())
-                .split(',').map(|d| d.trim().to_lowercase()).filter(|d| !d.is_empty()).collect(),
-            send_external: std::env::var("SEND_EXTERNAL").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+                .split(',')
+                .map(|d| d.trim().to_lowercase())
+                .filter(|d| !d.is_empty())
+                .collect(),
+            send_external: std::env::var("SEND_EXTERNAL")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
-            integration_email_from: std::env::var("IRIS_INTEGRATION_EMAIL_FROM").unwrap_or_default(),
-            integration_email_enabled: std::env::var("IRIS_INTEGRATION_EMAIL_ENABLED").is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
-            iris_timeless_service_token: std::env::var("IRIS_TIMELESS_SERVICE_TOKEN").unwrap_or_default(),
+            integration_email_from: std::env::var("IRIS_INTEGRATION_EMAIL_FROM")
+                .unwrap_or_default(),
+            integration_email_enabled: std::env::var("IRIS_INTEGRATION_EMAIL_ENABLED")
+                .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
+            iris_timeless_service_token: std::env::var("IRIS_TIMELESS_SERVICE_TOKEN")
+                .unwrap_or_default(),
             iris_timeless_email_from: std::env::var("IRIS_TIMELESS_EMAIL_FROM").unwrap_or_default(),
             iris_timeless_email_to: std::env::var("IRIS_TIMELESS_EMAIL_TO").unwrap_or_default(),
             timeless_public_origin: std::env::var("TIMELESS_PUBLIC_ORIGIN").unwrap_or_default(),
@@ -78,14 +86,17 @@ impl Config {
 }
 
 fn is_local_http_endpoint(url: &str) -> bool {
-    let Some(rest) = url.strip_prefix("http://") else { return false; };
+    let Some(rest) = url.strip_prefix("http://") else {
+        return false;
+    };
     let authority = rest.split('/').next().unwrap_or_default();
     if authority.is_empty() || authority.contains(['@', '?', '#', '\\']) {
         return false;
     }
-    let Some((host, port)) = authority.rsplit_once(':') else { return false; };
-    matches!(host, "localhost" | "127.0.0.1")
-        && port.parse::<u16>().is_ok_and(|port| port > 0)
+    let Some((host, port)) = authority.rsplit_once(':') else {
+        return false;
+    };
+    matches!(host, "localhost" | "127.0.0.1") && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 fn resend_api_endpoint(env: &str, override_url: Option<&str>) -> String {
@@ -93,7 +104,10 @@ fn resend_api_endpoint(env: &str, override_url: Option<&str>) -> String {
     if env.eq_ignore_ascii_case("production") {
         return RESEND_URL.to_string();
     }
-    match override_url.map(str::trim).filter(|url| is_local_http_endpoint(url)) {
+    match override_url
+        .map(str::trim)
+        .filter(|url| is_local_http_endpoint(url))
+    {
         Some(url) => url.to_string(),
         None => RESEND_URL.to_string(),
     }
@@ -125,7 +139,10 @@ mod tests {
             "http://localhost:8765@attacker.invalid/emails",
             "http://127.0.0.1:8765@attacker.invalid/emails",
         ] {
-            assert_eq!(resend_api_endpoint("development", Some(url)), "https://api.resend.com/emails");
+            assert_eq!(
+                resend_api_endpoint("development", Some(url)),
+                "https://api.resend.com/emails"
+            );
         }
     }
 }
