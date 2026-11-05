@@ -112,16 +112,23 @@ pub(crate) fn valid_email_address(value: &str) -> bool {
 
 /// Loose address check for user-typed compose recipients: same length and
 /// domain-shape guards as the strict check, but the mail server remains the
-/// final arbiter, so local-part charset, dot placement, the single-`@`
-/// rule, and the LDH label rules are not enforced here.
+/// final arbiter, so local-part charset, dot placement, and the LDH label
+/// rules are not enforced here. Multi-`@` and over-long (63+) labels ARE
+/// rejected, because a lenient downstream parser could interpret such
+/// addresses ambiguously (security).
 pub(crate) fn valid_compose_address(value: &str) -> bool {
-    let Some((local, domain)) = value.rsplit_once('@') else {
+    let Some((local, domain)) = value.split_once('@') else {
+        return false;
+    };
+    if domain.contains('@') || local.is_empty() || domain.is_empty() {
+        return false;
+    }
+    let Some(labels) = domain_labels(domain) else {
         return false;
     };
     value.len() <= 254
-        && !local.is_empty()
         && local.len() <= 64
-        && domain_labels(domain).is_some()
+        && labels.iter().all(|label| label.len() <= 63)
         && value
             .chars()
             .all(|c| c.is_ascii_graphic() && !"<>()[]\\,;:\"".contains(c))
@@ -141,13 +148,20 @@ mod tests {
     #[test]
     fn loose_accepts_addresses_strict_rejects() {
         // Documented divergence (see module docs): the compose check is
-        // deliberately looser than the transactional check.
-        for addr in [".a@x.id", "a..b@x.id", "a@b@x.id", "a@x_y.id", "a@-x.id"] {
+        // deliberately looser than the transactional check, except for
+        // multi-`@` and over-long labels which are now rejected by both.
+        for addr in [".a@x.id", "a..b@x.id", "a@x_y.id", "a@-x.id"] {
             assert!(!valid_email_address(addr), "strict must reject {addr}");
             assert!(valid_compose_address(addr), "loose must accept {addr}");
         }
+    }
+
+    #[test]
+    fn loose_rejects_ambiguous_addresses() {
+        // Security: multi-`@` and labels longer than 63 bytes must be
+        // rejected even by the loose compose check.
+        assert!(!valid_compose_address("a@b@c.com"));
         let long_label = format!("a@{}.id", "x".repeat(64));
-        assert!(!valid_email_address(&long_label));
-        assert!(valid_compose_address(&long_label));
+        assert!(!valid_compose_address(&long_label));
     }
 }
