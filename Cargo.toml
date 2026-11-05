@@ -12,7 +12,7 @@ resolver = "2"
 version = "0.1.0"
 edition = "2021"
 authors = ["Meow Labs"]
-license = "TBD"
+license = "MIT OR Apache-2.0"
 
 [workspace.dependencies]
 tokio = { version = "1.40", features = ["full"] }

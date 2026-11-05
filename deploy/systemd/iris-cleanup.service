@@ -6,8 +6,8 @@ After=network.target
 
 [Service]
 Type=oneshot
-User=meowlabs
-Group=meowlabs
-WorkingDirectory=/home/meowlabs/projects/irisproject
-EnvironmentFile=/home/meowlabs/projects/irisproject/.env
+User=iris
+Group=iris
+WorkingDirectory=/opt/iris
+EnvironmentFile=/opt/iris/.env
 ExecStart=/usr/local/bin/iris-api cleanup-once

@@ -139,7 +139,7 @@ mod tests {
 
     #[test]
     fn strict_addresses_are_also_loose_addresses() {
-        for addr in ["a@meowlabs.id", "first.last+tag@sub.example.co"] {
+        for addr in ["a@example.com", "first.last+tag@sub.example.co"] {
             assert!(valid_email_address(addr), "{addr}");
             assert!(valid_compose_address(addr), "{addr}");
         }

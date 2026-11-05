@@ -1,7 +1,7 @@
 # IRIS Design System
 
 **Product:** IRIS by Meow Labs  
-**Primary application:** `mail.meowlabs.id`  
+**Primary application:** `mail.example.com`  
 **Version:** 1.0  
 **Direction:** Minimal Editorial + Swiss Design + Modern Developer Tool
 
@@ -23,9 +23,9 @@ Principles:
 - Product: **IRIS**
 - Parent brand: **Meow Labs**
 - Tagline: **Every message finds its way.**
-- Dashboard: `https://mail.meowlabs.id`
-- Permanent email domain: `meowlabs.id`
-- Proposed temporary email domain: `inbox.meowlabs.id`
+- Dashboard: `https://mail.example.com`
+- Permanent email domain: `example.com`
+- Proposed temporary email domain: `inbox.example.com`
 
 Use the official Meow Labs logo and brand red when available. The colors below are provisional and must be reconciled with the official brand palette. Do not invent a new mascot or modify the parent logo without approval.
 

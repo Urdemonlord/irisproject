@@ -10,7 +10,7 @@ Its personality is calm, alert, and a little aloof. It never waves, winks, or gr
 more emotion than the eyes allow.
 
 Kurir is a separate character from the official Meow Labs logo, which is a white-on-black negative-space
-cat. Kurir never replaces or edits the parent logo. **Arya must approve Kurir before ship**: the earlier
+cat. Kurir never replaces or edits the parent logo. **The maintainer must approve Kurir before ship**: the earlier
 `design.md` §12 forbids a mascot in core mail flows without approval. Under this guide, Kurir appears
 only in the placements listed below.
 

@@ -81,8 +81,8 @@ pub const DEFAULT_LIST_LIMIT: u32 = 50;
 pub const MAX_LIST_LIMIT: u32 = 100;
 /// Search terms are truncated to this many characters before going to JMAP.
 pub const MAX_SEARCH_QUERY_CHARS: usize = 200;
-/// Max request body for the Timeless password-reset endpoint.
-pub const MAX_TIMELESS_RESET_BODY_BYTES: usize = 1_024;
+/// Max request body for the password-reset webhook endpoint.
+pub const MAX_PASSWORD_RESET_BODY_BYTES: usize = 1_024;
 /// Max request body for the transactional-email send endpoint.
 pub const MAX_TRANSACTIONAL_EMAIL_BODY_BYTES: usize = 8_192;
 
@@ -129,7 +129,7 @@ mod tests {
         assert_eq!(DEFAULT_LIST_LIMIT, 50);
         assert_eq!(MAX_LIST_LIMIT, 100);
         assert_eq!(MAX_SEARCH_QUERY_CHARS, 200);
-        assert_eq!(MAX_TIMELESS_RESET_BODY_BYTES, 1_024);
+        assert_eq!(MAX_PASSWORD_RESET_BODY_BYTES, 1_024);
         assert_eq!(MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, 8_192);
         assert_eq!(MAX_HTML_BODY_BYTES, 5_000_000);
         assert_eq!(HTML_BODY_TOKEN_TTL_SECS, 120);

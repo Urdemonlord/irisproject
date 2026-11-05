@@ -1,7 +1,7 @@
 # IRIS Technical Requirements Document (TRD)
 
 **Product:** IRIS by Meow Labs\
-**Primary URL:** `mail.meowlabs.id`\
+**Primary URL:** `mail.example.com`\
 **Status:** Draft v1.0
 
 ## 1. Technical direction
@@ -36,7 +36,7 @@ Internet senders
       |
       | SMTP / MX
       v
-mx.meowlabs.id
+mx.example.com
       |
       v
 Stalwart Mail Server ---- mail storage
@@ -51,10 +51,10 @@ Rust API (Axum)                 |
 Vanilla TypeScript frontend
       |
       v
-mail.meowlabs.id
+mail.example.com
 
 Temporary addresses:
-inbox.meowlabs.id -> MX routing -> Stalwart -> temporary-inbox mapping
+inbox.example.com -> MX routing -> Stalwart -> temporary-inbox mapping
 ```
 
 The frontend must not connect directly to the mail server with
@@ -63,13 +63,13 @@ carefully scoped user-level JMAP session.
 
 ## 3. Domain and DNS requirements
 
-Proposed names: - `meowlabs.id`: company website. - `mail.meowlabs.id`:
-IRIS web application. - `mx.meowlabs.id`: mail server hostname. -
-`inbox.meowlabs.id`: temporary address domain.
+Proposed names: - `example.com`: company website. - `mail.example.com`:
+IRIS web application. - `mx.example.com`: mail server hostname. -
+`inbox.example.com`: temporary address domain.
 
 Required DNS and network configuration depends on the chosen mail-server
 topology: - A/AAAA records for public hosts where applicable. - MX
-records for `meowlabs.id` and `inbox.meowlabs.id`. - PTR/reverse DNS for
+records for `example.com` and `inbox.example.com`. - PTR/reverse DNS for
 the sending IP if outbound mail is enabled. - SPF record authorizing the
 actual outbound sender. - DKIM signing and public key records. - DMARC
 policy and reporting mailbox. - Valid TLS certificates for web and mail

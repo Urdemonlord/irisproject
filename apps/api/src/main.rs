@@ -9,9 +9,9 @@ use axum::{
 use iris_auth as auth;
 use iris_config::limits::{
     DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
-    MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW,
-    MAX_SEARCH_QUERY_CHARS, MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES,
-    READ_WINDOW_MINUTES,
+    MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PASSWORD_RESET_BODY_BYTES, MAX_PREVIEW_BYTES,
+    MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
+    MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
 use iris_mail::{
@@ -207,11 +207,7 @@ async fn main() {
         .route("/ready", get(ready))
         .route("/auth/csrf", get(csrf))
         .route("/auth/login", post(login))
-        .route(
-            "/internal/v1/timeless-password-reset",
-            post(timeless_password_reset)
-                .layer(DefaultBodyLimit::max(MAX_TIMELESS_RESET_BODY_BYTES)),
-        )
+        .merge(password_reset_routes())
         .route(
             "/api/v1/integrations/email",
             post(transactional_email::send)
@@ -259,9 +255,27 @@ async fn main() {
     .expect("server");
 }
 
+/// Both paths serve the same handler: the generic webhook path, plus the
+/// deprecated companion-app path kept for the live caller (it allow-lists
+/// that exact path — see README, "Password-reset webhook"). Remove the
+/// deprecated route only after the caller has switched to the generic one.
+fn password_reset_routes() -> Router<Arc<AppState>> {
+    Router::new()
+        .route(
+            "/internal/v1/password-reset-webhook",
+            post(password_reset_webhook)
+                .layer(DefaultBodyLimit::max(MAX_PASSWORD_RESET_BODY_BYTES)),
+        )
+        .route(
+            "/internal/v1/timeless-password-reset",
+            post(password_reset_webhook)
+                .layer(DefaultBodyLimit::max(MAX_PASSWORD_RESET_BODY_BYTES)),
+        )
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TimelessPasswordResetBody {
+struct PasswordResetWebhookBody {
     token: String,
 }
 
@@ -297,23 +311,23 @@ fn reset_email_configured(s: &AppState) -> bool {
                 b.is_ascii_whitespace() || b == b'<' || b == b'>' || b == b'\r' || b == b'\n'
             })
     };
-    s.config.iris_timeless_service_token.len() >= 32
-        && valid_email(&s.config.iris_timeless_email_from)
-        && valid_email(&s.config.iris_timeless_email_to)
-        && valid_dns_name(&s.config.timeless_public_origin)
+    s.config.password_reset_service_token.len() >= 32
+        && valid_email(&s.config.password_reset_email_from)
+        && valid_email(&s.config.password_reset_email_to)
+        && valid_dns_name(&s.config.password_reset_public_origin)
         && s.relay.is_some()
 }
 
-async fn timeless_password_reset(
+async fn password_reset_webhook(
     State(s): S,
     headers: HeaderMap,
-    Json(body): Json<TimelessPasswordResetBody>,
+    Json(body): Json<PasswordResetWebhookBody>,
 ) -> ApiResult {
     let supplied = headers
         .get(header::AUTHORIZATION)
         .and_then(|h| h.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "));
-    if !supplied.is_some_and(|value| auth::ct_eq(&s.config.iris_timeless_service_token, value)) {
+    if !supplied.is_some_and(|value| auth::ct_eq(&s.config.password_reset_service_token, value)) {
         return Err(ApiError(StatusCode::UNAUTHORIZED, "unauthorized"));
     }
     if !reset_email_configured(&s) {
@@ -328,13 +342,13 @@ async fn timeless_password_reset(
 
     let link = format!(
         "https://{}/admin/reset#token={}",
-        s.config.timeless_public_origin, body.token
+        s.config.password_reset_public_origin, body.token
     );
     let message = Compose {
-        from: s.config.iris_timeless_email_from.clone(),
-        to: vec![s.config.iris_timeless_email_to.clone()],
-        subject: "Reset your Timeless editor password".to_string(),
-        text: format!("A password reset was requested for the Timeless editor account.\n\nUse this one-time link within 15 minutes:\n{link}\n\nIf you did not request this, ignore this message."),
+        from: s.config.password_reset_email_from.clone(),
+        to: vec![s.config.password_reset_email_to.clone()],
+        subject: "Reset your editor password".to_string(),
+        text: format!("A password reset was requested for the editor account.\n\nUse this one-time link within 15 minutes:\n{link}\n\nIf you did not request this, ignore this message."),
         ..Compose::default()
     };
     // `reset_email_configured` above already checks `s.relay.is_some()`;
@@ -346,7 +360,7 @@ async fn timeless_password_reset(
         ));
     };
     if relay.send(&message).await.is_err() {
-        tracing::warn!("Timeless password reset email relay failed; details redacted");
+        tracing::warn!("Password-reset webhook email relay failed; details redacted");
         return Err(ApiError(StatusCode::BAD_GATEWAY, "delivery_unavailable"));
     }
     Ok((StatusCode::ACCEPTED, Json(json!({ "accepted": true }))).into_response())
@@ -1099,7 +1113,7 @@ async fn get_attachment_preview(
 }
 
 #[cfg(test)]
-mod timeless_password_reset_tests {
+mod password_reset_webhook_tests {
     use super::*;
     use serde_json::Value;
     use std::{
@@ -1220,12 +1234,12 @@ mod timeless_password_reset_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: true,
-                iris_timeless_service_token: service_key.into(),
-                iris_timeless_email_from: sender.into(),
-                iris_timeless_email_to: recipient.into(),
-                timeless_public_origin: origin.into(),
+                password_reset_service_token: service_key.into(),
+                password_reset_email_from: sender.into(),
+                password_reset_email_to: recipient.into(),
+                password_reset_public_origin: origin.into(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
             },
@@ -1254,29 +1268,29 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
             )),
         )
         .await;
-        let missing = timeless_password_reset(
+        let missing = password_reset_webhook(
             State(app.clone()),
             HeaderMap::new(),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(missing.0, StatusCode::UNAUTHORIZED);
-        let wrong = timeless_password_reset(
+        let wrong = password_reset_webhook(
             State(app),
             auth_headers("wrong-service-key"),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
@@ -1291,19 +1305,19 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
             )),
         )
         .await;
-        let result = timeless_password_reset(
+        let result = password_reset_webhook(
             State(app),
             auth_headers(SERVICE_KEY),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: "not-a-reset-token".into(),
             }),
         )
@@ -1327,20 +1341,20 @@ mod timeless_password_reset_tests {
             )),
         )
         .await;
-        let unauthenticated = timeless_password_reset(
+        let unauthenticated = password_reset_webhook(
             State(app.clone()),
             HeaderMap::new(),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
         .await
         .unwrap_err();
         assert_eq!(unauthenticated.0, StatusCode::UNAUTHORIZED);
-        let authenticated = timeless_password_reset(
+        let authenticated = password_reset_webhook(
             State(app),
             auth_headers(SERVICE_KEY),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
@@ -1355,19 +1369,19 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "admin@meowlabs.id",
+            "admin@example.com",
             "",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
             )),
         )
         .await;
-        let result = timeless_password_reset(
+        let result = password_reset_webhook(
             State(app),
             auth_headers(SERVICE_KEY),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
@@ -1382,19 +1396,19 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "admin@meowlabs.id",
+            "admin@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
             )),
         )
         .await;
-        let response = timeless_password_reset(
+        let response = password_reset_webhook(
             State(app),
             auth_headers(SERVICE_KEY),
-            Json(TimelessPasswordResetBody {
+            Json(PasswordResetWebhookBody {
                 token: GOOD_TOKEN.into(),
             }),
         )
@@ -1405,15 +1419,54 @@ mod timeless_password_reset_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload["from"], "admin@meowlabs.id");
+        assert_eq!(payload["from"], "admin@example.com");
         assert_eq!(payload["to"], json!(["recovery@example.test"]));
-        assert_eq!(payload["subject"], "Reset your Timeless editor password");
+        assert_eq!(payload["subject"], "Reset your editor password");
         let text = payload["text"].as_str().unwrap();
         assert!(text.contains(&format!(
-            "https://timeless.meowlabs.id/admin/reset#token={GOOD_TOKEN}"
+            "https://reset.example.com/admin/reset#token={GOOD_TOKEN}"
         )));
         assert!(!text.contains("?token="));
         relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn generic_and_deprecated_routes_both_serve() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        // The fake relay accepts a single connection, so each path gets a
+        // fresh relay + state; both must answer 202.
+        for path in [
+            "/internal/v1/password-reset-webhook",
+            "/internal/v1/timeless-password-reset",
+        ] {
+            let relay = fake_relay().await;
+            let app = state(
+                SERVICE_KEY,
+                "admin@example.com",
+                "recovery@example.test",
+                "reset.example.com",
+                Some(ResendClient::with_endpoint(
+                    "test-key".into(),
+                    relay.endpoint.clone(),
+                )),
+            )
+            .await;
+            let req = Request::builder()
+                .method("POST")
+                .uri(path)
+                .header(header::AUTHORIZATION, format!("Bearer {SERVICE_KEY}"))
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(format!("{{\"token\":\"{GOOD_TOKEN}\"}}")))
+                .unwrap();
+            let response = password_reset_routes()
+                .with_state(app)
+                .oneshot(req)
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::ACCEPTED, "{path} must serve");
+            relay.task.abort();
+        }
     }
 
     #[tokio::test]
@@ -1421,7 +1474,7 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let mut app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1437,7 +1490,7 @@ mod timeless_password_reset_tests {
         let generated = auth::generate_api_key();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES (?,?,?,?,?)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1456,7 +1509,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "user@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+                action_url: "https://alpha.example.com/verify?token=opaque".into(),
             }),
         )
         .await
@@ -1476,7 +1529,7 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1489,7 +1542,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify", "email:status"]).to_string())
             .bind(auth::now())
@@ -1507,7 +1560,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            action_url: "https://alpha.example.com/verify?token=opaque".into(),
         };
         let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
             .await
@@ -1523,13 +1576,13 @@ mod timeless_password_reset_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload["from"], "no-reply@meowlabs.id");
+        assert_eq!(payload["from"], "no-reply@example.com");
         assert_eq!(payload["to"], json!(["user@example.test"]));
-        assert_eq!(payload["subject"], "Verify your GenCV email");
+        assert_eq!(payload["subject"], "Verify your email");
         assert!(payload["text"]
             .as_str()
             .unwrap()
-            .contains("https://gencv.meowlabs.id/verify?token=opaque"));
+            .contains("https://alpha.example.com/verify?token=opaque"));
 
         let retry = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
             .await
@@ -1547,7 +1600,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "different@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+                action_url: "https://alpha.example.com/verify?token=opaque".into(),
             }),
         )
         .await
@@ -1578,7 +1631,7 @@ mod timeless_password_reset_tests {
         .await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1591,7 +1644,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1608,7 +1661,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            action_url: "https://alpha.example.com/verify?token=opaque".into(),
         };
 
         let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
@@ -1650,7 +1703,7 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1663,7 +1716,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1712,7 +1765,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+            action_url: "https://alpha.example.com/verify?token=abc".into(),
         };
 
         headers.insert("idempotency-key", "quota-free-first".parse().unwrap());
@@ -1748,7 +1801,7 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1761,7 +1814,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1798,7 +1851,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "user@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+                action_url: "https://alpha.example.com/verify?token=abc".into(),
             }),
         )
         .await
@@ -1832,7 +1885,7 @@ mod timeless_password_reset_tests {
     #[tokio::test]
     async fn migration_enforces_idempotency_per_integration_key() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
-        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES ('test-key','gencv',?,'[\\\"email:template:auth.verify\\\"]',?)")
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES ('test-key','alpha',?,'[\\\"email:template:auth.verify\\\"]',?)")
             .bind("a".repeat(64)).bind(auth::now()).execute(&pool).await.unwrap();
         let insert = "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'accepted',?,?)";
         let now = auth::now();
@@ -1891,12 +1944,12 @@ mod read_limit_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
-                iris_timeless_service_token: String::new(),
-                iris_timeless_email_from: String::new(),
-                iris_timeless_email_to: String::new(),
-                timeless_public_origin: String::new(),
+                password_reset_service_token: String::new(),
+                password_reset_email_from: String::new(),
+                password_reset_email_to: String::new(),
+                password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
             },
@@ -2100,7 +2153,7 @@ mod handler_integration_tests {
                 vec![json!(["Mailbox/set", {"created": {}, "notCreated": {}}, "s"])]
             }
             "Identity/get" => vec![
-                json!(["Identity/get", {"list": [{"id": "ident-1", "email": "alice@meowlabs.id"}]}, "i"]),
+                json!(["Identity/get", {"list": [{"id": "ident-1", "email": "alice@example.com"}]}, "i"]),
             ],
             "Identity/set" => vec![
                 json!(["Identity/set", {"created": {"i": {"id": "ident-1"}}, "notCreated": {}}, "s"]),
@@ -2239,11 +2292,11 @@ mod handler_integration_tests {
 
     async fn test_state(jmap: &FakeJmap, relay: Option<ResendClient>) -> Arc<AppState> {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
-        sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES ('u-alice','alice@meowlabs.id','Alice','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES ('u-alice','alice@example.com','Alice','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mbx-1','u-alice','alice@meowlabs.id','acct-1','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mbx-1','u-alice','alice@example.com','acct-1','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
@@ -2263,15 +2316,15 @@ mod handler_integration_tests {
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
                 temp_inbox_mail_password: String::new(),
-                send_local_domains: vec!["meowlabs.id".into()],
+                send_local_domains: vec!["example.com".into()],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
-                iris_timeless_service_token: String::new(),
-                iris_timeless_email_from: String::new(),
-                iris_timeless_email_to: String::new(),
-                timeless_public_origin: String::new(),
+                password_reset_service_token: String::new(),
+                password_reset_email_from: String::new(),
+                password_reset_email_to: String::new(),
+                password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
             },
@@ -2281,9 +2334,9 @@ mod handler_integration_tests {
     fn user() -> CurrentUser {
         CurrentUser {
             user_id: "u-alice".into(),
-            email: "alice@meowlabs.id".into(),
+            email: "alice@example.com".into(),
             creds: Creds {
-                user: "alice@meowlabs.id".into(),
+                user: "alice@example.com".into(),
                 pass: "secret".into(),
             },
         }
@@ -2334,7 +2387,7 @@ mod handler_integration_tests {
     }
 
     fn summary_json(id: &str, subject: &str) -> Value {
-        json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@meowlabs.id"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
+        json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@example.com"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
     }
 
     /// Compose -> relay -> store_sent fails: the message is already
@@ -2352,7 +2405,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("bob@example.com"),
+            compose_body("bob@example.test"),
         )
         .await
         .unwrap();
@@ -2386,7 +2439,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("bob@example.com"),
+            compose_body("bob@example.test"),
         )
         .await
         .unwrap();
@@ -2430,7 +2483,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("alice@meowlabs.id"),
+            compose_body("alice@example.com"),
         )
         .await
         .unwrap();
@@ -2565,8 +2618,8 @@ mod handler_integration_tests {
         json!({
             "id": "m1",
             "from": [{"email": "noreply-dmarc-support@google.com"}],
-            "to": [{"email": "alice@meowlabs.id"}],
-            "subject": "Report domain: meowlabs.id",
+            "to": [{"email": "alice@example.com"}],
+            "subject": "Report domain: example.com",
             "preview": "", "receivedAt": "2026-11-04T00:00:00Z",
             "keywords": {"$seen": true}, "size": 12345, "hasAttachment": true,
             "blobId": "msg-blob-1",

@@ -3,7 +3,7 @@
 ## `iris-api.service` (live, NOT in this repo)
 
 The production API unit lives only on the host (`/etc/systemd/system/iris-api.service`):
-`User=meowlabs`, `WorkingDirectory=/home/meowlabs/projects/irisproject`,
+`User=iris`, `WorkingDirectory=/opt/iris`,
 `EnvironmentFile=.../.env`, `ExecStart=/usr/local/bin/iris-api`, `Restart=always`.
 It is documented here so the safety-net units below can mirror it exactly.
 
@@ -20,7 +20,7 @@ out-of-process backstop for exactly that case.
 ### How it works
 
 - `iris-cleanup.service` runs `/usr/local/bin/iris-api cleanup-once` as user
-  `meowlabs` with the same working directory and `.env` as the API, so it
+  `iris` with the same working directory and `.env` as the API, so it
   reads the same database and mail credentials. No new daemon, no new
   endpoint, no new credentials: one pass of the existing cleanup code, then
   the process exits.
@@ -38,7 +38,7 @@ the `cleanup-once` subcommand (IRIS debt round 2 or later). Check first:
 ```bash
 # One manual pass; exit code 0 means the subcommand exists and the pass ran.
 # It performs real (idempotent) cleanup work, so run it once and check the log.
-sudo -u meowlabs /usr/local/bin/iris-api cleanup-once; echo "exit=$?"
+sudo -u iris /usr/local/bin/iris-api cleanup-once; echo "exit=$?"
 ```
 
 Then install and enable the timer:

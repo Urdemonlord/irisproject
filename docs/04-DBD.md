@@ -1,7 +1,7 @@
 # IRIS Design Brief Documentation (DBD)
 
 **Product:** IRIS by Meow Labs\
-**Primary URL:** `mail.meowlabs.id`\
+**Primary URL:** `mail.example.com`\
 **Status:** Draft v1.0
 
 ## 1. Design objective

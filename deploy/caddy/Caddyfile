@@ -2,7 +2,7 @@
 # Install: copy to /etc/caddy/Caddyfile, then `caddy validate --config /etc/caddy/Caddyfile && systemctl reload caddy`.
 # Web build goes to /srv/iris/dist (npm --prefix apps/web run build), API listens on 127.0.0.1:8000.
 
-mail.meowlabs.id {
+mail.example.com {
 	encode zstd gzip
 
 	# API + auth -> iris-api (same origin, needed for CSRF cookie + SameSite).

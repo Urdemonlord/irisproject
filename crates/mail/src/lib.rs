@@ -1256,8 +1256,8 @@ mod tests {
         json!({
             "id": "dmarc1",
             "from": [{"email": "noreply-dmarc-support@google.com"}],
-            "to": [{"email": "admin@meowlabs.id"}],
-            "subject": "Report domain: meowlabs.id Submitter: google.com Report-ID: 1",
+            "to": [{"email": "admin@example.com"}],
+            "subject": "Report domain: example.com Submitter: google.com Report-ID: 1",
             "preview": "", "receivedAt": "2026-11-04T00:00:00Z",
             "keywords": {"$seen": true}, "size": 12345, "hasAttachment": true,
             "blobId": "msg-blob-1",
@@ -1265,10 +1265,10 @@ mod tests {
             "bodyStructure": {"type": "multipart/mixed", "subParts": [
                 {"type": "text/plain", "partId": "1", "blobId": "b1", "size": 0},
                 {"type": "application/gzip", "partId": "2", "blobId": "b2", "size": 1234,
-                 "name": "google.com!meowlabs.id!1700000000!1700086400.xml.gz", "disposition": "attachment"}
+                 "name": "google.com!example.com!1700000000!1700086400.xml.gz", "disposition": "attachment"}
             ]},
             "attachments": [{"type": "application/gzip", "partId": "2", "blobId": "b2", "size": 1234,
-                "name": "google.com!meowlabs.id!1700000000!1700086400.xml.gz", "disposition": "attachment"}]
+                "name": "google.com!example.com!1700000000!1700086400.xml.gz", "disposition": "attachment"}]
         })
     }
 
@@ -1307,9 +1307,9 @@ mod tests {
         enc.write_all(xml.as_bytes()).unwrap();
         let gz = enc.finish().unwrap();
         let out =
-            extract_text_attachment("google.com!meowlabs.id!1!2.xml.gz", "application/gzip", &gz)
+            extract_text_attachment("google.com!example.com!1!2.xml.gz", "application/gzip", &gz)
                 .unwrap();
-        assert_eq!(out.inner_name, "google.com!meowlabs.id!1!2.xml");
+        assert_eq!(out.inner_name, "google.com!example.com!1!2.xml");
         assert!(out.text.contains("google.com"));
         assert!(!out.truncated);
 
@@ -1317,7 +1317,7 @@ mod tests {
         {
             let mut zip = zip::ZipWriter::new(&mut buf);
             zip.start_file(
-                "google.com!meowlabs.id!1!2.xml",
+                "google.com!example.com!1!2.xml",
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
@@ -1325,7 +1325,7 @@ mod tests {
             zip.finish().unwrap();
         }
         let out = extract_text_attachment(
-            "google.com!meowlabs.id!1!2.zip",
+            "google.com!example.com!1!2.zip",
             "application/zip",
             buf.get_ref(),
         )
@@ -1378,7 +1378,7 @@ mod tests {
                 .unwrap();
             zip.write_all(b"ignore me").unwrap();
             zip.start_file(
-                "google.com!meowlabs.id!1!2.xml",
+                "google.com!example.com!1!2.xml",
                 zip::write::SimpleFileOptions::default(),
             )
             .unwrap();
@@ -1386,7 +1386,7 @@ mod tests {
             zip.finish().unwrap();
         }
         let out = extract_text_attachment(
-            "google.com!meowlabs.id!1!2.zip",
+            "google.com!example.com!1!2.zip",
             "application/zip",
             mixed.get_ref(),
         )

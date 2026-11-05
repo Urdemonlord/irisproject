@@ -21,3 +21,6 @@ iris-config = { path = "../../crates/config" }
 iris-auth = { path = "../../crates/auth" }
 iris-database = { path = "../../crates/database" }
 iris-mail = { path = "../../crates/mail" }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }

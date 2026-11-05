@@ -1,6 +1,13 @@
 # IRIS Production Readiness Checklist
 
-Status as of 2026-10-30, staging (`iris-stalwart` + `iris-api`). `[x]` = verified with the proof named; `[ ]` = open.
+Status as of 2026-11-06, production. IRIS is live: systemd `iris-api`
+(listening on `127.0.0.1:8000`, `IRIS_ENV=production`) behind nginx
+vhosts for the app origin and the separate mail-content origin, with
+per-subdomain ECDSA certificates (app origin cert to 2027-01-28,
+content origin cert to 2027-02-03); Stalwart JMAP on `127.0.0.1:8092`;
+both origins resolve via Cloudflare. `[x]` = verified with the proof
+named; `[ ]` = open. Items carried over from the 2026-10-30 staging
+review keep their original proof unless re-verified live (noted inline).
 
 ## 1. Application security
 
@@ -11,7 +18,7 @@ Status as of 2026-10-30, staging (`iris-stalwart` + `iris-api`). `[x]` = verifie
 - [x] HTML email isolation: `<iframe sandbox="">` (no scripts, no same-origin), CSP `img-src data: cid:` blocks trackers and remote CSS. Proof: Playwright hostile-HTML probe (script/onerror blocked, 0 remote fetches, parent title untouched).
 - [x] Oversize mail rejected at SMTP: Stalwart `maxMessageSize` 26214400 (25 MiB), advertised in EHLO `SIZE`. Proof: smoke test sends 26 MiB with and without `SIZE=` → 5xx.
 - [ ] Rotating `SESSION_SECRET` invalidates all sealed credentials: users must log in again. Document in the ops runbook.
-- [ ] Separate origin for HTML mail rendering (TRD §6 "where feasible"); code prepared behind the flag, infra pending — see `docs/separate-mail-origin.md`. Currently same-origin `srcdoc` + empty sandbox.
+- [x] Separate origin for HTML mail rendering (TRD §6 "where feasible"): infra live since 2026-11-05 — DNS + ECDSA cert + nginx vhost + `MAIL_CONTENT_ORIGIN` set; origin smoke checks pass (`/` → 404, `html-body` without token → 404 with `frame-ancestors`). Not yet end-to-end: the deployed web build has no content-origin flag baked in, so browsers still use the same-origin `srcdoc` fallback until the web is rebuilt — see `docs/separate-mail-origin.md` §5–§6.
 
 ## 2. Retention
 
@@ -29,26 +36,31 @@ Status as of 2026-10-30, staging (`iris-stalwart` + `iris-api`). `[x]` = verifie
 
 Checked against authoritative NS (Cloudflare) on 2026-10-30.
 
-| Record | meowlabs.id | inbox.meowlabs.id |
+Live deployment (verified 2026-11-06): the app and mail-content origins
+resolve via Cloudflare. The record table below is the 2026-10-30 staging
+check and has not been re-verified against the live domains — treat the
+DMARC/SPF/PTR actions as still open until re-checked.
+
+| Record | example.com | inbox.example.com |
 |---|---|---|
-| MX | none (apex does not receive) | `10 mx-iris.meowlabs.id` → 129.226.193.34 |
+| MX | none (apex does not receive) | `10 mx.example.com` → 203.0.113.10 |
 | SPF | `v=spf1 mx -all` ⚠ apex has no MX, so this authorizes nobody | `v=spf1 -all` ✓ (receive-only domain) |
 | DKIM | `default._domainkey` RSA-2048 ✓, `resend._domainkey` RSA-1024 | n/a (never sends) |
 | DMARC | **missing** | **missing** |
 
-Actions (DNS changes, owner: Arya):
+Actions (DNS changes, owner: the deployment operator):
 
-- [ ] `_dmarc.meowlabs.id TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc@meowlabs.id; adkim=s; aspf=s"` (start `p=none` for 2 weeks if anything legitimately sends from the apex).
-- [ ] `_dmarc.inbox.meowlabs.id TXT "v=DMARC1; p=reject; adkim=s; aspf=s"` (domain never sends).
-- [ ] Fix apex SPF: list the real sender (e.g. `v=spf1 ip4:129.226.193.34 -all`, or `include:` of the provider using `resend._domainkey`), or `v=spf1 -all` if the apex never sends.
-- [ ] PTR for 129.226.193.34 → `mx-iris.meowlabs.id` (currently no PTR; required by many receivers if IRIS ever sends).
+- [ ] `_dmarc.example.com TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com; adkim=s; aspf=s"` (start `p=none` for 2 weeks if anything legitimately sends from the apex).
+- [ ] `_dmarc.inbox.example.com TXT "v=DMARC1; p=reject; adkim=s; aspf=s"` (domain never sends).
+- [ ] Fix apex SPF: list the real sender (e.g. `v=spf1 ip4:203.0.113.10 -all`, or `include:` of the provider using `resend._domainkey`), or `v=spf1 -all` if the apex never sends.
+- [ ] PTR for 203.0.113.10 → `mx.example.com` (currently no PTR; required by many receivers if IRIS ever sends).
 - [ ] Optional: MTA-STS + TLS-RPT (`_mta-sts`, `_smtp._tls`) for inbound TLS enforcement.
 
 ## 5. TLS
 
-- [ ] HTTPS on the web origin via reverse proxy; HTTP → HTTPS redirect; HSTS.
-- [ ] `IRIS_ENV=production` so cookies get `Secure`.
-- [ ] Stalwart SMTP STARTTLS / IMAPS certificate for `mx-iris.meowlabs.id` (ACME), auto-renew checked.
+- [x] HTTPS on the web origin via reverse proxy; HTTP → HTTPS redirect; HSTS. Proof: public check 2026-11-06 — `http://` answers 301, `https://` answers 200 with `strict-transport-security: max-age=31536000`; nginx vhosts listen on 443 with per-subdomain ECDSA certs (see header).
+- [x] `IRIS_ENV=production` so cookies get `Secure`. Proof: live `.env` value checked 2026-11-06.
+- [ ] Stalwart SMTP STARTTLS / IMAPS certificate for `mx.example.com` (ACME), auto-renew checked.
 
 ## 6. Backups
 
@@ -61,6 +73,9 @@ Actions (DNS changes, owner: Arya):
 
 - [ ] Uptime check on `/ready` (DB) and `/health`.
 - [ ] Disk usage alert at 80 % (mail + SQLite volumes).
+  Live note (2026-11-06): root disk is at 89% (6.5 GB free) — already
+  above the 80% threshold — and no alert is configured. Check disk before
+  every deploy; stop if < 3 GB free.
 - [ ] Log shipping; alert on `cleanup` errors, `mail_server_unavailable` spikes, 5xx rate.
 - [ ] Stalwart queue depth / delivery failures.
 

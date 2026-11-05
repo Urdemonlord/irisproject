@@ -1,7 +1,7 @@
 # IRIS Implementation Plan Documentation (IPD)
 
 **Product:** IRIS by Meow Labs\
-**Primary URL:** `mail.meowlabs.id`\
+**Primary URL:** `mail.example.com`\
 **Status:** Draft v1.0
 
 ## 1. Delivery strategy
@@ -20,8 +20,8 @@ Tasks: - \[ \] Confirm the VPS and available CPU, RAM, disk, and backup
 capacity. - \[ \] Confirm provider SMTP port 25 policy and reverse DNS
 support. - \[ \] Select and pin a supported Stalwart release. - \[ \]
 Create a staging environment. - \[ \] Configure persistent storage and
-Docker networking. - \[ \] Configure DNS plan for `mail.meowlabs.id`,
-`mx.meowlabs.id`, and `inbox.meowlabs.id`. - \[ \] Obtain TLS
+Docker networking. - \[ \] Configure DNS plan for `mail.example.com`,
+`mx.example.com`, and `inbox.example.com`. - \[ \] Obtain TLS
 certificates. - \[ \] Configure MX, SPF, DKIM, and DMARC. - \[ \]
 Receive a message from an external provider. - \[ \] Send a test message
 if outbound sending is in scope. - \[ \] Document backup and restore.

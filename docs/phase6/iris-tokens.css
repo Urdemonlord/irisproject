@@ -1,6 +1,6 @@
 /* IRIS Phase 6 design tokens — visual lock-in.
    Source of truth for docs/phase6/MOCKUPS.md + MASCOT.md. Contrast ratios are WCAG 2.x,
-   measured against --iris-cream unless noted. Brand values per Arya: #B83232 / #F7F7F2. */
+   measured against --iris-cream unless noted. Brand values: #B83232 / #F7F7F2. */
 :root {
   color-scheme: light;
 
