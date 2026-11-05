@@ -253,28 +253,46 @@ pub(crate) async fn send(
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_sends"));
     }
 
-    match (&s.relay, external) {
+    // The Sent copy and the rate-limit row are bookkeeping *after* delivery:
+    // failing either must never turn an already-delivered message into an
+    // error (a client retry would double-send) or silently drop the Sent
+    // copy. The relay branch therefore reports the copy outcome honestly
+    // (`sent_copy: false`) while still answering success; the JMAP branch
+    // files Sent atomically with submission, so its copy always holds.
+    let sent_copy = match (&s.relay, external) {
         // Other domains go out through the relay (it also delivers our local recipients via MX);
         // the copy for Sent is filed afterwards. A failed copy doesn't undo a sent message.
         (Some(relay), true) => {
             relay.send(&c).await?;
-            if let Err(e) = s
+            match s
                 .jmap
                 .store_sent(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
                 .await
             {
-                tracing::error!("sent via relay but Sent copy failed: {e}");
+                Ok(()) => true,
+                Err(e) => {
+                    tracing::error!("sent via relay but Sent copy failed: {e}");
+                    false
+                }
             }
         }
         _ => {
             s.jmap
                 .send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
-                .await?
+                .await?;
+            true
         }
+    };
+    // Best effort only: the message is already delivered, so a failed
+    // bookkeeping insert must not fail the request (and invite a retry
+    // that would double-send). Cost: this one send is not counted
+    // against the hourly limit.
+    if let Err(e) = sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
+        .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await
+    {
+        tracing::error!("rate-limit event insert failed after send: {e}");
     }
-    sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await?;
-    Ok(Json(json!({ "sent": true })).into_response())
+    Ok(Json(json!({ "sent": true, "sent_copy": sent_copy })).into_response())
 }
 
 #[cfg(test)]

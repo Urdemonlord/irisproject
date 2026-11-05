@@ -232,13 +232,11 @@ impl JmapClient {
             .await
             .map_err(|e| MailError::Unavailable(e.to_string()))?;
         let v = check(resp).await?;
-        let out: Vec<Value> = v["methodResponses"]
+        let responses = v["methodResponses"]
             .as_array()
-            .ok_or_else(|| MailError::Protocol("no methodResponses".into()))?
-            .iter()
-            .map(|r| r[1].clone())
-            .collect();
-        for (i, r) in v["methodResponses"].as_array().unwrap().iter().enumerate() {
+            .ok_or_else(|| MailError::Protocol("no methodResponses".into()))?;
+        let out: Vec<Value> = responses.iter().map(|r| r[1].clone()).collect();
+        for (i, r) in responses.iter().enumerate() {
             if r[0] == "error" {
                 return Err(MailError::Protocol(format!("call {i}: {}", r[1])));
             }

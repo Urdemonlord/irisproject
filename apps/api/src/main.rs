@@ -282,7 +282,14 @@ async fn timeless_password_reset(
         text: format!("A password reset was requested for the Timeless editor account.\n\nUse this one-time link within 15 minutes:\n{link}\n\nIf you did not request this, ignore this message."),
         ..Compose::default()
     };
-    let relay = s.relay.as_ref().expect("reset configuration checks relay");
+    // `reset_email_configured` above already checks `s.relay.is_some()`;
+    // answer 503 instead of panicking the request task if that ever drifts.
+    let Some(relay) = s.relay.as_ref() else {
+        return Err(ApiError(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "service_unavailable",
+        ));
+    };
     if relay.send(&message).await.is_err() {
         tracing::warn!("Timeless password reset email relay failed; details redacted");
         return Err(ApiError(StatusCode::BAD_GATEWAY, "delivery_unavailable"));
@@ -444,15 +451,20 @@ async fn login(
     let secure = secure(&s);
     let mut resp = Json(json!({ "authenticated": true, "email": email })).into_response();
     let h = resp.headers_mut();
+    // Built from hex tokens, so these parses cannot fail in practice;
+    // map a failure to a 500 instead of panicking the request task (and
+    // dropping an already-created session) if one ever did.
     h.append(
         header::SET_COOKIE,
-        auth::set_cookie(&token, secure).parse().unwrap(),
+        auth::set_cookie(&token, secure)
+            .parse()
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?,
     );
     h.append(
         header::SET_COOKIE,
         auth::set_csrf_cookie(&auth::new_token(), secure)
             .parse()
-            .unwrap(),
+            .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?,
     );
     Ok(resp)
 }
