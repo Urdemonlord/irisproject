@@ -844,9 +844,7 @@ fn detail_from_email(e: &Value) -> MessageDetail {
         }
     };
     let mime_parts = walk_structure(&e["bodyStructure"]);
-    let mut body_source = if html_body.is_some() {
-        "jmap".to_string()
-    } else if text_body.is_some() {
+    let mut body_source = if html_body.is_some() || text_body.is_some() {
         "jmap".to_string()
     } else {
         "none".to_string()
