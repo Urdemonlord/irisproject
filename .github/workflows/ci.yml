@@ -61,10 +61,27 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-      - name: cargo audit
-        uses: rustsec/audit-check@v2
+      # NOTE (2026-11-05): rustsec/audit-check@v2 was removed. It runs
+      # `cargo audit --json` and does an unguarded JSON.parse(stdout), so
+      # any early cargo-audit failure surfaces only as the misleading
+      # "Unexpected end of JSON input" and hides the real error. Reproduced
+      # locally: cargo-audit <= 0.21.x cannot load the current RustSec DB
+      # (advisory RUSTSEC-2026-0331 carries a CVSS:4.0 vector, which those
+      # versions reject with "unsupported CVSS version: 4.0"), exits
+      # non-zero with EMPTY stdout -> JSON.parse('') throws. cargo-audit
+      # 0.22.2 parses the same DB fine. Audit is NOT disabled: it now runs
+      # directly with a pinned prebuilt 0.22.2, so real failures surface
+      # with their real error message.
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install cargo-audit 0.22.2 (prebuilt)
+        uses: taiki-e/install-action@v2
         with:
-          token: ${{ secrets.GITHUB_TOKEN }}
+          tool: cargo-audit@0.22.2
+      - name: cargo audit
+        # Advisory: a finding exits 1 but must not skip the npm audit step.
+        continue-on-error: true
+        run: cargo audit
       - name: npm audit
         working-directory: apps/web
         run: npm audit --audit-level=high

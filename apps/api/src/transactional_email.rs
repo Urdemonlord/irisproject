@@ -21,39 +21,41 @@ async fn authenticate(
     pool: &SqlitePool,
     token: &str,
     required_scope: &str,
-) -> Result<IntegrationPrincipal, StatusCode> {
-    let parsed = auth::parse_api_key(token).ok_or(StatusCode::UNAUTHORIZED)?;
+) -> Result<IntegrationPrincipal, crate::ApiError> {
+    // Auth failures stay 401/403 with generic codes. A database failure
+    // surfaces through `ApiError::from` instead, so a pool outage
+    // answers 503 `database_unavailable` rather than masquerading as a
+    // 500, and the detail is logged server-side rather than dropped.
+    let unauthorized = || crate::ApiError(StatusCode::UNAUTHORIZED, "unauthorized");
+    let parsed = auth::parse_api_key(token).ok_or_else(unauthorized)?;
     let row: Option<(String, String, String, Option<String>)> = sqlx::query_as(
         "SELECT token_hash, app_id, scopes_json, expires_at FROM integration_keys WHERE key_id=? AND status='active'",
     )
     .bind(&parsed.key_id)
     .fetch_optional(pool)
-    .await
-    .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+    .await?;
     let Some((stored_hash, app_id, scopes_json, expires_at)) = row else {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(unauthorized());
     };
     if !auth::ct_eq(&parsed.token_hash, &stored_hash) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(unauthorized());
     }
     if expires_at.as_deref().is_some_and(|value| {
         chrono::DateTime::parse_from_rfc3339(value)
             .map(|expiry| expiry <= chrono::Utc::now())
             .unwrap_or(true)
     }) {
-        return Err(StatusCode::UNAUTHORIZED);
+        return Err(unauthorized());
     }
-    let scopes: Vec<String> =
-        serde_json::from_str(&scopes_json).map_err(|_| StatusCode::UNAUTHORIZED)?;
+    let scopes: Vec<String> = serde_json::from_str(&scopes_json).map_err(|_| unauthorized())?;
     if !scopes.iter().any(|scope| scope == required_scope) {
-        return Err(StatusCode::FORBIDDEN);
+        return Err(crate::ApiError(StatusCode::FORBIDDEN, "forbidden"));
     }
     sqlx::query("UPDATE integration_keys SET last_used_at=? WHERE key_id=?")
         .bind(auth::now())
         .bind(&parsed.key_id)
         .execute(pool)
-        .await
-        .map_err(|_| StatusCode::INTERNAL_SERVER_ERROR)?;
+        .await?;
     Ok(IntegrationPrincipal {
         key_id: parsed.key_id,
         app_id,
@@ -77,77 +79,15 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
         && url.password().is_none()
 }
 
-fn valid_recipient(value: &str) -> bool {
-    if value.len() > 254
-        || value.bytes().any(|byte| {
-            byte.is_ascii_whitespace() || byte.is_ascii_control() || matches!(byte, b'<' | b'>')
-        })
-    {
-        return false;
-    }
-    let mut parts = value.split('@');
-    let Some(local) = parts.next() else {
-        return false;
-    };
-    let Some(domain) = parts.next() else {
-        return false;
-    };
-    let valid_local = !local.starts_with('.')
-        && !local.ends_with('.')
-        && !local.contains("..")
-        && local.bytes().all(|byte| {
-            byte.is_ascii_alphanumeric()
-                || matches!(
-                    byte,
-                    b'!' | b'#'
-                        | b'$'
-                        | b'%'
-                        | b'&'
-                        | b'\''
-                        | b'*'
-                        | b'+'
-                        | b'-'
-                        | b'/'
-                        | b'='
-                        | b'?'
-                        | b'^'
-                        | b'_'
-                        | b'`'
-                        | b'{'
-                        | b'|'
-                        | b'}'
-                        | b'~'
-                        | b'.'
-                )
-        });
-    if parts.next().is_some()
-        || local.is_empty()
-        || local.len() > 64
-        || !valid_local
-        || domain.is_empty()
-    {
-        return false;
-    }
-    let labels: Vec<_> = domain.split('.').collect();
-    labels.len() >= 2
-        && labels.iter().all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label.as_bytes()[0].is_ascii_alphanumeric()
-                && label.as_bytes()[label.len() - 1].is_ascii_alphanumeric()
-                && label
-                    .bytes()
-                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        })
-}
-
 fn render_message(
     app_id: &str,
     template_id: &str,
     recipient: &str,
     action_url: &str,
 ) -> Result<iris_mail::Compose, &'static str> {
-    if !valid_recipient(recipient) || !action_url_allowed(app_id, action_url) {
+    if !crate::email_address::valid_email_address(recipient)
+        || !action_url_allowed(app_id, action_url)
+    {
         return Err("invalid request");
     }
     let Some(template) =
@@ -179,17 +119,6 @@ fn send_response(status: StatusCode, request_id: &str, delivery_status: &str) ->
         .into_response())
 }
 
-fn auth_error(status: StatusCode) -> crate::ApiError {
-    let code = if status == StatusCode::FORBIDDEN {
-        "forbidden"
-    } else if status == StatusCode::INTERNAL_SERVER_ERROR {
-        "internal_error"
-    } else {
-        "unauthorized"
-    };
-    crate::ApiError(status, code)
-}
-
 pub async fn send(
     State(state): State<Arc<crate::AppState>>,
     headers: HeaderMap,
@@ -201,12 +130,10 @@ pub async fn send(
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(crate::ApiError(StatusCode::UNAUTHORIZED, "unauthorized"))?;
     let required_scope = format!("email:template:{}", body.template_id);
-    let principal = authenticate(&state.pool, token, &required_scope)
-        .await
-        .map_err(auth_error)?;
+    let principal = authenticate(&state.pool, token, &required_scope).await?;
     if !state.config.integration_email_enabled
         || state.relay.is_none()
-        || !valid_recipient(&state.config.integration_email_from)
+        || !crate::email_address::valid_email_address(&state.config.integration_email_from)
     {
         return Err(crate::ApiError(
             StatusCode::SERVICE_UNAVAILABLE,
@@ -241,28 +168,22 @@ pub async fn send(
     let recipient_hash = auth::hash_token(&body.recipient.trim().to_ascii_lowercase());
     let request_id = uuid::Uuid::new_v4().to_string();
     let now = auth::now();
-    let mut tx = state
-        .pool
-        .begin()
-        .await
-        .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let inserted = sqlx::query(
         "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?, 'sending', ?,?) ON CONFLICT(key_id,idempotency_key) DO NOTHING",
     )
     .bind(&request_id).bind(&principal.key_id).bind(idempotency_key).bind(&body.template_id)
     .bind(&recipient_hash).bind(&request_hash).bind(&now).bind(&now)
     .execute(&mut *tx).await
-    .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    ?;
 
     if inserted.rows_affected() == 0 {
         let existing: (String, String, String) = sqlx::query_as(
             "SELECT id,request_hash,status FROM integration_email_requests WHERE key_id=? AND idempotency_key=?",
         )
         .bind(&principal.key_id).bind(idempotency_key).fetch_one(&mut *tx).await
-        .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
-        tx.commit()
-            .await
-            .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+        ?;
+        tx.commit().await?;
         if !auth::ct_eq(&existing.1, &request_hash) {
             return Err(crate::ApiError(
                 StatusCode::CONFLICT,
@@ -285,23 +206,26 @@ pub async fn send(
         .unwrap()
         .and_utc()
         .to_rfc3339();
-    let (sent_today, daily_limit): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? WHERE k.key_id=? GROUP BY k.key_id",
+    // Daily quota counts accepted sends plus in-flight (`sending`) rows of
+    // OTHER requests for the same key. Counting only `accepted` allowed two
+    // concurrent sends to both pass when the count sat at limit-1 (TOCTOU);
+    // counting `sending` rows (excluding this request's own row, which is
+    // still `sending` here) closes the window. BEGIN IMMEDIATE serializes
+    // the transactions so a concurrent commit is visible before this
+    // count runs.
+    let (accepted_today, daily_limit): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? AND r.status IN ('sending','accepted') AND r.id<>? WHERE k.key_id=? GROUP BY k.key_id",
     )
-    .bind(utc_start).bind(&principal.key_id).fetch_one(&mut *tx).await
-    .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
-    if sent_today > daily_limit {
-        tx.rollback()
-            .await
-            .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    .bind(utc_start).bind(&request_id).bind(&principal.key_id).fetch_one(&mut *tx).await
+    ?;
+    if accepted_today >= daily_limit {
+        tx.rollback().await?;
         return Err(crate::ApiError(
             StatusCode::TOO_MANY_REQUESTS,
             "daily_limit_reached",
         ));
     }
-    tx.commit()
-        .await
-        .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    tx.commit().await?;
 
     let Some(relay) = state.relay.as_ref() else {
         return Err(crate::ApiError(
@@ -313,7 +237,7 @@ pub async fn send(
         Ok(provider_id) if !provider_id.trim().is_empty() => {
             sqlx::query("UPDATE integration_email_requests SET status='accepted',provider_message_id=?,updated_at=? WHERE id=?")
                 .bind(provider_id).bind(auth::now()).bind(&request_id).execute(&state.pool).await
-                .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+                ?;
             send_response(StatusCode::ACCEPTED, &request_id, "accepted")
         }
         Err(iris_mail::MailError::Rejected(_)) => {
@@ -323,8 +247,7 @@ pub async fn send(
             .bind(auth::now())
             .bind(&request_id)
             .execute(&state.pool)
-            .await
-            .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+            .await?;
             send_response(StatusCode::UNPROCESSABLE_ENTITY, &request_id, "failed")
         }
         _ => {
@@ -334,8 +257,7 @@ pub async fn send(
             .bind(auth::now())
             .bind(&request_id)
             .execute(&state.pool)
-            .await
-            .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+            .await?;
             send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
         }
     }
@@ -351,16 +273,13 @@ pub async fn status(
         .and_then(|value| value.to_str().ok())
         .and_then(|value| value.strip_prefix("Bearer "))
         .ok_or(crate::ApiError(StatusCode::UNAUTHORIZED, "unauthorized"))?;
-    let principal = authenticate(&state.pool, token, "email:status")
-        .await
-        .map_err(auth_error)?;
+    let principal = authenticate(&state.pool, token, "email:status").await?;
     let row: Option<String> =
         sqlx::query_scalar("SELECT status FROM integration_email_requests WHERE id=? AND key_id=?")
             .bind(&request_id)
             .bind(&principal.key_id)
             .fetch_optional(&state.pool)
-            .await
-            .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+            .await?;
     match row {
         Some(delivery_status) => send_response(StatusCode::OK, &request_id, &delivery_status),
         None => Err(crate::ApiError(StatusCode::NOT_FOUND, "not_found")),
@@ -450,9 +369,14 @@ mod tests {
             ".leading@example.test",
             "trailing.@example.test",
         ] {
-            assert!(!valid_recipient(recipient), "must reject {recipient}");
+            assert!(
+                !crate::email_address::valid_email_address(recipient),
+                "must reject {recipient}"
+            );
         }
-        assert!(valid_recipient("first.last+auth@example.test"));
+        assert!(crate::email_address::valid_email_address(
+            "first.last+auth@example.test"
+        ));
     }
 
     #[test]

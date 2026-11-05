@@ -1,5 +1,9 @@
 //! Folders, message actions (move / read / delete), drafts and sending.
-use crate::{owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser, S};
+use crate::email_address::valid_compose_address;
+use crate::{
+    check_read_limit, owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser,
+    S,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -7,14 +11,12 @@ use axum::{
     Extension, Json,
 };
 use iris_auth as auth;
+use iris_config::limits::{
+    MAX_BODY, MAX_HEADER_IDS, MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
+};
 use iris_mail::{Compose, FOLDER_ROLES};
 use serde::Deserialize;
 use serde_json::json;
-
-const MAX_RECIPIENTS: usize = 50;
-const MAX_SUBJECT: usize = 998;
-const MAX_BODY: usize = 1_000_000;
-const SENDS_PER_HOUR: i64 = 100;
 
 pub(crate) fn folder_role(name: &str) -> Result<&'static str, ApiError> {
     FOLDER_ROLES
@@ -38,6 +40,7 @@ pub(crate) async fn folders(
     Path(mailbox_id): Path<String>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    check_read_limit(&s, &u).await?;
     let folders = s
         .jmap
         .folders(&u.creds.user, &u.creds.pass, &account)
@@ -128,28 +131,12 @@ pub(crate) struct ComposeBody {
     draft_id: Option<String>,
 }
 
-/// A plain, conservative address check (no display names, no quoted local parts).
-pub(crate) fn valid_address(a: &str) -> bool {
-    let Some((local, domain)) = a.rsplit_once('@') else {
-        return false;
-    };
-    a.len() <= 254
-        && !local.is_empty()
-        && local.len() <= 64
-        && domain.contains('.')
-        && !domain.starts_with('.')
-        && !domain.ends_with('.')
-        && !domain.contains("..")
-        && a.chars()
-            .all(|c| c.is_ascii_graphic() && !"<>()[]\\,;:\"".contains(c))
-}
-
 fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
     v.iter()
         .map(|a| a.trim().to_lowercase())
         .filter(|a| !a.is_empty())
         .map(|a| {
-            if valid_address(&a) {
+            if valid_compose_address(&a) {
                 Ok(a)
             } else {
                 Err(ApiError(StatusCode::BAD_REQUEST, "invalid_recipient"))
@@ -162,8 +149,10 @@ fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
 fn clean_ids(v: impl IntoIterator<Item = String>) -> Vec<String> {
     v.into_iter()
         .map(|x| x.trim().trim_matches(|c| c == '<' || c == '>').to_string())
-        .filter(|x| !x.is_empty() && x.len() <= 250 && !x.chars().any(char::is_whitespace))
-        .take(20)
+        .filter(|x| {
+            !x.is_empty() && x.len() <= MAX_HEADER_ID_LEN && !x.chars().any(char::is_whitespace)
+        })
+        .take(MAX_HEADER_IDS)
         .collect()
 }
 
@@ -246,10 +235,24 @@ pub(crate) async fn send(
 
     let subject = auth::hash_token(&format!("send:{}", u.user_id));
     let since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    let sent: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='send' AND occurred_at>?",
-    ).bind(&subject).bind(&since).fetch_one(&s.pool).await?;
-    if sent >= SENDS_PER_HOUR {
+    // Reserve a slot atomically BEFORE delivery so two concurrent sends
+    // cannot both pass the hourly cap (TOCTOU). The single INSERT is an
+    // atomic statement under SQLite's write lock: the second request sees
+    // the first's committed row and gets 0 rows_affected -> 429.
+    let reserved = sqlx::query(
+        "INSERT INTO rate_limit_events (id, subject_hash, action, occurred_at, outcome) \
+         SELECT ?, ?, 'send', ?, 'allowed' \
+         WHERE (SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash = ? AND action = 'send' AND occurred_at > ?) < ?",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&subject)
+    .bind(auth::now())
+    .bind(&subject)
+    .bind(&since)
+    .bind(SENDS_PER_HOUR)
+    .execute(&s.pool)
+    .await?;
+    if reserved.rows_affected() == 0 {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_sends"));
     }
 
@@ -287,11 +290,8 @@ pub(crate) async fn send(
     // bookkeeping insert must not fail the request (and invite a retry
     // that would double-send). Cost: this one send is not counted
     // against the hourly limit.
-    if let Err(e) = sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await
-    {
-        tracing::error!("rate-limit event insert failed after send: {e}");
-    }
+    // (Reservation now happens atomically before delivery, so this is
+    // no longer needed.)
     Ok(Json(json!({ "sent": true, "sent_copy": sent_copy })).into_response())
 }
 
@@ -301,13 +301,13 @@ mod tests {
 
     #[test]
     fn addresses() {
-        assert!(valid_address("a@meowlabs.id"));
-        assert!(valid_address("first.last+tag@sub.example.co"));
+        assert!(valid_compose_address("a@meowlabs.id"));
+        assert!(valid_compose_address("first.last+tag@sub.example.co"));
         for bad in [
             "", "a", "@x.id", "a@", "a@x", "a@.x", "a@x.", "a b@x.id", "a@x..id", "<a@x.id>",
             "a,b@x.id", "a@x.id\n",
         ] {
-            assert!(!valid_address(bad), "{bad:?}");
+            assert!(!valid_compose_address(bad), "{bad:?}");
         }
     }
 

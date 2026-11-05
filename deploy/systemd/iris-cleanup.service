@@ -1,0 +1,13 @@
+# Out-of-process IRIS retention safety net. NOT enabled by default — see README.md
+# in this directory for the activation steps (needs a separate approval).
+[Unit]
+Description=IRIS one-shot retention cleanup
+After=network.target
+
+[Service]
+Type=oneshot
+User=meowlabs
+Group=meowlabs
+WorkingDirectory=/home/meowlabs/projects/irisproject
+EnvironmentFile=/home/meowlabs/projects/irisproject/.env
+ExecStart=/usr/local/bin/iris-api cleanup-once

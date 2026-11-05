@@ -20,6 +20,15 @@ pub async fn run(s: Arc<AppState>) {
     }
 }
 
+/// One pass of the retention job, for the out-of-process safety net
+/// (`iris-api cleanup-once`, run by `iris-cleanup.timer`): same work as one tick
+/// of [`run`], then exit. Safe to run while the API is alive: `mark` is a
+/// conditional UPDATE and the JMAP destroys only count ids the server reports
+/// destroyed, so overlapping passes cannot double-delete or resurrect rows.
+pub async fn run_once(s: &AppState) -> anyhow::Result<()> {
+    once(s).await
+}
+
 fn ts(t: chrono::DateTime<Utc>) -> String {
     t.to_rfc3339_opts(SecondsFormat::Secs, true)
 }
@@ -112,5 +121,52 @@ mod tests {
             ]
             .map(|(a, b)| (a.to_string(), b.to_string()))
         );
+    }
+
+    #[tokio::test]
+    async fn run_once_marks_expired_inboxes_without_jmap() {
+        // Empty temp_inbox_mail_user: run_once stops after mark(), no JMAP call.
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        let now = Utc::now();
+        sqlx::query("INSERT INTO temporary_inboxes (id,address,access_token_hash,status,created_at,expires_at) VALUES ('past','past@x','h','active',?,?)")
+            .bind(ts(now))
+            .bind(ts(now - Duration::minutes(1)))
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = Arc::new(AppState {
+            pool: pool.clone(),
+            jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
+            relay: None,
+            config: iris_config::Config {
+                env: "test".into(),
+                host: "127.0.0.1".into(),
+                port: 8000,
+                database_url: "sqlite::memory:".into(),
+                session_secret: "test-secret".into(),
+                stalwart_api_url: "http://127.0.0.1:9".into(),
+                temp_inbox_domain: "example.test".into(),
+                temp_inbox_default_expiry_hours: 1,
+                temp_inbox_mail_user: String::new(),
+                temp_inbox_mail_password: String::new(),
+                send_local_domains: vec![],
+                send_external: false,
+                resend_api_key: String::new(),
+                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_enabled: false,
+                iris_timeless_service_token: String::new(),
+                iris_timeless_email_from: String::new(),
+                iris_timeless_email_to: String::new(),
+                timeless_public_origin: String::new(),
+                resend_api_url: String::new(),
+            },
+        });
+        super::run_once(&state).await.unwrap();
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM temporary_inboxes WHERE id='past'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "deletion_pending");
     }
 }
