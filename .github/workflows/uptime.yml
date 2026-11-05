@@ -1,0 +1,75 @@
+name: uptime-mail
+
+# Monitor eksternal mail.meowlabs.id -> notifikasi Telegram.
+# Jalan dari infrastruktur GitHub (bukan dari VM), jadi tetap jalan walau VM mati.
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: uptime-mail
+  cancel-in-progress: false
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Ambil status terakhir
+        uses: actions/cache@v4
+        with:
+          path: state
+          key: uptime-state-${{ github.run_id }}
+          restore-keys: |
+            uptime-state-
+
+      - name: Cek /health
+        id: chk
+        run: |
+          set -u
+          mkdir -p state
+          prev=$(cat state/status 2>/dev/null || echo up)
+          code=$(curl -s -o /dev/null -m 20 -w '%{http_code}' https://mail.meowlabs.id/health || true)
+          [ -z "${code:-}" ] && code=000
+          now=$(TZ=Asia/Jakarta date +'%d/%m %H:%M WIB')
+
+          if [ "$code" = "200" ]; then cur=up; else cur=down; fi
+
+          echo "prev=$prev code=$code cur=$cur"
+          echo "cur=$cur" >> "$GITHUB_OUTPUT"
+          echo "notify=0" >> "$GITHUB_OUTPUT"
+
+          if [ "$cur" = "down" ] && [ "$prev" != "down" ]; then
+            {
+              echo "msg=🔴 mail.meowlabs.id DOWN (HTTP $code) — $now"
+              echo "Keterangan: https://mail.meowlabs.id/health tidak membalas 200."
+              echo "Cek: panel Sumopod / uptime VM."
+            } >> "$GITHUB_OUTPUT"
+            echo "notify=1" >> "$GITHUB_OUTPUT"
+          elif [ "$cur" = "up" ] && [ "$prev" = "down" ]; then
+            {
+              echo "msg=🟢 mail.meowlabs.id UP lagi (HTTP 200) — $now"
+            } >> "$GITHUB_OUTPUT"
+            echo "notify=1" >> "$GITHUB_OUTPUT"
+          fi
+
+          echo "$cur" > state/status
+
+      - name: Kirim Telegram
+        if: steps.chk.outputs.notify == '1'
+        env:
+          TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          CHAT: ${{ secrets.TELEGRAM_CHAT_ID }}
+          MSG: ${{ steps.chk.outputs.msg }}
+        run: |
+          python3 - <<'PY' > payload.json
+          import json, os
+          print(json.dumps({"chat_id": os.environ["CHAT"], "text": os.environ["MSG"]}))
+          PY
+          curl -sS -m 20 -X POST "https://api.telegram.org/bot$TOKEN/sendMessage" \
+            -H 'Content-Type: application/json' --data @payload.json
