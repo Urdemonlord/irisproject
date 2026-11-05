@@ -346,29 +346,66 @@ function messageExtras(url: string, init: RequestInit | undefined, m: Detail) {
 }
 
 // Message bodies don't change: keep them (as promises) for instant re-open and hover prefetch.
-const messageCache = new Map<string, Promise<{ message: Detail }>>()
+//
+// Eviction rules: bodies are immutable, so an entry is never invalidated by
+// content -- only by age, size, or a mutation that removes the message:
+// - TTL: entries older than MESSAGE_CACHE_TTL_MS are refetched on next use.
+//   Bodies never change server-side, so this is only a memory-hygiene bound
+//   for entries that outlive their tab's activity (e.g. prefetched bodies
+//   in a tab left idle).
+// - Size: at most MESSAGE_CACHE_MAX entries, oldest (first inserted)
+//   evicted first. The previous `size > 100` check ran before `set`, so the
+//   map could grow to 101 entries.
+// - Mutation: move()/deleteForever() drop the entry; logout -- and a 401
+//   while reading -- drop the whole cache via clearMailCache().
+// Folder switches deliberately do NOT clear this cache: keys are
+// mailbox+message ids and bodies don't depend on the folder.
+const MESSAGE_CACHE_MAX = 100
+const MESSAGE_CACHE_TTL_MS = 30 * 60 * 1000
+const messageCache = new Map<string, { at: number; p: Promise<{ message: Detail }> }>()
 function prefetchMessage(url: string, init?: RequestInit) {
-  let p = messageCache.get(url)
-  if (!p) {
-    p = api<{ message: Detail }>(url, init)
-    p.catch(() => messageCache.delete(url))
-    if (messageCache.size > 100) messageCache.delete(messageCache.keys().next().value!)
-    messageCache.set(url, p)
+  const hit = messageCache.get(url)
+  if (hit) {
+    if (Date.now() - hit.at < MESSAGE_CACHE_TTL_MS) return hit.p
+    messageCache.delete(url) // expired: refetch below
   }
+  const p = api<{ message: Detail }>(url, init)
+  p.catch(() => { if (messageCache.get(url)?.p === p) messageCache.delete(url) })
+  while (messageCache.size >= MESSAGE_CACHE_MAX) messageCache.delete(messageCache.keys().next().value!)
+  messageCache.set(url, { at: Date.now(), p })
   return p
 }
 
 // Last message list per account, per tab (sessionStorage is cleared when the tab closes).
+//
+// Eviction rules: the stored list is only an initial paint -- load()
+// refetches it on render and every 30 s while the tab is visible -- so the
+// stored copy is bounded on both axes:
+// - TTL: entries older than LIST_CACHE_TTL_MS are ignored, so a reloaded
+//   tab shows a skeleton and fetches fresh instead of serving a stale list.
+//   A live tab never hits this: every successful poll rewrites the entry.
+// - Size: at most LIST_CACHE_MAX_MESSAGES summaries per folder are stored.
+//   Load-more can grow the in-memory list beyond that, but only the first
+//   pages are persisted, so the stored object stays far under the
+//   sessionStorage quota instead of growing with every load-more click.
 const LIST_KEY = 'iris_list_cache'
+const LIST_CACHE_TTL_MS = 10 * 60 * 1000
+const LIST_CACHE_MAX_MESSAGES = 200
+type ListCache = { email: string; mb: string; savedAt: number; folders: Record<string, Summary[]> }
 function readListCache(email: string, mb: string, folder: string): Summary[] | null {
-  try { const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null'); return c && c.email === email && c.mb === mb ? c.folders?.[folder] ?? null : null } catch { return null }
+  try {
+    const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null') as ListCache | null
+    if (!c || c.email !== email || c.mb !== mb) return null
+    if (!c.savedAt || Date.now() - c.savedAt > LIST_CACHE_TTL_MS) return null
+    return c.folders?.[folder] ?? null
+  } catch { return null }
 }
 function writeListCache(email: string, mb: string, folder: string, messages: Summary[]) {
   try {
-    const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null')
+    const c = JSON.parse(sessionStorage.getItem(LIST_KEY) ?? 'null') as ListCache | null
     const folders = c && c.email === email && c.mb === mb ? c.folders ?? {} : {}
-    folders[folder] = messages
-    sessionStorage.setItem(LIST_KEY, JSON.stringify({ email, mb, folders }))
+    folders[folder] = messages.slice(0, LIST_CACHE_MAX_MESSAGES)
+    sessionStorage.setItem(LIST_KEY, JSON.stringify({ email, mb, savedAt: Date.now(), folders }))
   } catch { /* storage full or blocked */ }
 }
 function clearMailCache() { messageCache.clear(); try { sessionStorage.removeItem(LIST_KEY) } catch { /* ignore */ } }
@@ -785,6 +822,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
 
   const move = async (m: Summary, target: FolderRole) => {
     removeLocal(m.id)
+    messageCache.delete(url(m.id)) // the body is no longer in this folder; refetch if it comes back (undo)
     try {
       await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder: target }) })
       toast(target === 'trash' ? 'Moved to Trash' : `Moved to ${folderMeta(target).label}`, {
@@ -875,7 +913,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         current = m.id
         draw()
         ui.show()
-        openMessageAt(url(m.id), ui.readerBody, undefined, () => { account = null; renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m))
+        openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m))
       },
       onIntent: folder === 'drafts' ? undefined : (m) => prefetchMessage(url(m.id)),
     })
