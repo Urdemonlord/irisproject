@@ -1904,3 +1904,632 @@ mod error_mapping_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod handler_integration_tests {
+    use super::*;
+    use axum::body::to_bytes;
+    use iris_config::limits::{MAX_LIST_LIMIT, MAX_SEARCH_QUERY_CHARS, SENDS_PER_HOUR};
+    use serde_json::Value;
+    use std::{
+        sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+        },
+        time::Duration,
+    };
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+
+    /// What the fake JMAP server answers for an `Email/set` call.
+    #[derive(Clone, Copy, PartialEq)]
+    enum EmailSet {
+        Created,
+        NotCreated,
+    }
+
+    /// Script for one fake JMAP server: canned folders, list results, one
+    /// message, one blob, and whether `Email/set` succeeds. No Stalwart, no
+    /// real login: `JmapClient` just points at the loopback mock.
+    struct JmapScript {
+        /// Roles present in the Mailbox/get answer; default is all five.
+        roles: Vec<&'static str>,
+        email_set: EmailSet,
+        /// Total for Email/query; the list is returned verbatim by Email/get.
+        query_total: u64,
+        query_list: Vec<Value>,
+        /// Email/get answer for get_message (None = empty list -> NotFound).
+        message: Option<Value>,
+        /// Bytes served by GET /jmap/download/... for any blob id.
+        blob: Vec<u8>,
+    }
+
+    impl Default for JmapScript {
+        fn default() -> Self {
+            Self {
+                roles: vec!["inbox", "sent", "drafts", "archive", "trash"],
+                email_set: EmailSet::Created,
+                query_total: 0,
+                query_list: vec![],
+                message: None,
+                blob: vec![],
+            }
+        }
+    }
+
+    struct FakeJmap {
+        base_url: String,
+        relay_url: String,
+        /// Parsed JSON bodies of every POST /jmap/ request, in order.
+        requests: Arc<Mutex<Vec<Value>>>,
+        relay_calls: Arc<AtomicUsize>,
+    }
+
+    fn folder_json(role: &str) -> Value {
+        json!({"id": format!("f-{role}"), "role": role, "name": role, "totalEmails": 0, "unreadEmails": 0})
+    }
+
+    /// One JMAP `methodResponses` body for the request the client posted.
+    fn jmap_response(script: &JmapScript, body: &Value) -> String {
+        let calls = body["methodCalls"].as_array().cloned().unwrap_or_default();
+        let first = calls
+            .first()
+            .and_then(|c| c[0].as_str())
+            .unwrap_or_default()
+            .to_string();
+        let responses: Vec<Value> = match first.as_str() {
+            "Mailbox/get" => vec![
+                json!(["Mailbox/get", {"list": script.roles.iter().map(|r| folder_json(r)).collect::<Vec<_>>()}, "m"]),
+            ],
+            "Mailbox/set" => {
+                vec![json!(["Mailbox/set", {"created": {}, "notCreated": {}}, "s"])]
+            }
+            "Identity/get" => vec![
+                json!(["Identity/get", {"list": [{"id": "ident-1", "email": "alice@meowlabs.id"}]}, "i"]),
+            ],
+            "Identity/set" => vec![
+                json!(["Identity/set", {"created": {"i": {"id": "ident-1"}}, "notCreated": {}}, "s"]),
+            ],
+            "Email/query" => vec![
+                json!(["Email/query", {"total": script.query_total, "ids": script.query_list.iter().map(|m| m["id"].clone()).collect::<Vec<_>>()}, "q"]),
+                json!(["Email/get", {"list": script.query_list}, "g"]),
+            ],
+            "Email/get" => {
+                let list = script.message.clone().map(|m| vec![m]).unwrap_or_default();
+                vec![json!(["Email/get", {"list": list}, "g"])]
+            }
+            // jmap.send submits Email/set + EmailSubmission/set in one batch.
+            "Email/set" if calls.len() == 2 => vec![
+                json!(["Email/set", {"created": {"n": {"id": "msg-1"}}, "notCreated": {}}, "e"]),
+                json!(["EmailSubmission/set", {"created": {"s": {"id": "sub-1"}}, "notCreated": {}}, "x"]),
+            ],
+            "Email/set" => match script.email_set {
+                EmailSet::Created => {
+                    vec![
+                        json!(["Email/set", {"created": {"n": {"id": "msg-1"}}, "notCreated": {}}, "s"]),
+                    ]
+                }
+                EmailSet::NotCreated => vec![
+                    json!(["Email/set", {"created": {}, "notCreated": {"n": {"type": "forbidden", "description": "mock refuses the Sent copy"}}}, "s"]),
+                ],
+            },
+            _ => vec![json!(["error", {"type": "unknownMethod"}, "e"])],
+        };
+        serde_json::to_string(&json!({"methodResponses": responses})).unwrap()
+    }
+
+    /// Loopback HTTP server answering JMAP on POST /jmap/, the relay on
+    /// POST /emails, and blob downloads on GET /jmap/download/... One
+    /// request per connection (`connection: close`); the task ends after
+    /// 5 s without a connection, or when the test runtime drops.
+    async fn fake_jmap(script: JmapScript) -> FakeJmap {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let relay_calls = Arc::new(AtomicUsize::new(0));
+        let task_requests = requests.clone();
+        let task_relay = relay_calls.clone();
+        drop(tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(5), listener.accept()).await
+                else {
+                    return;
+                };
+                // Read one HTTP request: headers, then Content-Length body.
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut expected: Option<usize> = None;
+                let mut header_end: Option<usize> = None;
+                loop {
+                    let Ok(n) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(end);
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected = Some(end + 4 + length);
+                        }
+                    }
+                    if let Some(end) = expected {
+                        if bytes.len() >= end {
+                            break;
+                        }
+                    }
+                }
+                let end = header_end.unwrap();
+                let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let mut lines = head.lines();
+                let request_line = lines.next().unwrap_or_default().to_string();
+                let mut parts = request_line.split_whitespace();
+                let method = parts.next().unwrap_or_default().to_string();
+                let path = parts.next().unwrap_or_default().to_string();
+                let body = bytes[end + 4..].to_vec();
+                let (status, content_type, payload): (&str, &str, Vec<u8>) =
+                    if method == "POST" && path == "/jmap/" {
+                        let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
+                        task_requests.lock().unwrap().push(v.clone());
+                        (
+                            "200 OK",
+                            "application/json",
+                            jmap_response(&script, &v).into_bytes(),
+                        )
+                    } else if method == "POST" && path == "/emails" {
+                        task_relay.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "200 OK",
+                            "application/json",
+                            br#"{"id":"re_mock_1"}"#.to_vec(),
+                        )
+                    } else if method == "GET" && path.starts_with("/jmap/download/") {
+                        ("200 OK", "application/octet-stream", script.blob.clone())
+                    } else {
+                        (
+                            "404 Not Found",
+                            "application/json",
+                            br#"{"error":"no such route"}"#.to_vec(),
+                        )
+                    };
+                let response = format!(
+                    "HTTP/1.1 {status}\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                    payload.len()
+                );
+                let mut out = response.into_bytes();
+                out.extend_from_slice(&payload);
+                let _ = stream.write_all(&out).await;
+                let _ = stream.shutdown().await;
+            }
+        }));
+        FakeJmap {
+            base_url: format!("http://{address}"),
+            relay_url: format!("http://{address}/emails"),
+            requests,
+            relay_calls,
+        }
+    }
+
+    async fn test_state(jmap: &FakeJmap, relay: Option<ResendClient>) -> Arc<AppState> {
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES ('u-alice','alice@meowlabs.id','Alice','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mbx-1','u-alice','alice@meowlabs.id','acct-1','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        Arc::new(AppState {
+            pool,
+            jmap: JmapClient::new(jmap.base_url.clone()),
+            relay,
+            config: Config {
+                env: "test".into(),
+                host: "127.0.0.1".into(),
+                port: 8000,
+                database_url: "sqlite::memory:".into(),
+                session_secret: "test-secret".into(),
+                stalwart_api_url: "http://127.0.0.1:9".into(),
+                temp_inbox_domain: "example.test".into(),
+                temp_inbox_default_expiry_hours: 1,
+                temp_inbox_mail_user: String::new(),
+                temp_inbox_mail_password: String::new(),
+                send_local_domains: vec!["meowlabs.id".into()],
+                send_external: false,
+                resend_api_key: "test-resend-key".into(),
+                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_enabled: false,
+                iris_timeless_service_token: String::new(),
+                iris_timeless_email_from: String::new(),
+                iris_timeless_email_to: String::new(),
+                timeless_public_origin: String::new(),
+                resend_api_url: String::new(),
+            },
+        })
+    }
+
+    fn user() -> CurrentUser {
+        CurrentUser {
+            user_id: "u-alice".into(),
+            email: "alice@meowlabs.id".into(),
+            creds: Creds {
+                user: "alice@meowlabs.id".into(),
+                pass: "secret".into(),
+            },
+        }
+    }
+
+    fn relay(jmap: &FakeJmap) -> ResendClient {
+        ResendClient::with_endpoint("test-relay-key".into(), jmap.relay_url.clone())
+    }
+
+    async fn body_json(resp: Response) -> Value {
+        let bytes = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    fn compose_body(to: &str) -> Json<compose::ComposeBody> {
+        Json(
+            serde_json::from_value(json!({
+                "to": [to], "subject": "Hi", "text": "Hello from the test",
+            }))
+            .unwrap(),
+        )
+    }
+
+    /// Seed `n` allowed `send` rows for alice within the last hour, the way
+    /// `compose::send` counts them.
+    async fn seed_sends(pool: &SqlitePool, n: i64) {
+        let subject = auth::hash_token("send:u-alice");
+        for _ in 0..n {
+            sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
+                .bind(uuid::Uuid::new_v4().to_string())
+                .bind(&subject)
+                .bind(auth::now())
+                .execute(pool)
+                .await
+                .unwrap();
+        }
+    }
+
+    async fn send_count(pool: &SqlitePool) -> i64 {
+        let subject = auth::hash_token("send:u-alice");
+        sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='send' AND outcome='allowed'",
+        )
+        .bind(&subject)
+        .fetch_one(pool)
+        .await
+        .unwrap()
+    }
+
+    fn summary_json(id: &str, subject: &str) -> Value {
+        json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@meowlabs.id"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
+    }
+
+    /// Compose -> relay -> store_sent fails: the message is already
+    /// delivered, so the handler must still answer success, report the
+    /// failed copy honestly (`sent_copy: false`), and still log the send.
+    #[tokio::test]
+    async fn relay_send_reports_sent_copy_false_when_store_sent_fails() {
+        let jmap = fake_jmap(JmapScript {
+            email_set: EmailSet::NotCreated,
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, Some(relay(&jmap))).await;
+        let resp = compose::send(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            compose_body("bob@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["sent"], true);
+        assert_eq!(v["sent_copy"], false);
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(send_count(&s.pool).await, 1);
+        // The failed copy really was an Email/set into Sent, not a skip.
+        let reqs = jmap.requests.lock().unwrap();
+        let set = reqs
+            .iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/set")
+            .expect("store_sent must attempt Email/set");
+        assert_eq!(
+            set["methodCalls"][0][1]["create"]["n"]["mailboxIds"]["f-sent"],
+            true
+        );
+        assert_eq!(
+            set["methodCalls"][0][1]["create"]["n"]["keywords"]["$seen"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn relay_send_reports_sent_copy_true_when_store_sent_succeeds() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, Some(relay(&jmap))).await;
+        let resp = compose::send(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            compose_body("bob@example.com"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["sent"], true);
+        assert_eq!(v["sent_copy"], true);
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(send_count(&s.pool).await, 1);
+    }
+
+    /// The hourly send quota is enforced before any relay or JMAP call:
+    /// the 101st send in an hour is refused and nothing is delivered.
+    #[tokio::test]
+    async fn send_quota_refuses_at_cap_without_relay_or_jmap() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, Some(relay(&jmap))).await;
+        seed_sends(&s.pool, SENDS_PER_HOUR).await;
+        let err = compose::send(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            compose_body("bob@example.com"),
+        )
+        .await
+        .expect_err("100 sends in the last hour must refuse the 101st");
+        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(err.1, "too_many_sends");
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        assert!(jmap.requests.lock().unwrap().is_empty());
+        assert_eq!(send_count(&s.pool).await, SENDS_PER_HOUR);
+    }
+
+    /// A local recipient with no relay goes through JMAP submission, which
+    /// files Sent atomically: `sent_copy` is always true on that path.
+    #[tokio::test]
+    async fn local_send_via_jmap_files_sent_copy() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let resp = compose::send(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            compose_body("alice@meowlabs.id"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["sent"], true);
+        assert_eq!(v["sent_copy"], true);
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        let reqs = jmap.requests.lock().unwrap();
+        let batch = reqs
+            .iter()
+            .find(|r| r["methodCalls"].as_array().is_some_and(|c| c.len() == 2))
+            .expect("jmap send must submit Email/set + EmailSubmission/set in one batch");
+        assert_eq!(batch["methodCalls"][1][0], "EmailSubmission/set");
+        assert_eq!(
+            batch["methodCalls"][1][1]["onSuccessUpdateEmail"]["#s"]["mailboxIds/f-sent"],
+            true
+        );
+    }
+
+    /// Search + pagination through the real handler: the query text,
+    /// position and limit reach JMAP, and the total + page come back.
+    #[tokio::test]
+    async fn list_messages_forwards_search_and_pagination() {
+        let jmap = fake_jmap(JmapScript {
+            query_total: 5,
+            query_list: vec![
+                summary_json("m3", "Invoice 3"),
+                summary_json("m4", "Invoice 4"),
+            ],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let resp = list_messages(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            Query(Page {
+                limit: Some(2),
+                position: Some(2),
+                folder: None,
+                q: Some("invoice".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["total"], 5);
+        assert_eq!(v["position"], 2);
+        assert_eq!(v["messages"].as_array().unwrap().len(), 2);
+        assert_eq!(v["messages"][0]["subject"], "Invoice 3");
+        let reqs = jmap.requests.lock().unwrap();
+        let query = reqs
+            .iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/query")
+            .expect("list must query JMAP");
+        let args = &query["methodCalls"][0][1];
+        assert_eq!(args["filter"]["conditions"][0]["inMailbox"], "f-inbox");
+        assert_eq!(args["filter"]["conditions"][1]["text"], "invoice");
+        assert_eq!(args["position"], 2);
+        assert_eq!(args["limit"], 2);
+        assert_eq!(args["calculateTotal"], true);
+    }
+
+    /// Handler-side clamps: a huge page is capped at MAX_LIST_LIMIT and a
+    /// huge search term is truncated to MAX_SEARCH_QUERY_CHARS before JMAP.
+    #[tokio::test]
+    async fn list_messages_clamps_limit_and_truncates_search() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let long_q = "x".repeat(300);
+        let resp = list_messages(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            Query(Page {
+                limit: Some(500),
+                position: None,
+                folder: None,
+                q: Some(long_q),
+            }),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let reqs = jmap.requests.lock().unwrap();
+        let query = reqs
+            .iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/query")
+            .expect("list must query JMAP");
+        let args = &query["methodCalls"][0][1];
+        assert_eq!(args["limit"], MAX_LIST_LIMIT);
+        assert_eq!(
+            args["filter"]["conditions"][1]["text"]
+                .as_str()
+                .unwrap()
+                .len(),
+            MAX_SEARCH_QUERY_CHARS
+        );
+    }
+
+    /// A valid folder role the server has no folder for is a 404, not a 500.
+    #[tokio::test]
+    async fn list_messages_missing_folder_role_is_not_found() {
+        let jmap = fake_jmap(JmapScript {
+            roles: vec!["inbox", "sent", "drafts", "trash"],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let err = list_messages(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            Query(Page {
+                limit: None,
+                position: None,
+                folder: Some("archive".into()),
+                q: None,
+            }),
+        )
+        .await
+        .expect_err("a role the server has no folder for must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "not_found");
+    }
+
+    /// One message carrying a single zip attachment (part "2", blob "b2").
+    fn message_with_zip_attachment(zip_len: u64) -> Value {
+        json!({
+            "id": "m1",
+            "from": [{"email": "noreply-dmarc-support@google.com"}],
+            "to": [{"email": "alice@meowlabs.id"}],
+            "subject": "Report domain: meowlabs.id",
+            "preview": "", "receivedAt": "2026-11-04T00:00:00Z",
+            "keywords": {"$seen": true}, "size": 12345, "hasAttachment": true,
+            "blobId": "msg-blob-1",
+            "textBody": [], "htmlBody": [], "bodyValues": {},
+            "bodyStructure": {"type": "multipart/mixed", "subParts": [
+                {"type": "text/plain", "partId": "1", "blobId": "b1", "size": 0},
+                {"type": "application/zip", "partId": "2", "blobId": "b2", "size": zip_len,
+                 "name": "report.zip", "disposition": "attachment"}
+            ]},
+            "attachments": [{"type": "application/zip", "partId": "2", "blobId": "b2", "size": zip_len,
+                "name": "report.zip", "disposition": "attachment"}]
+        })
+    }
+
+    /// A zip with no entries at all (end-of-central-directory only).
+    const EMPTY_ZIP: &[u8] = &[
+        80, 75, 5, 6, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+
+    /// A stored zip holding one `report.xml` DMARC report.
+    const XML_ZIP: &[u8] = &[
+        80, 75, 3, 4, 20, 0, 0, 0, 0, 0, 178, 104, 101, 93, 183, 125, 237, 223, 87, 0, 0, 0, 87, 0,
+        0, 0, 10, 0, 0, 0, 114, 101, 112, 111, 114, 116, 46, 120, 109, 108, 60, 102, 101, 101, 100,
+        98, 97, 99, 107, 62, 60, 114, 101, 112, 111, 114, 116, 95, 109, 101, 116, 97, 100, 97, 116,
+        97, 62, 60, 111, 114, 103, 95, 110, 97, 109, 101, 62, 103, 111, 111, 103, 108, 101, 46, 99,
+        111, 109, 60, 47, 111, 114, 103, 95, 110, 97, 109, 101, 62, 60, 47, 114, 101, 112, 111,
+        114, 116, 95, 109, 101, 116, 97, 100, 97, 116, 97, 62, 60, 47, 102, 101, 101, 100, 98, 97,
+        99, 107, 62, 80, 75, 1, 2, 20, 3, 20, 0, 0, 0, 0, 0, 178, 104, 101, 93, 183, 125, 237, 223,
+        87, 0, 0, 0, 87, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 128, 1, 0, 0, 0, 0, 114,
+        101, 112, 111, 114, 116, 46, 120, 109, 108, 80, 75, 5, 6, 0, 0, 0, 0, 1, 0, 1, 0, 56, 0, 0,
+        0, 127, 0, 0, 0, 0, 0,
+    ];
+
+    /// Preview path end to end: get_message -> find_attachment -> blob
+    /// download -> extract. A zip with no .xml entry answers 415, so the
+    /// UI offers a download instead of rendering bogus text.
+    #[tokio::test]
+    async fn attachment_preview_of_zip_without_xml_answers_415() {
+        let jmap = fake_jmap(JmapScript {
+            message: Some(message_with_zip_attachment(EMPTY_ZIP.len() as u64)),
+            blob: EMPTY_ZIP.to_vec(),
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let err = get_attachment_preview(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into(), "2".into())),
+        )
+        .await
+        .expect_err("a zip with no .xml entry must not preview");
+        assert_eq!(err.0, StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert_eq!(err.1, "not_previewable");
+    }
+
+    /// Same preview path, positive control: a zip with a .xml entry
+    /// returns the extracted report text.
+    #[tokio::test]
+    async fn attachment_preview_of_zip_with_xml_returns_text() {
+        let jmap = fake_jmap(JmapScript {
+            message: Some(message_with_zip_attachment(XML_ZIP.len() as u64)),
+            blob: XML_ZIP.to_vec(),
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let resp = get_attachment_preview(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into(), "2".into())),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["inner_name"], "report.xml");
+        assert!(v["text"].as_str().unwrap().contains("google.com"));
+    }
+}
