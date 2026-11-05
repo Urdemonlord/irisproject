@@ -184,6 +184,21 @@ Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.
 
 Single host: Stalwart (mail) + `iris-api` (Rust, SQLite) + static web build behind a TLS reverse proxy.
 
+Or run the whole stack (API + web + Stalwart) with Docker Compose — the
+fastest way to try IRIS on a server with Docker:
+
+```bash
+SESSION_SECRET=$(openssl rand -hex 32) docker compose -f deploy/compose/docker-compose.yaml up -d --build
+# open http://127.0.0.1:8080
+```
+
+Then create Stalwart accounts (one permanent user per mailbox + the
+catch-all `TEMP_INBOX_MAIL_USER`) and set a real `TEMP_INBOX_DOMAIN`
+before real use. Known limitation: in the Compose stack, per-IP rate
+limits see the proxy's IP, not the real client IP (the API trusts
+`X-Real-IP` only from a loopback proxy) — the systemd + nginx deployment
+below does not have this problem.
+
 ### 1. Mail server (Stalwart)
 
 - Accounts: one permanent user per mailbox, plus the catch-all `TEMP_INBOX_MAIL_USER` receiving `*@TEMP_INBOX_DOMAIN`.
