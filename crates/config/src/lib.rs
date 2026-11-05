@@ -36,7 +36,7 @@ pub struct Config {
     /// Relay endpoint; production is pinned to the official Resend endpoint.
     pub resend_api_url: String,
     /// Separate origin that serves HTML mail bodies (e.g.
-    /// `https://mail-content.meowlabs.id`). Empty = disabled: the web keeps
+    /// `https://mail-content.example.com`). Empty = disabled: the web keeps
     /// rendering HTML mail in a same-origin srcdoc iframe. Only used to
     /// build one-time render URLs; never a secret.
     pub mail_content_origin: String,
@@ -60,9 +60,9 @@ impl Config {
             session_secret: std::env::var("SESSION_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-in-prod".to_string()),
             stalwart_api_url: std::env::var("STALWART_API_URL")
-                .unwrap_or_else(|_| "http://localhost:8091".to_string()),
+                .unwrap_or_else(|_| "http://localhost:8092".to_string()),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")
-                .unwrap_or_else(|_| "inbox.meowlabs.id".to_string()),
+                .unwrap_or_else(|_| "inbox.example.com".to_string()),
             temp_inbox_default_expiry_hours: std::env::var("TEMP_INBOX_DEFAULT_EXPIRY_HOURS")
                 .ok()
                 .and_then(|h| h.parse().ok())
@@ -70,7 +70,7 @@ impl Config {
             temp_inbox_mail_user: std::env::var("TEMP_INBOX_MAIL_USER").unwrap_or_default(),
             temp_inbox_mail_password: std::env::var("TEMP_INBOX_MAIL_PASSWORD").unwrap_or_default(),
             send_local_domains: std::env::var("SEND_LOCAL_DOMAINS")
-                .unwrap_or_else(|_| "meowlabs.id,iris.meowlabs.id,inbox.meowlabs.id".to_string())
+                .unwrap_or_else(|_| "example.com".to_string())
                 .split(',')
                 .map(|d| d.trim().to_lowercase())
                 .filter(|d| !d.is_empty())
@@ -208,25 +208,25 @@ mod tests {
     #[test]
     fn mail_content_origin_keeps_bare_https_origin() {
         assert_eq!(
-            normalize_mail_content_origin(Some("https://mail-content.meowlabs.id")),
-            "https://mail-content.meowlabs.id"
+            normalize_mail_content_origin(Some("https://mail-content.example.com")),
+            "https://mail-content.example.com"
         );
         assert_eq!(
-            normalize_mail_content_origin(Some("https://MAIL-Content.MeowLabs.ID")),
-            "https://mail-content.meowlabs.id"
+            normalize_mail_content_origin(Some("https://MAIL-Content.Example.COM")),
+            "https://mail-content.example.com"
         );
     }
 
     #[test]
     fn mail_content_origin_rejects_paths_and_userinfo() {
         for bad in [
-            "https://mail-content.meowlabs.id/",
-            "https://mail-content.meowlabs.id/api",
-            "https://mail-content.meowlabs.id?x=1",
-            "https://user:pass@mail-content.meowlabs.id",
-            "https://mail-content.meowlabs.id#frag",
-            "mail-content.meowlabs.id",
-            "ftp://mail-content.meowlabs.id",
+            "https://mail-content.example.com/",
+            "https://mail-content.example.com/api",
+            "https://mail-content.example.com?x=1",
+            "https://user:pass@mail-content.example.com",
+            "https://mail-content.example.com#frag",
+            "mail-content.example.com",
+            "ftp://mail-content.example.com",
         ] {
             assert_eq!(
                 normalize_mail_content_origin(Some(bad)),
@@ -247,7 +247,7 @@ mod tests {
             "http://localhost:5173"
         );
         assert_eq!(
-            normalize_mail_content_origin(Some("http://mail-content.meowlabs.id")),
+            normalize_mail_content_origin(Some("http://mail-content.example.com")),
             ""
         );
     }

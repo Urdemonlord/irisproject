@@ -73,7 +73,7 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
     };
 
     url.scheme() == "https"
-        && url.host_str() == Some(app.host)
+        && url.host_str() == Some(app.host.as_str())
         && url.port_or_known_default() == Some(443)
         && url.username().is_empty()
         && url.password().is_none()
@@ -295,67 +295,67 @@ mod tests {
     #[test]
     fn action_urls_are_restricted_to_the_exact_https_origin_for_each_app() {
         assert!(action_url_allowed(
-            "gencv",
-            "https://gencv.meowlabs.id/verify?token=abc"
+            "alpha",
+            "https://alpha.example.com/verify?token=abc"
         ));
         assert!(action_url_allowed(
-            "academy",
-            "https://academy.meowlabs.id/masuk#token=abc"
+            "beta",
+            "https://beta.example.com/masuk#token=abc"
         ));
         assert!(!action_url_allowed(
-            "gencv",
-            "https://academy.meowlabs.id/verify?token=abc"
+            "alpha",
+            "https://beta.example.com/verify?token=abc"
         ));
         assert!(!action_url_allowed(
-            "gencv",
-            "http://gencv.meowlabs.id/verify?token=abc"
+            "alpha",
+            "http://alpha.example.com/verify?token=abc"
         ));
         assert!(!action_url_allowed(
-            "gencv",
-            "https://gencv.meowlabs.id.attacker.invalid/verify"
+            "alpha",
+            "https://alpha.example.com.attacker.invalid/verify"
         ));
         assert!(!action_url_allowed(
-            "gencv",
-            "https://gencv.meowlabs.id@attacker.invalid/verify"
+            "alpha",
+            "https://alpha.example.com@attacker.invalid/verify"
         ));
         assert!(!action_url_allowed(
-            "gencv",
-            "https://gencv.meowlabs.id:8443/verify"
+            "alpha",
+            "https://alpha.example.com:8443/verify"
         ));
         assert!(!action_url_allowed(
             "unknown",
-            "https://gencv.meowlabs.id/verify"
+            "https://alpha.example.com/verify"
         ));
         assert!(action_url_allowed(
-            "aksaria",
-            "https://aksaria.meowlabs.id/reset-sandi/?token=abc"
+            "gamma",
+            "https://gamma.example.com/reset-sandi/?token=abc"
         ));
         assert!(!action_url_allowed(
-            "aksaria",
-            "https://gencv.meowlabs.id/reset-sandi/?token=abc"
+            "gamma",
+            "https://alpha.example.com/reset-sandi/?token=abc"
         ));
     }
 
     #[test]
     fn renders_only_registered_auth_templates_for_the_owning_app() {
         let message = render_message(
-            "gencv",
+            "alpha",
             "auth.verify",
             "user@example.test",
-            "https://gencv.meowlabs.id/verify?token=abc",
+            "https://alpha.example.com/verify?token=abc",
         )
         .expect("registered template should render");
         assert_eq!(message.to, ["user@example.test"]);
-        assert_eq!(message.subject, "Verify your GenCV email");
+        assert_eq!(message.subject, "Verify your email");
         assert!(message
             .text
-            .contains("https://gencv.meowlabs.id/verify?token=abc"));
+            .contains("https://alpha.example.com/verify?token=abc"));
 
         assert!(render_message(
-            "gencv",
+            "alpha",
             "auth.login_link",
             "user@example.test",
-            "https://gencv.meowlabs.id/verify?token=abc",
+            "https://alpha.example.com/verify?token=abc",
         )
         .is_err());
     }
@@ -382,10 +382,10 @@ mod tests {
     #[test]
     fn rejects_header_injection_in_recipient() {
         assert!(render_message(
-            "gencv",
+            "alpha",
             "auth.verify",
             "user@example.test\r\nBcc: attacker@example.test",
-            "https://gencv.meowlabs.id/verify?token=abc",
+            "https://alpha.example.com/verify?token=abc",
         )
         .is_err());
     }
@@ -397,7 +397,7 @@ mod tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at) VALUES (?,?,?,?,?,?)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -410,6 +410,6 @@ mod tests {
             .await
             .expect("valid scoped key must authenticate");
         assert_eq!(principal.key_id, generated.key_id);
-        assert_eq!(principal.app_id, "gencv");
+        assert_eq!(principal.app_id, "alpha");
     }
 }
