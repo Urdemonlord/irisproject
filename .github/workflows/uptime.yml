@@ -54,16 +54,10 @@ jobs:
           echo "notify=0" >> "$GITHUB_OUTPUT"
 
           if [ "$cur" = "down" ] && [ "$prev" != "down" ]; then
-            {
-              echo "msg=🔴 mail.meowlabs.id DOWN (HTTP $code) — $now"
-              echo "Keterangan: https://mail.meowlabs.id/health tidak membalas 200."
-              echo "Cek: panel Sumopod / uptime VM."
-            } >> "$GITHUB_OUTPUT"
+            echo "msg=🔴 mail.meowlabs.id DOWN (HTTP $code) — $now. https://mail.meowlabs.id/health tidak membalas 200. Cek panel Sumopod / status VM." >> "$GITHUB_OUTPUT"
             echo "notify=1" >> "$GITHUB_OUTPUT"
           elif [ "$cur" = "up" ] && [ "$prev" = "down" ]; then
-            {
-              echo "msg=🟢 mail.meowlabs.id UP lagi (HTTP 200) — $now"
-            } >> "$GITHUB_OUTPUT"
+            echo "msg=🟢 mail.meowlabs.id UP lagi (HTTP 200) — $now" >> "$GITHUB_OUTPUT"
             echo "notify=1" >> "$GITHUB_OUTPUT"
           fi
 
