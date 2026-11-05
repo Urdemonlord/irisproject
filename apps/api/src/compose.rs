@@ -235,10 +235,24 @@ pub(crate) async fn send(
 
     let subject = auth::hash_token(&format!("send:{}", u.user_id));
     let since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    let sent: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='send' AND occurred_at>?",
-    ).bind(&subject).bind(&since).fetch_one(&s.pool).await?;
-    if sent >= SENDS_PER_HOUR {
+    // Reserve a slot atomically BEFORE delivery so two concurrent sends
+    // cannot both pass the hourly cap (TOCTOU). The single INSERT is an
+    // atomic statement under SQLite's write lock: the second request sees
+    // the first's committed row and gets 0 rows_affected -> 429.
+    let reserved = sqlx::query(
+        "INSERT INTO rate_limit_events (id, subject_hash, action, occurred_at, outcome) \
+         SELECT ?, ?, 'send', ?, 'allowed' \
+         WHERE (SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash = ? AND action = 'send' AND occurred_at > ?) < ?",
+    )
+    .bind(uuid::Uuid::new_v4().to_string())
+    .bind(&subject)
+    .bind(auth::now())
+    .bind(&subject)
+    .bind(&since)
+    .bind(SENDS_PER_HOUR)
+    .execute(&s.pool)
+    .await?;
+    if reserved.rows_affected() == 0 {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_sends"));
     }
 
@@ -276,11 +290,8 @@ pub(crate) async fn send(
     // bookkeeping insert must not fail the request (and invite a retry
     // that would double-send). Cost: this one send is not counted
     // against the hourly limit.
-    if let Err(e) = sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'send',?,'allowed')")
-        .bind(uuid::Uuid::new_v4().to_string()).bind(&subject).bind(auth::now()).execute(&s.pool).await
-    {
-        tracing::error!("rate-limit event insert failed after send: {e}");
-    }
+    // (Reservation now happens atomically before delivery, so this is
+    // no longer needed.)
     Ok(Json(json!({ "sent": true, "sent_copy": sent_copy })).into_response())
 }
 

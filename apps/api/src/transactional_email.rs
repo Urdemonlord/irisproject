@@ -168,7 +168,7 @@ pub async fn send(
     let recipient_hash = auth::hash_token(&body.recipient.trim().to_ascii_lowercase());
     let request_id = uuid::Uuid::new_v4().to_string();
     let now = auth::now();
-    let mut tx = state.pool.begin().await?;
+    let mut tx = state.pool.begin_with("BEGIN IMMEDIATE").await?;
     let inserted = sqlx::query(
         "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?, 'sending', ?,?) ON CONFLICT(key_id,idempotency_key) DO NOTHING",
     )
@@ -206,21 +206,17 @@ pub async fn send(
         .unwrap()
         .and_utc()
         .to_rfc3339();
-    // Daily quota counts only requests the provider accepted. A `failed`
-    // attempt was rejected by the provider, an `unknown` attempt never
-    // got a delivery verdict, and a `sending` row is still in flight (or
-    // its sender crashed mid-send), so none of them consumed a delivery
-    // and none of them consumes quota.
-    //
-    // The current request's row was just inserted as `sending`, so it is
-    // not counted here; the boundary is therefore `>=` rather than the
-    // old `>`, which only held because the current row was counted. The
-    // limit value itself is unchanged: at most `daily_send_limit`
-    // accepted sends per key per day.
+    // Daily quota counts accepted sends plus in-flight (`sending`) rows of
+    // OTHER requests for the same key. Counting only `accepted` allowed two
+    // concurrent sends to both pass when the count sat at limit-1 (TOCTOU);
+    // counting `sending` rows (excluding this request's own row, which is
+    // still `sending` here) closes the window. BEGIN IMMEDIATE serializes
+    // the transactions so a concurrent commit is visible before this
+    // count runs.
     let (accepted_today, daily_limit): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? AND r.status='accepted' WHERE k.key_id=? GROUP BY k.key_id",
+        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? AND r.status IN ('sending','accepted') AND r.id<>? WHERE k.key_id=? GROUP BY k.key_id",
     )
-    .bind(utc_start).bind(&principal.key_id).fetch_one(&mut *tx).await
+    .bind(utc_start).bind(&request_id).bind(&principal.key_id).fetch_one(&mut *tx).await
     ?;
     if accepted_today >= daily_limit {
         tx.rollback().await?;

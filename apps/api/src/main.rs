@@ -1564,14 +1564,15 @@ mod timeless_password_reset_tests {
             .unwrap();
 
         // One row per non-accepted outcome today, plus an accepted row from
-        // yesterday: none of them may consume today's quota.
+        // yesterday: none of them may consume today's quota. (`sending` rows
+        // of OTHER requests now DO consume quota to close the TOCTOU window,
+        // so they are not seeded here.)
         let now = auth::now();
         let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
         let insert = "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)";
         for (id, idempotency_key, status, created_at) in [
             ("seed-failed", "seed-failed", "failed", now.as_str()),
             ("seed-unknown", "seed-unknown", "unknown", now.as_str()),
-            ("seed-sending", "seed-sending", "sending", now.as_str()),
             (
                 "seed-old-accepted",
                 "seed-old-accepted",
@@ -1629,7 +1630,7 @@ mod timeless_password_reset_tests {
                 .fetch_one(&app.pool)
                 .await
                 .unwrap();
-        assert_eq!(request_count, 5);
+        assert_eq!(request_count, 4);
         relay.task.abort();
     }
 
