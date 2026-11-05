@@ -249,7 +249,15 @@ const previewable = (a: Attachment) => /\.gz$|\.zip$|\.xml$/i.test(a.name) || /g
 function messageBody(m: Detail) {
   if (!m.html_body) return m.text_body ? [h('pre', { className: 'mail-text' }, m.text_body)] : []
   const frame = (allowRemote: boolean) => {
-    const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; img-src data: cid:${allowRemote ? ' https:' : ''}">`
+    // The srcdoc frame is sandboxed (no scripts, no same-origin, no top
+    // navigation) and this meta CSP is its only policy. The directives
+    // below only restate the 'none' that default-src already enforces
+    // (each falls back to default-src), so the effective policy is
+    // unchanged — they stay 'none' even if default-src is ever loosened.
+    // style-src 'unsafe-inline' must stay: real HTML mail relies on
+    // inline styles, and dropping it would break rendering of most HTML
+    // messages. frame-ancestors/sandbox cannot be set via <meta>.
+    const csp = `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'none'; object-src 'none'; media-src 'none'; font-src 'none'; connect-src 'none'; worker-src 'none'; manifest-src 'none'; frame-src 'none'; base-uri 'none'; form-action 'none'; style-src 'unsafe-inline'; img-src data: cid:${allowRemote ? ' https:' : ''}">`
     const f = h('iframe', { className: 'mail-frame', title: 'Message body', srcdoc: csp + m.html_body, loading: 'lazy' })
     f.setAttribute('sandbox', '')
     f.setAttribute('referrerpolicy', 'no-referrer')
