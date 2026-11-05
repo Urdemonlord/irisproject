@@ -150,7 +150,7 @@ CREATE TABLE app_settings (
 ``` json
 {
   "id": "opaque-id",
-  "address": "random@inbox.meowlabs.id",
+  "address": "random@inbox.example.com",
   "access_token": "returned-once",
   "created_at": "2026-10-30T00:00:00Z",
   "expires_at": "2026-10-30T01:00:00Z"

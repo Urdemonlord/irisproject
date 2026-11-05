@@ -301,7 +301,7 @@ mod tests {
 
     #[test]
     fn addresses() {
-        assert!(valid_compose_address("a@meowlabs.id"));
+        assert!(valid_compose_address("a@example.com"));
         assert!(valid_compose_address("first.last+tag@sub.example.co"));
         for bad in [
             "", "a", "@x.id", "a@", "a@x", "a@.x", "a@x.", "a b@x.id", "a@x..id", "<a@x.id>",

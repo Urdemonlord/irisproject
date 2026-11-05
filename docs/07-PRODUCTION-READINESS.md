@@ -29,26 +29,26 @@ Status as of 2026-10-30, staging (`iris-stalwart` + `iris-api`). `[x]` = verifie
 
 Checked against authoritative NS (Cloudflare) on 2026-10-30.
 
-| Record | meowlabs.id | inbox.meowlabs.id |
+| Record | example.com | inbox.example.com |
 |---|---|---|
-| MX | none (apex does not receive) | `10 mx-iris.meowlabs.id` → 129.226.193.34 |
+| MX | none (apex does not receive) | `10 mx.example.com` → 203.0.113.10 |
 | SPF | `v=spf1 mx -all` ⚠ apex has no MX, so this authorizes nobody | `v=spf1 -all` ✓ (receive-only domain) |
 | DKIM | `default._domainkey` RSA-2048 ✓, `resend._domainkey` RSA-1024 | n/a (never sends) |
 | DMARC | **missing** | **missing** |
 
-Actions (DNS changes, owner: Arya):
+Actions (DNS changes, owner: the deployment operator):
 
-- [ ] `_dmarc.meowlabs.id TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc@meowlabs.id; adkim=s; aspf=s"` (start `p=none` for 2 weeks if anything legitimately sends from the apex).
-- [ ] `_dmarc.inbox.meowlabs.id TXT "v=DMARC1; p=reject; adkim=s; aspf=s"` (domain never sends).
-- [ ] Fix apex SPF: list the real sender (e.g. `v=spf1 ip4:129.226.193.34 -all`, or `include:` of the provider using `resend._domainkey`), or `v=spf1 -all` if the apex never sends.
-- [ ] PTR for 129.226.193.34 → `mx-iris.meowlabs.id` (currently no PTR; required by many receivers if IRIS ever sends).
+- [ ] `_dmarc.example.com TXT "v=DMARC1; p=quarantine; rua=mailto:dmarc@example.com; adkim=s; aspf=s"` (start `p=none` for 2 weeks if anything legitimately sends from the apex).
+- [ ] `_dmarc.inbox.example.com TXT "v=DMARC1; p=reject; adkim=s; aspf=s"` (domain never sends).
+- [ ] Fix apex SPF: list the real sender (e.g. `v=spf1 ip4:203.0.113.10 -all`, or `include:` of the provider using `resend._domainkey`), or `v=spf1 -all` if the apex never sends.
+- [ ] PTR for 203.0.113.10 → `mx.example.com` (currently no PTR; required by many receivers if IRIS ever sends).
 - [ ] Optional: MTA-STS + TLS-RPT (`_mta-sts`, `_smtp._tls`) for inbound TLS enforcement.
 
 ## 5. TLS
 
 - [ ] HTTPS on the web origin via reverse proxy; HTTP → HTTPS redirect; HSTS.
 - [ ] `IRIS_ENV=production` so cookies get `Secure`.
-- [ ] Stalwart SMTP STARTTLS / IMAPS certificate for `mx-iris.meowlabs.id` (ACME), auto-renew checked.
+- [ ] Stalwart SMTP STARTTLS / IMAPS certificate for `mx.example.com` (ACME), auto-renew checked.
 
 ## 6. Backups
 

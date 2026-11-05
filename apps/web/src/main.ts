@@ -161,7 +161,7 @@ function field(id: string, label: string, ic: string, input: HTMLInputElement, e
 function renderLogin() {
   setPage({ title: 'Sign in', description: 'Sign in to IRIS, the self-hosted mailbox from Meow Labs — or grab a 1-hour temporary inbox, no sign-up needed.', path: '/' })
   const status = h('div', { className: 'form-error', role: 'alert' })
-  const email = h('input', { type: 'email', name: 'email', id: 'email', autocomplete: 'username', inputMode: 'email', placeholder: 'you@meowlabs.id', spellcheck: false }) as HTMLInputElement
+  const email = h('input', { type: 'email', name: 'email', id: 'email', autocomplete: 'username', inputMode: 'email', placeholder: 'you@example.com', spellcheck: false }) as HTMLInputElement
   const password = h('input', { type: 'password', name: 'password', id: 'password', autocomplete: 'current-password' }) as HTMLInputElement
   const submit = h('button', { type: 'submit', className: 'btn btn-ink btn-block' }, h('span', { className: 'btn-label' }, 'Sign in')) as HTMLButtonElement
   const showPw = h('button', { type: 'button', className: 'show-pw', ariaLabel: 'Show password', 'aria-pressed': 'false' }, 'Show') as HTMLButtonElement
@@ -572,7 +572,7 @@ const folderMeta = (r: FolderRole) => FOLDERS.find((f) => f.role === r)!
 let account: { email: string; mb: string } | null = null
 
 const sendErrors: Record<string, string> = {
-  external_sending_disabled: 'IRIS can only send to @meowlabs.id addresses for now. Sending to other domains isn’t set up yet.',
+  external_sending_disabled: 'IRIS can only send to local addresses for now. Sending to other domains isn’t set up yet.',
   too_many_sends: 'You’ve reached the sending limit (100 per hour). Try again later.',
   invalid_recipient: 'One of the addresses isn’t valid.',
   no_recipients: 'Add at least one recipient.',

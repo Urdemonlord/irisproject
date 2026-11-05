@@ -1220,7 +1220,7 @@ mod timeless_password_reset_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: true,
                 iris_timeless_service_token: service_key.into(),
                 iris_timeless_email_from: sender.into(),
@@ -1254,9 +1254,9 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
@@ -1291,9 +1291,9 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
@@ -1355,9 +1355,9 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "admin@meowlabs.id",
+            "admin@example.com",
             "",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
@@ -1382,9 +1382,9 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "admin@meowlabs.id",
+            "admin@example.com",
             "recovery@example.test",
-            "timeless.meowlabs.id",
+            "reset.example.com",
             Some(ResendClient::with_endpoint(
                 "test-key".into(),
                 relay.endpoint.clone(),
@@ -1405,12 +1405,12 @@ mod timeless_password_reset_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload["from"], "admin@meowlabs.id");
+        assert_eq!(payload["from"], "admin@example.com");
         assert_eq!(payload["to"], json!(["recovery@example.test"]));
         assert_eq!(payload["subject"], "Reset your Timeless editor password");
         let text = payload["text"].as_str().unwrap();
         assert!(text.contains(&format!(
-            "https://timeless.meowlabs.id/admin/reset#token={GOOD_TOKEN}"
+            "https://reset.example.com/admin/reset#token={GOOD_TOKEN}"
         )));
         assert!(!text.contains("?token="));
         relay.task.abort();
@@ -1421,7 +1421,7 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let mut app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1437,7 +1437,7 @@ mod timeless_password_reset_tests {
         let generated = auth::generate_api_key();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES (?,?,?,?,?)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1456,7 +1456,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "user@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+                action_url: "https://alpha.example.com/verify?token=opaque".into(),
             }),
         )
         .await
@@ -1476,7 +1476,7 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1489,7 +1489,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify", "email:status"]).to_string())
             .bind(auth::now())
@@ -1507,7 +1507,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            action_url: "https://alpha.example.com/verify?token=opaque".into(),
         };
         let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
             .await
@@ -1523,13 +1523,13 @@ mod timeless_password_reset_tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(payload["from"], "no-reply@meowlabs.id");
+        assert_eq!(payload["from"], "no-reply@example.com");
         assert_eq!(payload["to"], json!(["user@example.test"]));
-        assert_eq!(payload["subject"], "Verify your GenCV email");
+        assert_eq!(payload["subject"], "Verify your email");
         assert!(payload["text"]
             .as_str()
             .unwrap()
-            .contains("https://gencv.meowlabs.id/verify?token=opaque"));
+            .contains("https://alpha.example.com/verify?token=opaque"));
 
         let retry = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
             .await
@@ -1547,7 +1547,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "different@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+                action_url: "https://alpha.example.com/verify?token=opaque".into(),
             }),
         )
         .await
@@ -1578,7 +1578,7 @@ mod timeless_password_reset_tests {
         .await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1591,7 +1591,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,10)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1608,7 +1608,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=opaque".into(),
+            action_url: "https://alpha.example.com/verify?token=opaque".into(),
         };
 
         let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
@@ -1650,7 +1650,7 @@ mod timeless_password_reset_tests {
         let relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1663,7 +1663,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1712,7 +1712,7 @@ mod timeless_password_reset_tests {
         let body = || transactional_email::SendEmailBody {
             template_id: "auth.verify".into(),
             recipient: "user@example.test".into(),
-            action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+            action_url: "https://alpha.example.com/verify?token=abc".into(),
         };
 
         headers.insert("idempotency-key", "quota-free-first".parse().unwrap());
@@ -1748,7 +1748,7 @@ mod timeless_password_reset_tests {
         let mut relay = fake_relay().await;
         let app = state(
             SERVICE_KEY,
-            "no-reply@meowlabs.id",
+            "no-reply@example.com",
             "unused@example.test",
             "example.test",
             Some(ResendClient::with_endpoint(
@@ -1761,7 +1761,7 @@ mod timeless_password_reset_tests {
         let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
         sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
             .bind(&generated.key_id)
-            .bind("gencv")
+            .bind("alpha")
             .bind(&generated.token_hash)
             .bind(json!(["email:template:auth.verify"]).to_string())
             .bind(auth::now())
@@ -1798,7 +1798,7 @@ mod timeless_password_reset_tests {
             Json(transactional_email::SendEmailBody {
                 template_id: "auth.verify".into(),
                 recipient: "user@example.test".into(),
-                action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+                action_url: "https://alpha.example.com/verify?token=abc".into(),
             }),
         )
         .await
@@ -1832,7 +1832,7 @@ mod timeless_password_reset_tests {
     #[tokio::test]
     async fn migration_enforces_idempotency_per_integration_key() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
-        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES ('test-key','gencv',?,'[\\\"email:template:auth.verify\\\"]',?)")
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at) VALUES ('test-key','alpha',?,'[\\\"email:template:auth.verify\\\"]',?)")
             .bind("a".repeat(64)).bind(auth::now()).execute(&pool).await.unwrap();
         let insert = "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,'accepted',?,?)";
         let now = auth::now();
@@ -1891,7 +1891,7 @@ mod read_limit_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 iris_timeless_service_token: String::new(),
                 iris_timeless_email_from: String::new(),
@@ -2100,7 +2100,7 @@ mod handler_integration_tests {
                 vec![json!(["Mailbox/set", {"created": {}, "notCreated": {}}, "s"])]
             }
             "Identity/get" => vec![
-                json!(["Identity/get", {"list": [{"id": "ident-1", "email": "alice@meowlabs.id"}]}, "i"]),
+                json!(["Identity/get", {"list": [{"id": "ident-1", "email": "alice@example.com"}]}, "i"]),
             ],
             "Identity/set" => vec![
                 json!(["Identity/set", {"created": {"i": {"id": "ident-1"}}, "notCreated": {}}, "s"]),
@@ -2239,11 +2239,11 @@ mod handler_integration_tests {
 
     async fn test_state(jmap: &FakeJmap, relay: Option<ResendClient>) -> Arc<AppState> {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
-        sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES ('u-alice','alice@meowlabs.id','Alice','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES ('u-alice','alice@example.com','Alice','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
-        sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mbx-1','u-alice','alice@meowlabs.id','acct-1','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
+        sqlx::query("INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mbx-1','u-alice','alice@example.com','acct-1','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
             .execute(&pool)
             .await
             .unwrap();
@@ -2263,10 +2263,10 @@ mod handler_integration_tests {
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
                 temp_inbox_mail_password: String::new(),
-                send_local_domains: vec!["meowlabs.id".into()],
+                send_local_domains: vec!["example.com".into()],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 iris_timeless_service_token: String::new(),
                 iris_timeless_email_from: String::new(),
@@ -2281,9 +2281,9 @@ mod handler_integration_tests {
     fn user() -> CurrentUser {
         CurrentUser {
             user_id: "u-alice".into(),
-            email: "alice@meowlabs.id".into(),
+            email: "alice@example.com".into(),
             creds: Creds {
-                user: "alice@meowlabs.id".into(),
+                user: "alice@example.com".into(),
                 pass: "secret".into(),
             },
         }
@@ -2334,7 +2334,7 @@ mod handler_integration_tests {
     }
 
     fn summary_json(id: &str, subject: &str) -> Value {
-        json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@meowlabs.id"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
+        json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@example.com"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
     }
 
     /// Compose -> relay -> store_sent fails: the message is already
@@ -2352,7 +2352,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("bob@example.com"),
+            compose_body("bob@example.test"),
         )
         .await
         .unwrap();
@@ -2386,7 +2386,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("bob@example.com"),
+            compose_body("bob@example.test"),
         )
         .await
         .unwrap();
@@ -2430,7 +2430,7 @@ mod handler_integration_tests {
             State(s.clone()),
             Extension(user()),
             Path("mbx-1".into()),
-            compose_body("alice@meowlabs.id"),
+            compose_body("alice@example.com"),
         )
         .await
         .unwrap();
@@ -2565,8 +2565,8 @@ mod handler_integration_tests {
         json!({
             "id": "m1",
             "from": [{"email": "noreply-dmarc-support@google.com"}],
-            "to": [{"email": "alice@meowlabs.id"}],
-            "subject": "Report domain: meowlabs.id",
+            "to": [{"email": "alice@example.com"}],
+            "subject": "Report domain: example.com",
             "preview": "", "receivedAt": "2026-11-04T00:00:00Z",
             "keywords": {"$seen": true}, "size": 12345, "hasAttachment": true,
             "blobId": "msg-blob-1",

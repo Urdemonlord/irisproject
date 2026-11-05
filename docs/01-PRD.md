@@ -2,7 +2,7 @@
 
 **Product:** IRIS\
 **Parent brand:** Meow Labs\
-**Primary application URL:** `https://mail.meowlabs.id`\
+**Primary application URL:** `https://mail.example.com`\
 **Status:** Draft v1.0\
 **Date:** 30 October 2026
 
@@ -37,10 +37,10 @@ that can later be offered to other users.
 
 ## 3. Goals
 
--   Provide a reliable webmail interface at `mail.meowlabs.id`.
--   Support permanent mailboxes on `meowlabs.id`.
+-   Provide a reliable webmail interface at `mail.example.com`.
+-   Support permanent mailboxes on `example.com`.
 -   Support temporary addresses on a separate domain, proposed as
-    `inbox.meowlabs.id`.
+    `inbox.example.com`.
 -   Use Rust for application APIs and business logic.
 -   Use a mature mail server rather than implementing SMTP/IMAP
     protocols.
@@ -90,14 +90,14 @@ that can later be offered to other users.
     administrators.
 -   Supports receiving, reading, composing, replying, forwarding,
     searching, and attachments.
--   Uses the `meowlabs.id` domain.
+-   Uses the `example.com` domain.
 -   Retention is governed by mailbox policy, not temporary-inbox expiry.
 
 ### 6.2 Temporary inbox
 
 -   Anonymous creation may be enabled only after rate limits and abuse
     controls are implemented.
--   Uses a separate domain, proposed as `inbox.meowlabs.id`.
+-   Uses a separate domain, proposed as `inbox.example.com`.
 -   Generates cryptographically random local parts.
 -   Does not permit outbound email in MVP.
 -   Has a configurable expiry; initial proposal is 1 hour, with an

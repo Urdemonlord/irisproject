@@ -35,7 +35,7 @@ Asymmetric 2-column split, 7/5 on a 12-col grid with no gutter. A full-height 1p
 │                                      │  Sign in                │
 │   Every                              │  ─────────────── (2px)  │
 │   message                            │  EMAIL                  │
-│   finds                              │  [ arya@meowlabs.id   ] │
+│   finds                              │  [ alex@example.com   ] │
 │   its way.                           │  PASSWORD               │
 │                     ┌──cat sits──┐   │  [ ••••••••      Show ] │
 │   ─ ─ ─ ─ ─ ─ ─ ─ ─ ┤ eyes track ├   │  [ Sign in →  (ink)   ] │
@@ -75,7 +75,7 @@ Loading: button label becomes "Signing in…" with mono dots, and the button is 
 CSS grid columns `232px | 384px | 1fr`, with a 56px top bar whose dividers line up with the pane columns.
 
 ```
-┌ ◉ IRIS  meowlabs.id ┬ ⌕ Search mail      [/] ┬ ⟳ SYNCED 19:42     arya@… [A] ┐
+┌ ◉ IRIS  example.com ┬ ⌕ Search mail      [/] ┬ ⟳ SYNCED 19:42     alex@… [A] ┐
 ╞═════════════════════╪═══════════════════════════╪══════════════════════════════════╡ 2px ink
 │[ ✎ Compose     C ]  │ Inbox          [3 UNREAD] │ [Reply] Forward ▢ 🗑   1 OF 128 ⋯│
 │ MAILBOX             │ ══════════════════════════│──────────────────────────────────│
@@ -85,7 +85,7 @@ CSS grid columns `232px | 384px | 1fr`, with a 56px top bar whose dividers line 
 │ Archive             │   Three items before…     │══════════════════════════│ ▛PDF▜ temp… ↓
 │ Trash               │   ⌎ [PDF][2]              │ [R] Rina Hartono  SPF✓   │ [Download all]
 │ TEMPORARY           │ ◉ GitHub            08:47 │──────────────────────────│ ROUTE  │
-│ ◷ kurir-7f3k2    2  │   [iris] CI passed…       │ Hi Arya, …  (17/1.6,68ch)│ ■ mx.meowlabs.id
+│ ◷ kurir-7f3k2    2  │   [iris] CI passed…       │ Hi Alex, …  (17/1.6,68ch)│ ■ mx.example.com
 │ + New address       │   Budi Santoso  Yesterday │                          │ ┊      │
 │─────────────────────│   Invoice #2026-104       │ ┌ Remote images blocked ┐│ ■ auth pass
 │ STORAGE ▬▬▭▭▭ 1.2/5G│                           │ └──────────── Load once ┘│ ● Delivered
@@ -135,7 +135,7 @@ Same shell and top bar. The sidebar shows "TEMPORARY · kurir-7f3k2" as active. 
 ┌ sidebar ┬────────────────────────────────────────────────┬───────────────────────┐
 │         │ TEMPORARY ADDRESS                    (cat peeks│ EXPIRES               │
 │         │ ┌──────────────────────────────────────over──┐ │ 00:42:17  (Archivo 72,│
-│         │ │ kurir-7f3k2@inbox.meowlabs.id   [⧉ Copy]   │ │  tabular)             │
+│         │ │ kurir-7f3k2@inbox.example.com   [⧉ Copy]   │ │  tabular)             │
 │         │ └────────────────────────────────────────────┘ │ ▬▬▬▬▬▬▬▬▭▭▭▭ ticks   │
 │         │ RECEIVE-ONLY · NOT FOR SENSITIVE MAIL          │ at 20:24 WIB          │
 │         │════════════════════════════════════════════════│───────────────────────│

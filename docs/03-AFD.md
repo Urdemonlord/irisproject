@@ -1,7 +1,7 @@
 # IRIS Application Flow Documentation (AFD)
 
 **Product:** IRIS by Meow Labs\
-**Primary URL:** `mail.meowlabs.id`\
+**Primary URL:** `mail.example.com`\
 **Status:** Draft v1.0
 
 ## 1. Application map
@@ -39,7 +39,7 @@ IRIS
 
 ## 2. First visit
 
-1.  User opens `mail.meowlabs.id`.
+1.  User opens `mail.example.com`.
 2.  Frontend loads public shell and asks the API for session state.
 3.  If signed out, show sign-in and a separate entry point for temporary
     inbox.
@@ -110,7 +110,7 @@ suitable for sensitive or long-term correspondence.
 
 ## 7. Incoming temporary email flow
 
-1.  External sender resolves the MX record for `inbox.meowlabs.id`.
+1.  External sender resolves the MX record for `inbox.example.com`.
 2.  Mail server receives and validates the message.
 3.  The server routes it to the configured temporary-address handling
     mechanism.

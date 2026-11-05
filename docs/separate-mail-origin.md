@@ -1,11 +1,11 @@
 # Rencana: origin terpisah untuk render HTML mail
 
-Status: **persiapan kode selesai, infra BELUM ada — menunggu persetujuan Arya.**
+Status: **persiapan kode selesai, infra BELUM ada — menunggu persetujuan maintainer.**
 Dokumen ini adalah rencana konkret langkah demi langkah. Tidak ada subdomain,
 DNS, nginx, sertifikat, atau service live yang diubah oleh slice ini.
 
-Subdomain yang diusulkan: **`mail-content.meowlabs.id`**
-App origin tetap: `https://mail.meowlabs.id`
+Subdomain yang diusulkan: **`mail-content.example.com`**
+App origin tetap: `https://mail.example.com`
 
 ## 1. Masalah yang diselesaikan
 
@@ -33,11 +33,11 @@ Checklist yang ditutup rencana ini: `docs/07-PRODUCTION-READINESS.md` —
   `img-src ... https:`.
 - Cookie sesi di `crates/auth/src/lib.rs` — `set_cookie()`:
   `iris_session=...; Path=/; HttpOnly; SameSite=Strict; Max-Age=...` —
-  **tanpa atribut `Domain=`**, jadi host-only untuk `mail.meowlabs.id`.
+  **tanpa atribut `Domain=`**, jadi host-only untuk `mail.example.com`.
   Cookie CSRF (`set_csrf_cookie()`) juga tanpa `Domain=`, `SameSite=Strict`.
   Verifikasi ini penting: cookie TIDAK akan terkirim ke subdomain mana
   pun, dan itu yang diinginkan — jangan pernah menambahkan
-  `Domain=.meowlabs.id`.
+  `Domain=.example.com`.
 - `deploy/nginx/iris-headers.conf` tidak memasang CSP di halaman utama
   (komentar di file: IRIS memuat Google Fonts, dan srcdoc mewarisi CSP
   halaman — `style-src` yang ketat akan merusak render mail). Snippet yang
@@ -63,9 +63,9 @@ Alur saat origin terpisah aktif:
    Server mengambil ulang pesan via JMAP (pola yang sama dengan
    `get_message_raw`), menyimpan `html_body` di memori proses di bawah
    token acak 64 hex (`auth::new_token()`), dan menjawab
-   `{url: "https://mail-content.meowlabs.id/api/v1/mailboxes/:mb/messages/:id/html-body?t=<token>"}`.
+   `{url: "https://mail-content.example.com/api/v1/mailboxes/:mb/messages/:id/html-body?t=<token>"}`.
 3. Web memasang iframe `<iframe src="<url>" sandbox="" referrerpolicy="no-referrer">`.
-   Nginx vhost `mail-content.meowlabs.id` hanya mem-proxy path itu ke
+   Nginx vhost `mail-content.example.com` hanya mem-proxy path itu ke
    `iris-api` di `127.0.0.1:8000`.
 4. `GET .../html-body?t=<token>` (tanpa sesi, tanpa cookie) mengambil
    body dari store, **menghapus token pada pemakaian pertama** — benar
@@ -120,7 +120,7 @@ Alasan ditolak:
 
 ### 3.3 Yang TIDAK diubah oleh desain ini
 
-- **Cookie sesi tetap host-only.** Tidak ada `Domain=.meowlabs.id`.
+- **Cookie sesi tetap host-only.** Tidak ada `Domain=.example.com`.
   Menambahkan itu justru membocorkan sesi ke origin konten dan
   menggagalkan seluruh tujuan pemisahan.
 - **`style-src 'unsafe-inline'` tetap ada**, baik di meta-CSP srcdoc
@@ -155,31 +155,31 @@ kosong → `htmlBodyMinter()` mengembalikan `undefined` → `messageBody`
 persis seperti sebelumnya. `MAIL_CONTENT_ORIGIN` kosong → endpoint mint
 menjawab 409 dan tidak pernah dipanggil web.
 
-## 5. Langkah infra — MENUNGGU PERSETUJUAN ARYA (jangan jalankan dulu)
+## 5. Langkah infra — MENUNGGU PERSETUJUAN MAINTAINER (jangan jalankan dulu)
 
 Urutan yang diusulkan. Setiap langkah butuh persetujuan terpisah; tidak
 ada satu pun yang dikerjakan slice ini.
 
-1. **DNS.** Tambah `mail-content.meowlabs.id` → A/AAAA ke IP VPS yang
-   sama dengan `mail.meowlabs.id` (atau CNAME ke `mail.meowlabs.id` bila
-   itu pola yang dipakai). Verifikasi: `dig +short mail-content.meowlabs.id`
+1. **DNS.** Tambah `mail-content.example.com` → A/AAAA ke IP VPS yang
+   sama dengan `mail.example.com` (atau CNAME ke `mail.example.com` bila
+   itu pola yang dipakai). Verifikasi: `dig +short mail-content.example.com`
    menjawab IP VPS.
 2. **Sertifikat.** Terbitkan sertifikat untuk nama itu mengikuti pola
-   `mail.meowlabs.id` (saat ini Let's Encrypt via certbot). Verifikasi:
-   `curl -I https://mail-content.meowlabs.id/` menjawab 404 (bukan
+   `mail.example.com` (saat ini Let's Encrypt via certbot). Verifikasi:
+   `curl -I https://mail-content.example.com/` menjawab 404 (bukan
    error TLS) sebelum vhost dipasang.
 3. **Vhost nginx baru** (draf — simpan sebagai
-   `/etc/nginx/sites-available/mail-content.meowlabs.id`, JANGAN
+   `/etc/nginx/sites-available/mail-content.example.com`, JANGAN
    mengaktifkan sebelum langkah 1–2):
 
    ```nginx
    # DRAFT — belum diterapkan.
    server {
-       server_name mail-content.meowlabs.id;
+       server_name mail-content.example.com;
        include /etc/nginx/snippets/cloudflare-realip.conf;
 
        # JANGAN include iris-headers.conf di sini: X-Frame-Options: DENY
-       # di snippet itu akan memblokir iframe dari mail.meowlabs.id.
+       # di snippet itu akan memblokir iframe dari mail.example.com.
        # Sebagai gantinya, frame-ancestors di bawah yang hanya mengizinkan
        # app origin — dan hanya untuk path render ini.
        add_header X-Content-Type-Options "nosniff" always;
@@ -194,7 +194,7 @@ ada satu pun yang dikerjakan slice ini.
            # CSP kedua: hanya frame-ancestors. CSP dari API (tanpa
            # frame-ancestors) tetap berlaku berdampingan — browser
            # menegakkan keduanya.
-           add_header Content-Security-Policy "frame-ancestors https://mail.meowlabs.id" always;
+           add_header Content-Security-Policy "frame-ancestors https://mail.example.com" always;
            limit_req zone=mail_content burst=5 nodelay;
            proxy_pass http://127.0.0.1:8000;
            proxy_http_version 1.1;
@@ -207,17 +207,17 @@ ada satu pun yang dikerjakan slice ini.
        location / { return 404; }
 
        listen 443 ssl;
-       ssl_certificate /etc/letsencrypt/live/mail-content.meowlabs.id/fullchain.pem;
-       ssl_certificate_key /etc/letsencrypt/live/mail-content.meowlabs.id/privkey.pem;
+       ssl_certificate /etc/letsencrypt/live/mail-content.example.com/fullchain.pem;
+       ssl_certificate_key /etc/letsencrypt/live/mail-content.example.com/privkey.pem;
        include /etc/letsencrypt/options-ssl-nginx.conf;
        ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
    }
 
    server {
-       if ($host = mail-content.meowlabs.id) {
+       if ($host = mail-content.example.com) {
            return 301 https://$host$request_uri;
        }
-       server_name mail-content.meowlabs.id;
+       server_name mail-content.example.com;
        listen 80;
        return 404;
    }
@@ -228,9 +228,9 @@ ada satu pun yang dikerjakan slice ini.
    saat deploy. `nginx -t` sebelum reload; `systemctl reload nginx`.
 4. **Konfigurasi service.** Di environment iris-api (systemd unit /
    secret file yang sama dengan `SESSION_SECRET`, bukan di repo):
-   `MAIL_CONTENT_ORIGIN=https://mail-content.meowlabs.id`.
+   `MAIL_CONTENT_ORIGIN=https://mail-content.example.com`.
    Restart `iris-api` (deploy biasa) agar config terbaca.
-5. **Build web dengan flag.** `VITE_MAIL_CONTENT_ORIGIN=https://mail-content.meowlabs.id`
+5. **Build web dengan flag.** `VITE_MAIL_CONTENT_ORIGIN=https://mail-content.example.com`
    saat `npm run build` (pola deploy sandbox-built release yang sudah
    dipakai), lalu deploy dist seperti biasa. Tanpa langkah ini web tetap
    srcdoc meskipun server sudah siap — kedua flag harus hidup bersamaan.
@@ -244,16 +244,16 @@ Jangan klaim sudah teruji sebelum §5 selesai.
 
 ### 6.1 Cookie tidak bocor ke subdomain
 
-1. Login di `mail.meowlabs.id`. DevTools → Application → Cookies:
+1. Login di `mail.example.com`. DevTools → Application → Cookies:
    `iris_session` dan `iris_csrf` tampil **tanpa kolom Domain**
-   (host-only) di `mail.meowlabs.id`.
+   (host-only) di `mail.example.com`.
 2. Buka satu HTML mail (mode `src` aktif). DevTools → Network:
-   request `GET .../html-body?t=...` ke `mail-content.meowlabs.id`
+   request `GET .../html-body?t=...` ke `mail-content.example.com`
    **tidak membawa header `Cookie`**, dan responsnya tidak membawa
    `Set-Cookie`.
 3. DevTools → Application → Cookies untuk origin
-   `mail-content.meowlabs.id`: kosong setelah membuka mail.
-4. Uji negatif: ubah satu cookie menjadi `Domain=.meowlabs.id` secara
+   `mail-content.example.com`: kosong setelah membuka mail.
+4. Uji negatif: ubah satu cookie menjadi `Domain=.example.com` secara
    sengaja di staging/dev dan pastikan pemeriksaan di atas menangkapnya
    (cookie muncul di origin konten). Di produksi nilai itu tidak boleh
    ada.
@@ -276,7 +276,7 @@ Jangan klaim sudah teruji sebelum §5 selesai.
 4. Header respons `html-body`: `Content-Security-Policy` sama dengan
    meta-CSP lama (bandingkan string), `Cache-Control: no-store`,
    `X-Content-Type-Options: nosniff`, dan `Content-Security-Policy:
-   frame-ancestors https://mail.meowlabs.id` dari nginx.
+   frame-ancestors https://mail.example.com` dari nginx.
 
 ### 6.3 Paritas render
 
@@ -303,7 +303,7 @@ flag web hidup = `src`), di desktop + satu ponsel:
   Sampai inline script dipindah ke file eksternal + nonce/hash, CSP
   halaman utama akan memblokir aplikasi sendiri. Pekerjaan terpisah.
 - **Subdomain / DNS / vhost / sertifikat.** Butuh persetujuan terpisah
-  dari Arya (§5).
+  dari maintainer (§5).
 - **Endpoint mint untuk temp inbox.** Temp inbox memakai auth header
   sendiri (`x-temp-token`); mint-nya butuh varian route + store yang
   terikat ke inbox id, bukan `CurrentUser`. Sengaja ditunda: temp inbox

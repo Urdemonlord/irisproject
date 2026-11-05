@@ -1,6 +1,6 @@
-# /etc/nginx/sites-available/mail.meowlabs.id — IRIS web + API (behind Cloudflare)
+# /etc/nginx/sites-available/mail.example.com — IRIS web + API (behind Cloudflare)
 server {
-    server_name mail.meowlabs.id;
+    server_name mail.example.com;
 
     # Real client IP from Cloudflare only (not spoofable by hitting the origin directly).
     include /etc/nginx/snippets/cloudflare-realip.conf;
@@ -49,17 +49,17 @@ server {
     }
 
     listen 443 ssl;
-    ssl_certificate /etc/letsencrypt/live/mail.meowlabs.id/fullchain.pem;
-    ssl_certificate_key /etc/letsencrypt/live/mail.meowlabs.id/privkey.pem;
+    ssl_certificate /etc/letsencrypt/live/mail.example.com/fullchain.pem;
+    ssl_certificate_key /etc/letsencrypt/live/mail.example.com/privkey.pem;
     include /etc/letsencrypt/options-ssl-nginx.conf;
     ssl_dhparam /etc/letsencrypt/ssl-dhparams.pem;
 }
 
 server {
-    if ($host = mail.meowlabs.id) {
+    if ($host = mail.example.com) {
         return 301 https://$host$request_uri;
     }
-    server_name mail.meowlabs.id;
+    server_name mail.example.com;
     listen 80;
     return 404;
 }

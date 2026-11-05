@@ -6,10 +6,10 @@ const api = process.env.IRIS_API_URL ?? 'http://127.0.0.1:8000'
 
 // Public, non-secret defaults. Override with env vars or apps/web/.env.production.local.
 const DEFAULTS: Record<string, string> = {
-  VITE_SITE_URL: 'https://mail.meowlabs.id',
-  VITE_CONTACT_EMAIL: 'admin@meowlabs.id',
+  VITE_SITE_URL: 'https://mail.example.com',
+  VITE_CONTACT_EMAIL: 'admin@example.com',
   VITE_CONTACT_ADDRESS: '', // postal address shown on Privacy/Terms; empty = hidden
-  VITE_ANALYTICS_SRC: 'https://analytics.meowlabs.id/script.js', // Umami
+  VITE_ANALYTICS_SRC: '', // Umami — empty = analytics off
   VITE_ANALYTICS_WEBSITE_ID: '', // Umami website ID — empty = analytics off
   VITE_MAIL_CONTENT_ORIGIN: '', // separate HTML-mail origin — empty = srcdoc frame
 }

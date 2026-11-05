@@ -153,7 +153,7 @@ mod tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
-                integration_email_from: "no-reply@meowlabs.id".into(),
+                integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 iris_timeless_service_token: String::new(),
                 iris_timeless_email_from: String::new(),

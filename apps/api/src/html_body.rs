@@ -175,8 +175,8 @@ mod tests {
     #[test]
     fn render_url_is_absolute_on_the_content_origin() {
         assert_eq!(
-            html_body_url("https://mail-content.meowlabs.id", "mb-1", "msg_2", "tok"),
-            "https://mail-content.meowlabs.id/api/v1/mailboxes/mb-1/messages/msg_2/html-body?t=tok"
+            html_body_url("https://mail-content.example.com", "mb-1", "msg_2", "tok"),
+            "https://mail-content.example.com/api/v1/mailboxes/mb-1/messages/msg_2/html-body?t=tok"
         );
     }
 }

@@ -108,7 +108,7 @@ mod tests {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         let generated = issue(
             &pool,
-            "gencv",
+            "alpha",
             "email:template:auth.verify,email:status",
             30,
             25,
@@ -122,7 +122,7 @@ mod tests {
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!(row.0, "gencv");
+        assert_eq!(row.0, "alpha");
         assert_eq!(row.1, generated.token_hash);
         assert_ne!(row.1, generated.token);
         assert_eq!(row.2, "[\"email:template:auth.verify\",\"email:status\"]");
@@ -147,19 +147,19 @@ mod tests {
     async fn rejects_cross_app_scopes_and_unbounded_limits() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         assert_eq!(
-            issue(&pool, "academy", "email:template:auth.verify", 30, 10)
+            issue(&pool, "beta", "email:template:auth.verify", 30, 10)
                 .await
                 .err(),
             Some("invalid_scopes")
         );
         assert_eq!(
-            issue(&pool, "gencv", "email:template:auth.verify", 366, 10)
+            issue(&pool, "alpha", "email:template:auth.verify", 366, 10)
                 .await
                 .err(),
             Some("invalid_limits")
         );
         assert_eq!(
-            issue(&pool, "gencv", "email:template:auth.verify", 30, 10_001)
+            issue(&pool, "alpha", "email:template:auth.verify", 30, 10_001)
                 .await
                 .err(),
             Some("invalid_limits")
