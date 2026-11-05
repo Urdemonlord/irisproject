@@ -11,7 +11,7 @@ Status as of 2026-10-30, staging (`iris-stalwart` + `iris-api`). `[x]` = verifie
 - [x] HTML email isolation: `<iframe sandbox="">` (no scripts, no same-origin), CSP `img-src data: cid:` blocks trackers and remote CSS. Proof: Playwright hostile-HTML probe (script/onerror blocked, 0 remote fetches, parent title untouched).
 - [x] Oversize mail rejected at SMTP: Stalwart `maxMessageSize` 26214400 (25 MiB), advertised in EHLO `SIZE`. Proof: smoke test sends 26 MiB with and without `SIZE=` → 5xx.
 - [ ] Rotating `SESSION_SECRET` invalidates all sealed credentials: users must log in again. Document in the ops runbook.
-- [ ] Separate origin for HTML mail rendering (TRD §6 "where feasible"); currently same-origin `srcdoc` + empty sandbox.
+- [ ] Separate origin for HTML mail rendering (TRD §6 "where feasible"); code prepared behind the flag, infra pending — see `docs/separate-mail-origin.md`. Currently same-origin `srcdoc` + empty sandbox.
 
 ## 2. Retention
 

@@ -9,6 +9,9 @@ export const SITE = {
   // Umami: script URL + website ID. Analytics stays off unless both are set.
   analyticsSrc: env.VITE_ANALYTICS_SRC || '',
   analyticsWebsiteId: env.VITE_ANALYTICS_WEBSITE_ID || '',
+  // Separate origin that serves HTML mail bodies under one-time token
+  // URLs. Empty = the app renders mail in a same-origin srcdoc iframe.
+  mailContentOrigin: env.VITE_MAIL_CONTENT_ORIGIN || '',
 }
 const analyticsConfigured = !!(SITE.analyticsSrc && SITE.analyticsWebsiteId)
 

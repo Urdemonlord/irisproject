@@ -1,4 +1,4 @@
-import { footerLinks, initSite, setPage } from './site'
+import { SITE, footerLinks, initSite, setPage } from './site'
 
 type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
@@ -246,7 +246,31 @@ const errorState = (text: string, retry?: () => void) => h('div', { className: '
 const REMOTE_IMG = /<img\b[^>]*\bsrc\s*=\s*["']?\s*(https?:)?\/\//i
 const fmtBytes = (n: number) => n < 1024 ? `${n} B` : n < 1024 * 1024 ? `${(n / 1024).toFixed(1)} KB` : `${(n / 1024 / 1024).toFixed(1)} MB`
 const previewable = (a: Attachment) => /\.gz$|\.zip$|\.xml$/i.test(a.name) || /gzip|zip|xml/i.test(a.content_type)
-function messageBody(m: Detail) {
+/** Mint a one-time render URL for `src` mode, or null when the separate
+ *  content origin is off / minting failed. Supplied by the caller
+ *  (permanent mailboxes only); temp inboxes pass nothing and stay on srcdoc. */
+type HtmlBodyMinter = (allowRemote: boolean) => Promise<string | null>
+
+/** Build the minter for a permanent mailbox message, or `undefined` when
+ *  the separate content origin is off — then messageBody stays on the
+ *  srcdoc frame, exactly as today. A mint failure resolves to null and
+ *  also falls back to srcdoc, so the user still sees the message. */
+const htmlBodyMinter = (messageUrl: string): HtmlBodyMinter | undefined =>
+  SITE.mailContentOrigin
+    ? async (allowRemote) => {
+        try {
+          const { url } = await api<{ url: string }>(`${messageUrl}/html-body-token`, {
+            method: 'POST',
+            body: JSON.stringify({ allow_remote: allowRemote }),
+          })
+          return url
+        } catch {
+          return null
+        }
+      }
+    : undefined
+
+async function messageBody(m: Detail, mintUrl?: HtmlBodyMinter) {
   if (!m.html_body) return m.text_body ? [h('pre', { className: 'mail-text' }, m.text_body)] : []
   const frame = (allowRemote: boolean) => {
     // The srcdoc frame is sandboxed (no scripts, no same-origin, no top
@@ -263,11 +287,25 @@ function messageBody(m: Detail) {
     f.setAttribute('referrerpolicy', 'no-referrer')
     return f
   }
-  let body = frame(false)
+  // Separate-origin mode: the HTML is served from MAIL_CONTENT_ORIGIN
+  // under a one-time token URL, so it never executes in the app origin.
+  // Any mint failure falls back to the srcdoc frame below.
+  const srcFrame = async (allowRemote: boolean): Promise<HTMLElement | null> => {
+    if (!mintUrl) return null
+    const src = await mintUrl(allowRemote).catch(() => null)
+    if (!src) return null
+    // sandbox without allow-same-origin / allow-scripts: the frame stays
+    // an opaque origin even if the content origin is ever misconfigured.
+    const f = h('iframe', { className: 'mail-frame', title: 'Message body', src, loading: 'lazy' })
+    f.setAttribute('sandbox', '')
+    f.setAttribute('referrerpolicy', 'no-referrer')
+    return f
+  }
+  let body: HTMLElement = (await srcFrame(false)) ?? frame(false)
   if (!REMOTE_IMG.test(m.html_body)) return [body]
   const load = btn('btn btn-secondary btn-sm', 'Load images once')
   const bar = h('div', { className: 'remote-bar' }, icon('eye'), h('span', {}, h('strong', {}, 'Remote images blocked'), ' to protect your privacy.'), load)
-  load.onclick = () => { const next = frame(true); body.replaceWith(next); body = next; bar.remove() }
+  load.onclick = async () => { const next = (await srcFrame(true)) ?? frame(true); body.replaceWith(next); body = next; bar.remove() }
   return [bar, body]
 }
 
@@ -421,7 +459,7 @@ function writeListCache(email: string, mb: string, folder: string, messages: Sum
 }
 function clearMailCache() { messageCache.clear(); try { sessionStorage.removeItem(LIST_KEY) } catch { /* ignore */ } }
 
-async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void, position: string, toolbar?: (d: Detail) => HTMLElement) {
+async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit | undefined, onAuthFail: () => void, position: string, toolbar?: (d: Detail) => HTMLElement, htmlBodyToken?: HtmlBodyMinter) {
   if (!messageCache.has(url)) reader.replaceChildren(readerSkeleton())
   try {
     const { message: m } = await prefetchMessage(url, init)
@@ -436,13 +474,13 @@ async function openMessageAt(url: string, reader: HTMLElement, init: RequestInit
           h('dt', {}, 'To'), h('dd', {}, m.to.join(', ') || '—'),
           ...(m.cc?.length ? [h('dt', {}, 'Cc'), h('dd', {}, m.cc.join(', '))] : []),
           h('dt', {}, 'Date'), h('dd', {}, h('time', { dateTime: m.received_at }, fmtDate(m.received_at))))),
-      ...messageBody(m),
+      ...(await messageBody(m, htmlBodyToken)),
       ...messageExtras(url, init, m))
     reader.focus({ preventScroll: true })
   } catch (err) {
     if ([401, 410].includes((err as HttpError).status)) return onAuthFail()
     messageCache.delete(url)
-    reader.replaceChildren(errorState('Could not open this message.', () => openMessageAt(url, reader, init, onAuthFail, position, toolbar)))
+    reader.replaceChildren(errorState('Could not open this message.', () => openMessageAt(url, reader, init, onAuthFail, position, toolbar, htmlBodyToken)))
   }
 }
 
@@ -944,7 +982,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         current = m.id
         draw()
         ui.show()
-        openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m))
+        openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m), htmlBodyMinter(url(m.id)))
       },
       onIntent: folder === 'drafts' ? undefined : (m) => prefetchMessage(url(m.id)),
     })

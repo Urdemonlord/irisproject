@@ -9,8 +9,9 @@ use axum::{
 use iris_auth as auth;
 use iris_config::limits::{
     DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
-    MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
-    MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, READ_WINDOW_MINUTES,
+    MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW,
+    MAX_SEARCH_QUERY_CHARS, MAX_TIMELESS_RESET_BODY_BYTES, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES,
+    READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
 use iris_mail::{
@@ -25,6 +26,7 @@ use std::sync::Arc;
 mod cleanup;
 mod compose;
 mod email_address;
+mod html_body;
 mod integration_apps;
 mod integration_keys;
 mod temp;
@@ -36,6 +38,9 @@ pub(crate) struct AppState {
     jmap: JmapClient,
     /// Outbound relay for other domains (None = only local domains can be reached).
     relay: Option<ResendClient>,
+    /// One-time HTML bodies minted for the separate mail-content origin.
+    /// Process-local; entries expire after `HTML_BODY_TOKEN_TTL_SECS`.
+    html_bodies: html_body::HtmlBodyStore,
 }
 
 #[derive(Clone)]
@@ -127,6 +132,7 @@ async fn main() {
     }
     let state = Arc::new(AppState {
         pool,
+        html_bodies: html_body::HtmlBodyStore::new(),
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
         relay: (!config.resend_api_key.is_empty()).then(|| {
             ResendClient::with_endpoint(
@@ -161,6 +167,10 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id/raw",
             get(get_message_raw),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/messages/:message_id/html-body-token",
+            post(mint_html_body_token),
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id/attachments/:attachment_id",
@@ -221,6 +231,10 @@ async fn main() {
         .route(
             "/api/v1/temp-inboxes/:id/messages/:message_id/raw",
             get(temp::message_raw),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/messages/:message_id/html-body",
+            get(get_html_body),
         )
         .route(
             "/api/v1/temp-inboxes/:id/messages/:message_id/attachments/:attachment_id",
@@ -941,6 +955,99 @@ async fn get_message_raw(
     raw_response(&s, &u.creds.user, &u.creds.pass, &account, &m).await
 }
 
+/// Body for minting a one-time HTML render URL.
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HtmlBodyTokenBody {
+    #[serde(default)]
+    allow_remote: bool,
+}
+
+/// Query for claiming a one-time HTML render URL.
+#[derive(Deserialize)]
+struct HtmlBodyQuery {
+    #[serde(default)]
+    t: Option<String>,
+}
+
+/// Mint a one-time render URL for this message's HTML body, served from
+/// the separate mail-content origin. The body is stored server-side under
+/// a random token (never in the URL), so the render origin never needs
+/// the session cookie — it stays host-only on the app origin. Without a
+/// configured `MAIL_CONTENT_ORIGIN` this is refused with 409 and the web
+/// keeps the srcdoc frame.
+async fn mint_html_body_token(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path((mailbox_id, message_id)): Path<(String, String)>,
+    Json(body): Json<HtmlBodyTokenBody>,
+) -> ApiResult {
+    let origin = s.config.mail_content_origin.clone();
+    if origin.is_empty() {
+        return Err(ApiError(
+            StatusCode::CONFLICT,
+            "mail_content_origin_not_configured",
+        ));
+    }
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    if !valid_message_id(&message_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    check_read_limit(&s, &u).await?;
+    let m = s
+        .jmap
+        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .await?;
+    let html = m
+        .html_body
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    if html.len() as u64 > MAX_HTML_BODY_BYTES {
+        return Err(ApiError(StatusCode::PAYLOAD_TOO_LARGE, "too_large"));
+    }
+    let token = s
+        .html_bodies
+        .mint(&mailbox_id, &message_id, body.allow_remote, html)
+        .ok_or(ApiError(
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_pending_bodies",
+        ))?;
+    Ok(Json(json!({
+        "url": html_body::html_body_url(&origin, &mailbox_id, &message_id, &token)
+    }))
+    .into_response())
+}
+
+/// Serve a stored HTML body once, under a strict CSP. No session is
+/// needed — and none is accepted: the one-time token is the whole
+/// credential, it is deleted on first use (right or wrong message), and
+/// it expires after `HTML_BODY_TOKEN_TTL_SECS`. Unknown or expired
+/// tokens answer 404, indistinguishable from a missing body.
+async fn get_html_body(
+    State(s): S,
+    Path((mailbox_id, message_id)): Path<(String, String)>,
+    Query(q): Query<HtmlBodyQuery>,
+) -> ApiResult {
+    let token = q.t.as_deref().unwrap_or_default();
+    if token.is_empty() || !valid_message_id(&message_id) {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let (html, allow_remote) = s
+        .html_bodies
+        .claim(token, &mailbox_id, &message_id)
+        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    let csp = html_body::mail_body_csp(allow_remote);
+    Ok((
+        [
+            (header::CONTENT_TYPE, "text/html; charset=utf-8"),
+            (header::CONTENT_SECURITY_POLICY, csp.as_str()),
+            (header::CACHE_CONTROL, "no-store"),
+            (header::X_CONTENT_TYPE_OPTIONS, "nosniff"),
+        ],
+        html,
+    )
+        .into_response())
+}
+
 async fn get_attachment(
     State(s): S,
     Extension(u): Extension<CurrentUser>,
@@ -1098,6 +1205,7 @@ mod timeless_password_reset_tests {
             pool,
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             relay,
+            html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -1119,6 +1227,7 @@ mod timeless_password_reset_tests {
                 iris_timeless_email_to: recipient.into(),
                 timeless_public_origin: origin.into(),
                 resend_api_url: String::new(),
+                mail_content_origin: String::new(),
             },
         })
     }
@@ -1767,6 +1876,7 @@ mod read_limit_tests {
             pool,
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             relay: None,
+            html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -1788,6 +1898,7 @@ mod read_limit_tests {
                 iris_timeless_email_to: String::new(),
                 timeless_public_origin: String::new(),
                 resend_api_url: String::new(),
+                mail_content_origin: String::new(),
             },
         })
     }
@@ -2140,6 +2251,7 @@ mod handler_integration_tests {
             pool,
             jmap: JmapClient::new(jmap.base_url.clone()),
             relay,
+            html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -2161,6 +2273,7 @@ mod handler_integration_tests {
                 iris_timeless_email_to: String::new(),
                 timeless_public_origin: String::new(),
                 resend_api_url: String::new(),
+                mail_content_origin: String::new(),
             },
         })
     }

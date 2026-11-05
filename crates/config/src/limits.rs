@@ -86,6 +86,20 @@ pub const MAX_TIMELESS_RESET_BODY_BYTES: usize = 1_024;
 /// Max request body for the transactional-email send endpoint.
 pub const MAX_TRANSACTIONAL_EMAIL_BODY_BYTES: usize = 8_192;
 
+// --- Separate mail-content origin (one-time HTML render URLs) -----------
+// The iframe `src` path serves a stored HTML body under a random one-time
+// token, so the body never crosses the wire to the browser as page data
+// and the render origin never learns the session cookie (host-only).
+
+/// Max HTML body stored for one one-time render URL (same value as
+/// MAX_RAW_BYTES, separate name: retuning one must never retune the other).
+pub const MAX_HTML_BODY_BYTES: u64 = 5_000_000;
+/// How long a minted render URL stays valid, in seconds.
+pub const HTML_BODY_TOKEN_TTL_SECS: u64 = 120;
+/// Max render URLs pending at once; minting past this is refused with 429
+/// so a runaway client cannot grow the in-memory store without bound.
+pub const MAX_PENDING_HTML_BODIES: usize = 512;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +131,8 @@ mod tests {
         assert_eq!(MAX_SEARCH_QUERY_CHARS, 200);
         assert_eq!(MAX_TIMELESS_RESET_BODY_BYTES, 1_024);
         assert_eq!(MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, 8_192);
+        assert_eq!(MAX_HTML_BODY_BYTES, 5_000_000);
+        assert_eq!(HTML_BODY_TOKEN_TTL_SECS, 120);
+        assert_eq!(MAX_PENDING_HTML_BODIES, 512);
     }
 }
