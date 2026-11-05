@@ -1025,9 +1025,13 @@ function simplePage(cls: string, ...kids: HTMLElement[]) {
   app.replaceChildren(h('header', { className: 'simple-top' }, brand('Meow Labs')), h('main', { className: cls }, ...kids), footerLinks())
 }
 
-function renderTempStart(note = '') {
+async function renderTempStart(note = '') {
   stopTemp()
   setPage({ title: 'Free temporary email', description: 'Get a free disposable email address in one click. Receive-only, no sign-up, deleted automatically after 1 hour.', path: '/#/temp' })
+  if (!account) {
+    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+  }
+  const loggedIn = !!account
   const status = h('div', { className: 'form-error', role: 'alert' }, ...(note ? [icon('alert'), note] : []))
   const create = btn('btn btn-primary btn-block', 'Create temporary address', 'pen') as HTMLButtonElement
   create.onclick = async () => {
@@ -1055,7 +1059,7 @@ function renderTempStart(note = '') {
         h('li', {}, icon('shield'), h('span', {}, 'Not for sensitive or long-term mail.'))),
       status,
       h('div', { className: 'sticky-cta' }, create),
-      h('p', { className: 'auth-alt' }, 'Have an account? ', h('a', { href: '#/', className: 'link' }, 'Sign in →'))))
+      h('p', { className: 'auth-alt' }, loggedIn ? h('a', { href: '#/', className: 'link' }, 'Go to your mailbox →') : h('span', {}, 'Have an account? ', h('a', { href: '#/', className: 'link' }, 'Sign in →'))))),
   create.focus({ preventScroll: true })
 }
 
@@ -1075,9 +1079,15 @@ function renderTempExpired(inbox: TempInbox) {
   create.focus()
 }
 
-function renderTempInbox(inbox: TempInbox, justCreated = false) {
+async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   stopTemp()
   setPage({ title: 'Your temporary inbox', description: 'Your disposable IRIS address.', path: '/#/temp', noindex: true })
+  // Resolve auth state so the topbar reflects a logged-in session instead of
+  // always showing "Sign in" (issue: logged-in users saw "Sign in" on /#/temp).
+  if (!account) {
+    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+  }
+  const loggedIn = !!account
   const auth = { headers: { authorization: `Bearer ${inbox.access_token}` } }
   const base = `/api/v1/temp-inboxes/${inbox.id}`
   const expired = () => renderTempExpired(inbox)
@@ -1124,7 +1134,10 @@ function renderTempInbox(inbox: TempInbox, justCreated = false) {
   const topbar = h('header', { className: 'topbar' },
     brand('Temporary'),
     searchBox((q) => { query = q; draw() }),
-    h('div', { className: 'topbar-right' }, h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('account'), h('span', { className: 'btn-label' }, 'Sign in')),
+    h('div', { className: 'topbar-right' },
+      loggedIn
+        ? h('span', { className: 'account-chip', title: account!.email }, icon('account'), h('span', { className: 'account-email' }, account!.email))
+        : h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('account'), h('span', { className: 'btn-label' }, 'Sign in')),
       btn('btn btn-ghost btn-icon-sm', 'Discard address', 'close', { onclick: discard })))
 
   const ui = mailShell({
@@ -1197,7 +1210,8 @@ function route() {
   const r = location.hash.replace(/^#/, '') || '/'
   if (r === '/temp') {
     const saved = savedTemp()
-    return saved ? renderTempInbox(saved) : renderTempStart()
+    if (saved) { renderTempInbox(saved).catch(() => {}); return }
+    return renderTempStart()
   }
   if (r === '/signed-out') return renderSignedOut()
   const folder = r === '/' ? 'inbox' : FOLDERS.find((f) => `/${f.role}` === r)?.role
