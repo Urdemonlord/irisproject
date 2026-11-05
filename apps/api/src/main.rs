@@ -1453,6 +1453,174 @@ mod timeless_password_reset_tests {
     }
 
     #[tokio::test]
+    async fn transactional_email_failed_unknown_and_sending_attempts_do_not_consume_daily_quota() {
+        let relay = fake_relay().await;
+        let app = state(
+            SERVICE_KEY,
+            "no-reply@meowlabs.id",
+            "unused@example.test",
+            "example.test",
+            Some(ResendClient::with_endpoint(
+                "test-relay-key".into(),
+                relay.endpoint.clone(),
+            )),
+        )
+        .await;
+        let generated = auth::generate_api_key();
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
+            .bind(&generated.key_id)
+            .bind("gencv")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify"]).to_string())
+            .bind(auth::now())
+            .bind(expiry)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+
+        // One row per non-accepted outcome today, plus an accepted row from
+        // yesterday: none of them may consume today's quota.
+        let now = auth::now();
+        let yesterday = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        let insert = "INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)";
+        for (id, idempotency_key, status, created_at) in [
+            ("seed-failed", "seed-failed", "failed", now.as_str()),
+            ("seed-unknown", "seed-unknown", "unknown", now.as_str()),
+            ("seed-sending", "seed-sending", "sending", now.as_str()),
+            (
+                "seed-old-accepted",
+                "seed-old-accepted",
+                "accepted",
+                yesterday.as_str(),
+            ),
+        ] {
+            sqlx::query(insert)
+                .bind(id)
+                .bind(&generated.key_id)
+                .bind(idempotency_key)
+                .bind("auth.verify")
+                .bind("b".repeat(64))
+                .bind("c".repeat(64))
+                .bind(status)
+                .bind(created_at)
+                .bind(created_at)
+                .execute(&app.pool)
+                .await
+                .unwrap();
+        }
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", generated.token).parse().unwrap(),
+        );
+        let body = || transactional_email::SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+        };
+
+        headers.insert("idempotency-key", "quota-free-first".parse().unwrap());
+        let first = transactional_email::send(State(app.clone()), headers.clone(), Json(body()))
+            .await
+            .unwrap();
+        assert_eq!(first.status(), StatusCode::ACCEPTED);
+        let _payload = timeout(Duration::from_secs(1), relay.payload)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // That accepted send consumed the single daily slot, so the next
+        // fresh request is rejected even though most rows today failed.
+        headers.insert("idempotency-key", "quota-used-up".parse().unwrap());
+        let rejected = transactional_email::send(State(app.clone()), headers, Json(body()))
+            .await
+            .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.1, "daily_limit_reached");
+        assert_eq!(relay.calls.load(Ordering::SeqCst), 1);
+        let request_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_email_requests")
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(request_count, 5);
+        relay.task.abort();
+    }
+
+    #[tokio::test]
+    async fn transactional_email_daily_quota_rejects_once_accepted_sends_reach_the_limit() {
+        let mut relay = fake_relay().await;
+        let app = state(
+            SERVICE_KEY,
+            "no-reply@meowlabs.id",
+            "unused@example.test",
+            "example.test",
+            Some(ResendClient::with_endpoint(
+                "test-relay-key".into(),
+                relay.endpoint.clone(),
+            )),
+        )
+        .await;
+        let generated = auth::generate_api_key();
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1)")
+            .bind(&generated.key_id)
+            .bind("gencv")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify"]).to_string())
+            .bind(auth::now())
+            .bind(expiry)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+
+        // Exactly at the limit: one accepted send today already.
+        let now = auth::now();
+        sqlx::query("INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+            .bind("seed-accepted")
+            .bind(&generated.key_id)
+            .bind("seed-accepted")
+            .bind("auth.verify")
+            .bind("b".repeat(64))
+            .bind("c".repeat(64))
+            .bind("accepted")
+            .bind(&now)
+            .bind(&now)
+            .execute(&app.pool)
+            .await
+            .unwrap();
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            header::AUTHORIZATION,
+            format!("Bearer {}", generated.token).parse().unwrap(),
+        );
+        headers.insert("idempotency-key", "quota-at-limit".parse().unwrap());
+        let rejected = transactional_email::send(
+            State(app.clone()),
+            headers,
+            Json(transactional_email::SendEmailBody {
+                template_id: "auth.verify".into(),
+                recipient: "user@example.test".into(),
+                action_url: "https://gencv.meowlabs.id/verify?token=abc".into(),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(rejected.0, StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(rejected.1, "daily_limit_reached");
+        let request_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM integration_email_requests")
+                .fetch_one(&app.pool)
+                .await
+                .unwrap();
+        assert_eq!(request_count, 1);
+        assert_no_relay_call(&mut relay).await;
+    }
+
+    #[tokio::test]
     async fn migration_creates_scoped_integration_key_and_idempotency_tables() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         let keys: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys")

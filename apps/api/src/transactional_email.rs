@@ -223,12 +223,23 @@ pub async fn send(
         .unwrap()
         .and_utc()
         .to_rfc3339();
-    let (sent_today, daily_limit): (i64, i64) = sqlx::query_as(
-        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? WHERE k.key_id=? GROUP BY k.key_id",
+    // Daily quota counts only requests the provider accepted. A `failed`
+    // attempt was rejected by the provider, an `unknown` attempt never
+    // got a delivery verdict, and a `sending` row is still in flight (or
+    // its sender crashed mid-send), so none of them consumed a delivery
+    // and none of them consumes quota.
+    //
+    // The current request's row was just inserted as `sending`, so it is
+    // not counted here; the boundary is therefore `>=` rather than the
+    // old `>`, which only held because the current row was counted. The
+    // limit value itself is unchanged: at most `daily_send_limit`
+    // accepted sends per key per day.
+    let (accepted_today, daily_limit): (i64, i64) = sqlx::query_as(
+        "SELECT COUNT(r.id), k.daily_send_limit FROM integration_keys k LEFT JOIN integration_email_requests r ON r.key_id=k.key_id AND r.created_at>=? AND r.status='accepted' WHERE k.key_id=? GROUP BY k.key_id",
     )
     .bind(utc_start).bind(&principal.key_id).fetch_one(&mut *tx).await
     .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
-    if sent_today > daily_limit {
+    if accepted_today >= daily_limit {
         tx.rollback()
             .await
             .map_err(|_| crate::ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
