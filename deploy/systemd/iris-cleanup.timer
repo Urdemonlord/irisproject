@@ -1,0 +1,16 @@
+# Out-of-process IRIS retention safety net. NOT enabled by default — see README.md
+# in this directory for the activation steps (needs a separate approval).
+[Unit]
+Description=IRIS retention safety net (temp inbox cleanup while the API is down)
+After=network.target
+
+[Timer]
+# The in-process job runs every 60 s while the API is alive; the timer is only
+# a safety net for when the API is down, so every 15 min is enough.
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+Unit=iris-cleanup.service
+
+[Install]
+WantedBy=timers.target

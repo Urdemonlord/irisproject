@@ -92,7 +92,8 @@ async fn main() {
         .await
         .expect("database");
     let mut args = std::env::args().skip(1);
-    if args.next().as_deref() == Some("integration-key") {
+    let first_arg = args.next();
+    if first_arg.as_deref() == Some("integration-key") {
         let command: Vec<String> = args.collect();
         match integration_keys::run(&pool, &command).await {
             Ok(output) => print!("{output}"),
@@ -114,6 +115,17 @@ async fn main() {
         }),
         config: config.clone(),
     });
+    if first_arg.as_deref() == Some("cleanup-once") {
+        // Out-of-process safety net (iris-cleanup.timer): one retention pass, then exit.
+        // No HTTP server is started and the in-process loop is not spawned.
+        match cleanup::run_once(&state).await {
+            Ok(()) => return,
+            Err(e) => {
+                eprintln!("cleanup-once error: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
     tokio::spawn(cleanup::run(state.clone()));
 
     let protected = Router::new()

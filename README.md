@@ -70,7 +70,7 @@ cp .env.example .env   # then edit
 | `IRIS_TIMELESS_EMAIL_TO` | fixed recovery recipient; store only in the ignored, mode-600 `.env` or deployment secret store; never accept from request data |
 
 Migrations run automatically on start. Run under systemd (`Restart=always`) as an unprivileged user.
-The cleanup job runs inside the API every 60 s (log line `cleanup marked=… purged=…`); no cron needed.
+The cleanup job runs inside the API every 60 s (log line `cleanup marked=… purged=…`). As a safety net for when the API is down, `iris-api cleanup-once` runs one retention pass and exits; [`deploy/systemd/iris-cleanup.timer`](deploy/systemd/iris-cleanup.timer) runs it every 15 min. The timer is inert until activated — see [`deploy/systemd/README.md`](deploy/systemd/README.md) for the activation steps (separate approval) and rollback; overlapping runs with a live API are safe.
 
 Login does not keep the user's password: it mints a Stalwart app password per session (expires with the
 session, destroyed on logout) and stores it ChaCha20-Poly1305-sealed in SQLite.
