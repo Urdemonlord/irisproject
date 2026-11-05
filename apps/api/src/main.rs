@@ -19,6 +19,7 @@ use std::sync::Arc;
 
 mod cleanup;
 mod compose;
+mod integration_apps;
 mod integration_keys;
 mod temp;
 mod transactional_email;

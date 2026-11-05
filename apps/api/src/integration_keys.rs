@@ -1,17 +1,6 @@
+use crate::integration_apps::scope_allowed;
 use iris_auth as auth;
 use sqlx::SqlitePool;
-
-fn scope_allowed(app_id: &str, scope: &str) -> bool {
-    matches!(
-        (app_id, scope),
-        ("gencv", "email:template:auth.verify")
-            | ("gencv", "email:template:auth.recovery")
-            | ("aksaria", "email:template:auth.recovery")
-            | ("aksaria", "email:template:auth.verification")
-            | ("academy", "email:template:auth.login_link")
-            | (_, "email:status")
-    )
-}
 
 fn valid_key_id(key_id: &str) -> bool {
     key_id.len() == 32
@@ -27,7 +16,7 @@ async fn issue(
     expires_days: u32,
     daily_limit: u32,
 ) -> Result<auth::GeneratedApiKey, &'static str> {
-    if !matches!(app_id, "gencv" | "academy" | "aksaria") {
+    if crate::integration_apps::app(app_id).is_none() {
         return Err("unsupported_app");
     }
     if !(1..=365).contains(&expires_days) || !(1..=10_000).contains(&daily_limit) {
@@ -89,19 +78,24 @@ async fn revoke(pool: &SqlitePool, key_id: &str) -> Result<(), &'static str> {
 }
 
 /// Local operator command: returns a new plaintext token exactly once to the caller.
-pub(crate) async fn run(pool: &SqlitePool, args: &[String]) -> Result<String, &'static str> {
+pub(crate) async fn run(pool: &SqlitePool, args: &[String]) -> Result<String, String> {
     match args {
         [action, app_id, days, limit, scopes] if action == "create" => {
-            let expires_days = days.parse().map_err(|_| "invalid_limits")?;
-            let daily_limit = limit.parse().map_err(|_| "invalid_limits")?;
-            let generated = issue(pool, app_id, scopes, expires_days, daily_limit).await?;
+            let expires_days = days.parse().map_err(|_| "invalid_limits".to_string())?;
+            let daily_limit = limit.parse().map_err(|_| "invalid_limits".to_string())?;
+            let generated = issue(pool, app_id, scopes, expires_days, daily_limit)
+                .await
+                .map_err(|err| err.to_string())?;
             Ok(format!("key_id={}\ntoken={}\n", generated.key_id, generated.token))
         }
         [action, key_id] if action == "revoke" => {
-            revoke(pool, key_id).await?;
+            revoke(pool, key_id).await.map_err(|err| err.to_string())?;
             Ok(format!("revoked key_id={key_id}\n"))
         }
-        _ => Err("usage: integration-key create <gencv|academy|aksaria> <expires-days> <daily-limit> <comma-separated-scopes> | integration-key revoke <key-id>"),
+        _ => Err(format!(
+            "usage: integration-key create <{}> <expires-days> <daily-limit> <comma-separated-scopes> | integration-key revoke <key-id>",
+            crate::integration_apps::app_id_choices()
+        )),
     }
 }
 

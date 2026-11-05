@@ -62,11 +62,8 @@ async fn authenticate(
 }
 
 fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
-    let allowed_host = match app_id {
-        "gencv" => "gencv.meowlabs.id",
-        "academy" => "academy.meowlabs.id",
-        "aksaria" => "aksaria.meowlabs.id",
-        _ => return false,
+    let Some(app) = crate::integration_apps::app(app_id) else {
+        return false;
     };
 
     let Ok(url) = reqwest::Url::parse(raw_url) else {
@@ -74,7 +71,7 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
     };
 
     url.scheme() == "https"
-        && url.host_str() == Some(allowed_host)
+        && url.host_str() == Some(app.host)
         && url.port_or_known_default() == Some(443)
         && url.username().is_empty()
         && url.password().is_none()
@@ -153,38 +150,15 @@ fn render_message(
     if !valid_recipient(recipient) || !action_url_allowed(app_id, action_url) {
         return Err("invalid request");
     }
-    let (subject, intro, closing) = match (app_id, template_id) {
-        ("gencv", "auth.verify") => (
-            "Verify your GenCV email",
-            "Verify your email address to finish setting up GenCV.",
-            "If you did not create a GenCV account, ignore this message.",
-        ),
-        ("gencv", "auth.recovery") => (
-            "Reset your GenCV password",
-            "Use this link to reset your GenCV password.",
-            "If you did not request a password reset, ignore this message.",
-        ),
-        ("academy", "auth.login_link") => (
-            "Your MeowLabs Academy sign-in link",
-            "Use this one-time link to sign in to MeowLabs Academy.",
-            "If you did not request this link, ignore this message.",
-        ),
-        ("aksaria", "auth.recovery") => (
-            "Reset kata sandi Aksaria",
-            "Gunakan tautan ini untuk mengatur ulang kata sandi Aksaria.",
-            "Jika kamu tidak meminta reset ini, abaikan pesan ini.",
-        ),
-        ("aksaria", "auth.verification") => (
-            "Verifikasi email Aksaria",
-            "Gunakan tautan ini untuk memverifikasi email akun Aksaria. Tautan berlaku 24 jam.",
-            "Jika kamu tidak mendaftar di Aksaria, abaikan pesan ini.",
-        ),
-        _ => return Err("unknown template"),
+    let Some(template) =
+        crate::integration_apps::app(app_id).and_then(|app| app.template(template_id))
+    else {
+        return Err("unknown template");
     };
     Ok(iris_mail::Compose {
         to: vec![recipient.to_string()],
-        subject: subject.to_string(),
-        text: format!("{intro}\n\n{action_url}\n\n{closing}"),
+        subject: template.subject.to_string(),
+        text: format!("{}\n\n{action_url}\n\n{}", template.intro, template.closing),
         ..Default::default()
     })
 }
