@@ -7,6 +7,7 @@ fn scope_allowed(app_id: &str, scope: &str) -> bool {
         ("gencv", "email:template:auth.verify")
             | ("gencv", "email:template:auth.recovery")
             | ("aksaria", "email:template:auth.recovery")
+            | ("aksaria", "email:template:auth.verification")
             | ("academy", "email:template:auth.login_link")
             | (_, "email:status")
     )

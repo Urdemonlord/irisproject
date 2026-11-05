@@ -145,6 +145,11 @@ fn render_message(
             "Gunakan tautan ini untuk mengatur ulang kata sandi Aksaria.",
             "Jika kamu tidak meminta reset ini, abaikan pesan ini.",
         ),
+        ("aksaria", "auth.verification") => (
+            "Verifikasi email Aksaria",
+            "Gunakan tautan ini untuk memverifikasi email akun Aksaria. Tautan berlaku 24 jam.",
+            "Jika kamu tidak mendaftar di Aksaria, abaikan pesan ini.",
+        ),
         _ => return Err("unknown template"),
     };
     Ok(iris_mail::Compose {
