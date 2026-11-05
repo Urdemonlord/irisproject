@@ -9,6 +9,12 @@ pub struct Config {
     pub port: u16,
     pub database_url: String,
     pub session_secret: String,
+    /// Cloudflare Turnstile secret key for login verification. Empty =
+    /// disabled: logins skip the Turnstile check (see
+    /// `apps/api/src/turnstile.rs`). Read from `TURNSTILE_SECRET_KEY`;
+    /// never ship it to the browser — the public half is the
+    /// `VITE_TURNSTILE_SITE_KEY` build-time variable of the web app.
+    pub turnstile_secret_key: String,
     pub stalwart_api_url: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
@@ -69,6 +75,7 @@ impl Config {
                 .unwrap_or_else(|_| "sqlite:iris.db".to_string()),
             session_secret: std::env::var("SESSION_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-in-prod".to_string()),
+            turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default(),
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")

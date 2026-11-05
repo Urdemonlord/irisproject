@@ -31,11 +31,16 @@ mod integration_apps;
 mod integration_keys;
 mod temp;
 mod transactional_email;
+mod turnstile;
 
 pub(crate) struct AppState {
     pool: SqlitePool,
     config: Config,
     jmap: JmapClient,
+    /// Shared outbound HTTP client (Turnstile Siteverify). One client for
+    /// the process, like `JmapClient`'s own; a fresh client per login
+    /// would throw away connection reuse on every attempt.
+    http: reqwest::Client,
     /// Outbound relay for other domains (None = only local domains can be reached).
     relay: Option<ResendClient>,
     /// One-time HTML bodies minted for the separate mail-content origin.
@@ -109,6 +114,15 @@ impl From<MailError> for ApiError {
 async fn main() {
     tracing_subscriber::fmt::init();
     let config = Config::from_env().expect("config");
+    if config.turnstile_secret_key.is_empty() {
+        // Logged once at startup, not per login: an unconfigured
+        // deployment skips Turnstile verification entirely (see
+        // `turnstile::verify`), so this is the one place the operator
+        // learns the login form is unprotected.
+        tracing::warn!(
+            "turnstile: TURNSTILE_SECRET_KEY is not set; login Turnstile verification is disabled"
+        );
+    }
     if config.env == "production"
         && (config.session_secret.len() < 32 || config.session_secret.starts_with("dev-secret"))
     {
@@ -134,6 +148,10 @@ async fn main() {
         pool,
         html_bodies: html_body::HtmlBodyStore::new(),
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
+        http: reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(10))
+            .build()
+            .expect("reqwest client"),
         relay: (!config.resend_api_key.is_empty()).then(|| {
             ResendClient::with_endpoint(
                 config.resend_api_key.clone(),
@@ -416,6 +434,11 @@ async fn require_csrf(headers: HeaderMap, req: Request, next: Next) -> Response 
 struct LoginBody {
     email: String,
     password: String,
+    /// Cloudflare Turnstile token from the login widget. Absent when the
+    /// widget is off (no site key) or the client is not a browser; the
+    /// server only requires it while `TURNSTILE_SECRET_KEY` is set.
+    #[serde(default)]
+    turnstile_token: Option<String>,
 }
 
 /// Peer IP; trust X-Real-IP only when the peer is the local reverse proxy.
@@ -457,6 +480,37 @@ async fn login(
     ).bind(&ip_subject).bind(&since).fetch_one(&s.pool).await?;
     if ip_failures >= MAX_FAILED_LOGINS_PER_IP {
         return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"));
+    }
+
+    // Bot gate, after the cheap rate-limit checks and before any JMAP
+    // attempt: a failed check never touches the mail server and never
+    // records a login failure. Off entirely while no secret is
+    // configured (see `turnstile::verify`).
+    if !s.config.turnstile_secret_key.is_empty() {
+        match turnstile::verify(
+            &s.http,
+            &s.config.turnstile_secret_key,
+            b.turnstile_token.as_deref(),
+            &ip,
+            turnstile::SITEVERIFY_URL,
+        )
+        .await
+        {
+            Ok(()) => {}
+            Err(turnstile::TurnstileError::MissingToken)
+            | Err(turnstile::TurnstileError::Invalid) => {
+                return Err(ApiError(StatusCode::BAD_REQUEST, "turnstile_failed"));
+            }
+            Err(turnstile::TurnstileError::Unavailable) => {
+                // Fail closed: a login that cannot be verified does not go
+                // through, even though the credentials themselves are
+                // still unchecked at this point.
+                return Err(ApiError(
+                    StatusCode::SERVICE_UNAVAILABLE,
+                    "turnstile_unavailable",
+                ));
+            }
+        }
     }
 
     let account_id = match s.jmap.login(&email, &b.password).await {
@@ -1218,6 +1272,7 @@ mod password_reset_webhook_tests {
         Arc::new(AppState {
             pool,
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
+            http: reqwest::Client::new(),
             relay,
             html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
@@ -1226,6 +1281,7 @@ mod password_reset_webhook_tests {
                 port: 8000,
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
+                turnstile_secret_key: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -1928,6 +1984,7 @@ mod read_limit_tests {
         Arc::new(AppState {
             pool,
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
+            http: reqwest::Client::new(),
             relay: None,
             html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
@@ -1936,6 +1993,7 @@ mod read_limit_tests {
                 port: 8000,
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
+                turnstile_secret_key: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -2303,6 +2361,7 @@ mod handler_integration_tests {
         Arc::new(AppState {
             pool,
             jmap: JmapClient::new(jmap.base_url.clone()),
+            http: reqwest::Client::new(),
             relay,
             html_bodies: html_body::HtmlBodyStore::new(),
             config: Config {
@@ -2311,6 +2370,7 @@ mod handler_integration_tests {
                 port: 8000,
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
+                turnstile_secret_key: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
