@@ -98,6 +98,8 @@ const errorText: Record<string, string> = {
   too_many_attempts: 'Too many attempts. Try again in 15 minutes.',
   too_many_reads: 'Too many reads. Wait a moment and try again.',
   mail_server_unavailable: 'Mail server is unavailable. Try again shortly.',
+  mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
+  database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
   network: 'Can’t reach IRIS. Check your connection and try again.',
 }
 const tempErrors: Record<string, string> = {
@@ -530,6 +532,8 @@ const sendErrors: Record<string, string> = {
   no_recipients: 'Add at least one recipient.',
   too_many_recipients: 'Too many recipients (50 max).',
   send_rejected: 'The mail server refused this message.',
+  mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
+  database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
   network: errorText.network,
 }
 

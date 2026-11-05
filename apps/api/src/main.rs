@@ -64,17 +64,38 @@ impl IntoResponse for ApiError {
 impl From<sqlx::Error> for ApiError {
     fn from(e: sqlx::Error) -> Self {
         tracing::error!("db: {e}");
-        ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
+        match e {
+            // A query that found no row is a client-visible "not found",
+            // not a bug in our own code.
+            sqlx::Error::RowNotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
+            // The pool is exhausted, closed, or its worker died: a
+            // transient outage, retryable, and operationally distinct
+            // from an internal error.
+            sqlx::Error::PoolTimedOut | sqlx::Error::PoolClosed | sqlx::Error::WorkerCrashed => {
+                ApiError(StatusCode::SERVICE_UNAVAILABLE, "database_unavailable")
+            }
+            _ => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+        }
     }
 }
 impl From<MailError> for ApiError {
     fn from(e: MailError) -> Self {
+        // Only the generic code reaches the client; the detail in `{e}`
+        // (upstream response bodies, transport errors) stays in the
+        // server log, never in the response.
         tracing::warn!("mail: {e}");
         match e {
             MailError::Auth => ApiError(StatusCode::UNAUTHORIZED, "unauthorized"),
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
             MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
-            _ => ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable"),
+            // The mail server could not be reached at all.
+            MailError::Unavailable(_) => {
+                ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable")
+            }
+            // The mail server answered, but with something unexpected
+            // (bad JMAP response, undecodable blob): reachable yet
+            // misbehaving, a different cause from a transport failure.
+            MailError::Protocol(_) => ApiError(StatusCode::BAD_GATEWAY, "mail_server_error"),
         }
     }
 }
@@ -1821,5 +1842,65 @@ mod read_limit_tests {
             (chrono::Utc::now() - chrono::Duration::minutes(READ_WINDOW_MINUTES + 1)).to_rfc3339();
         seed_reads(&s.pool, "alice", MAX_READS_PER_WINDOW, &old).await;
         check_read_limit(&s, &user("alice")).await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    fn code(err: ApiError) -> (StatusCode, &'static str) {
+        (err.0, err.1)
+    }
+
+    #[test]
+    fn mail_errors_keep_their_category() {
+        assert_eq!(
+            code(ApiError::from(MailError::Auth)),
+            (StatusCode::UNAUTHORIZED, "unauthorized")
+        );
+        assert_eq!(
+            code(ApiError::from(MailError::NotFound)),
+            (StatusCode::NOT_FOUND, "not_found")
+        );
+        assert_eq!(
+            code(ApiError::from(MailError::Rejected("nope".into()))),
+            (StatusCode::UNPROCESSABLE_ENTITY, "send_rejected")
+        );
+        assert_eq!(
+            code(ApiError::from(MailError::Unavailable("down".into()))),
+            (StatusCode::BAD_GATEWAY, "mail_server_unavailable")
+        );
+    }
+
+    #[test]
+    fn mail_protocol_errors_are_not_reported_as_unavailable() {
+        // The server answered but with an unexpected response: reachable
+        // yet misbehaving, a different cause from a transport failure.
+        // The client-facing code stays generic; no detail leaks.
+        assert_eq!(
+            code(ApiError::from(MailError::Protocol(
+                "unexpected response: internal detail".into()
+            ))),
+            (StatusCode::BAD_GATEWAY, "mail_server_error")
+        );
+    }
+
+    #[test]
+    fn db_errors_keep_their_category() {
+        assert_eq!(
+            code(ApiError::from(sqlx::Error::RowNotFound)),
+            (StatusCode::NOT_FOUND, "not_found")
+        );
+        for e in [
+            sqlx::Error::PoolTimedOut,
+            sqlx::Error::PoolClosed,
+            sqlx::Error::WorkerCrashed,
+        ] {
+            assert_eq!(
+                code(ApiError::from(e)),
+                (StatusCode::SERVICE_UNAVAILABLE, "database_unavailable")
+            );
+        }
     }
 }
