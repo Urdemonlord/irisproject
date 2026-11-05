@@ -1,5 +1,7 @@
 # IRIS
 
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](LICENSE-MIT)
+
 A self-hosted email platform combining permanent mailboxes and temporary inboxes.
 
 ## Documentation
@@ -131,4 +133,9 @@ Then work through `docs/07-PRODUCTION-READINESS.md` (TLS, backups, monitoring, p
 
 ## License
 
-TBD
+Licensed under either of
+
+- Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE) or https://www.apache.org/licenses/LICENSE-2.0)
+- MIT license ([LICENSE-MIT](LICENSE-MIT) or https://opensource.org/licenses/MIT)
+
+at your option.
