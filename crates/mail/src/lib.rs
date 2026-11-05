@@ -1035,6 +1035,11 @@ fn read_limited<R: std::io::Read>(r: R) -> std::io::Result<(Vec<u8>, bool)> {
 /// (`.xml.gz`, the usual DMARC shape), or a zip archive (Google also ships
 /// `.zip`; the first `.xml` entry wins). Anything else is an error, so the
 /// UI can fall back to "download" instead of showing binary garbage.
+/// ZIP preview rule: only a `.xml` entry is ever rendered as text. A zip
+/// with no `.xml` entry — including an empty archive — is `not_previewable`
+/// (HTTP 415, UI offers a download), never the first entry whatever it is:
+/// rendering an arbitrary entry through `from_utf8_lossy` would show binary
+/// garbage as if it were a DMARC report.
 /// Decompression is capped at `MAX_PREVIEW_TEXT`; oversized output is
 /// truncated, never buffered without bound.
 pub fn extract_text_attachment(
@@ -1066,6 +1071,11 @@ pub fn extract_text_attachment(
         use std::io::Cursor;
         let mut archive = zip::ZipArchive::new(Cursor::new(bytes))
             .map_err(|e| MailError::Protocol(format!("zip open failed: {e}")))?;
+        // ZIP preview rule: the first `.xml` entry wins; every other entry
+        // is ignored. A zip with no `.xml` entry (including an empty
+        // archive) is `not_previewable`, so the API answers 415 and the UI
+        // offers a download instead of rendering an arbitrary entry — e.g.
+        // a binary blob — as lossy text.
         let mut pick: Option<usize> = None;
         for i in 0..archive.len() {
             let file = archive
@@ -1074,16 +1084,12 @@ pub fn extract_text_attachment(
             if file.is_dir() {
                 continue;
             }
-            let fname = file.name().to_string();
-            if fname.to_lowercase().ends_with(".xml") {
+            if file.name().to_lowercase().ends_with(".xml") {
                 pick = Some(i);
                 break;
             }
-            if pick.is_none() {
-                pick = Some(i);
-            }
         }
-        let i = pick.ok_or_else(|| MailError::Protocol("empty archive".into()))?;
+        let i = pick.ok_or_else(|| MailError::Protocol("not_previewable".into()))?;
         let mut file = archive
             .by_index(i)
             .map_err(|e| MailError::Protocol(e.to_string()))?;
@@ -1319,6 +1325,65 @@ mod tests {
         assert!(out.text.contains("<feedback>"));
 
         assert!(extract_text_attachment("photo.png", "image/png", b"not-text").is_err());
+    }
+
+    #[test]
+    fn zip_without_xml_entry_is_not_previewable() {
+        use std::io::Write;
+        // Regression: the first entry used to be picked whatever it was and
+        // rendered through `from_utf8_lossy`, so a zip of a text file or a
+        // binary blob showed up as a bogus "DMARC preview". Now only a
+        // `.xml` entry is previewable; anything else is `not_previewable`
+        // (API 415, UI offers a download).
+        let mut buf = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut buf);
+            zip.start_file("notes.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"not a dmarc report").unwrap();
+            zip.start_file("blob.bin", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(&[0xff, 0xfe, 0x00, 0x01]).unwrap();
+            zip.finish().unwrap();
+        }
+        assert!(matches!(
+            extract_text_attachment("report.zip", "application/zip", buf.get_ref()),
+            Err(MailError::Protocol(msg)) if msg == "not_previewable"
+        ));
+
+        // An archive with no entries at all is not previewable either.
+        let mut empty = std::io::Cursor::new(Vec::new());
+        zip::ZipWriter::new(&mut empty).finish().unwrap();
+        assert!(matches!(
+            extract_text_attachment("empty.zip", "application/zip", empty.get_ref()),
+            Err(MailError::Protocol(msg)) if msg == "not_previewable"
+        ));
+
+        // ...but a `.xml` entry still previews even when it is not the
+        // first entry in the archive.
+        let xml = "<feedback><report_metadata><org_name>google.com</org_name></report_metadata></feedback>";
+        let mut mixed = std::io::Cursor::new(Vec::new());
+        {
+            let mut zip = zip::ZipWriter::new(&mut mixed);
+            zip.start_file("readme.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            zip.write_all(b"ignore me").unwrap();
+            zip.start_file(
+                "google.com!meowlabs.id!1!2.xml",
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            zip.write_all(xml.as_bytes()).unwrap();
+            zip.finish().unwrap();
+        }
+        let out = extract_text_attachment(
+            "google.com!meowlabs.id!1!2.zip",
+            "application/zip",
+            mixed.get_ref(),
+        )
+        .unwrap();
+        assert!(out.inner_name.ends_with(".xml"));
+        assert!(out.text.contains("<feedback>"));
     }
 
     #[test]
