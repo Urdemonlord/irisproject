@@ -4,6 +4,18 @@
 
 A self-hosted email platform combining permanent mailboxes and temporary inboxes.
 
+- **Permanent mailboxes** — sign in with your mail-server account; five fixed
+  folders (Inbox, Sent, Drafts, Archive, Trash), server-side search,
+  plain-text compose with autosave drafts, reply/forward, attachments,
+  raw view, and DMARC report previews.
+- **Temporary inboxes** — anonymous, receive-only addresses that live 1 hour,
+  no sign-up. Web UI: `/#/temp`.
+- **Transactional email API** — scoped API keys let your own apps send
+  auth emails (verify, password reset, sign-in link) through IRIS.
+- **Separate HTML-mail origin** — HTML bodies can render in an isolated
+  origin behind one-time tokens instead of the app origin (see
+  [`docs/separate-mail-origin.md`](docs/separate-mail-origin.md)).
+
 ## Documentation
 
 - [PRD](docs/01-PRD.md) — Product Requirements
@@ -14,22 +26,42 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - [IPD](docs/06-IPD.md) — Implementation Plan
 - [Design System](docs/design.md) — UI/UX Design
 - [Production Readiness](docs/07-PRODUCTION-READINESS.md) — launch checklist + DNS status
+- [Roadmap](ROADMAP.md) — what is built and what is planned
 
-## Quick start
+## Prerequisites
+
+- Rust stable toolchain (`cargo`)
+- Node.js 22 (`npm`)
+- A mail server with a JMAP API — IRIS is built against
+  [Stalwart](https://stalw.art/) (JMAP on loopback, e.g.
+  `http://127.0.0.1:8092`). One account per permanent mailbox, plus one
+  catch-all account receiving `*@TEMP_INBOX_DOMAIN`.
+- A TLS reverse proxy for production (examples in [`deploy/`](deploy/):
+  nginx or Caddy).
+- DNS for your domains: MX, SPF, DKIM, DMARC, PTR — see
+  [`docs/07-PRODUCTION-READINESS.md`](docs/07-PRODUCTION-READINESS.md) §4.
+
+## Quick start (local dev)
 
 ```bash
-cargo build
+git clone https://github.com/Urdemonlord/irisproject.git
+cd irisproject
+cp .env.example .env   # then edit: SESSION_SECRET, STALWART_API_URL, TEMP_INBOX_* values
+cargo run -p iris-api  # API on http://127.0.0.1:8000 (migrations run on start)
 npm --prefix apps/web install
-npm --prefix apps/web run dev
+npm --prefix apps/web run dev   # web on http://127.0.0.1:5173, proxies /api + /auth to the API
 ```
 
-See `docs/06-IPD.md` for the phased implementation roadmap.
+Open http://127.0.0.1:5173, sign in with a mail-server account, or grab a
+temporary inbox at `/#/temp`. No seed data and no demo accounts: everything
+you see comes from your own mail server.
 
-## Temporary inbox (Phase 3)
+## Temporary inbox
 
-Anonymous, receive-only, 1-hour addresses at `TEMP_INBOX_DOMAIN`. Web UI: `/#/temp`.
-Mail server routes `*@TEMP_INBOX_DOMAIN` to one catch-all mailbox (`TEMP_INBOX_MAIL_USER`);
-each inbox sees only messages whose `To:` is its address and that arrived after creation.
+Anonymous, receive-only, 1-hour addresses at `TEMP_INBOX_DOMAIN`.
+Web UI: `/#/temp`. The mail server routes `*@TEMP_INBOX_DOMAIN` to one
+catch-all mailbox (`TEMP_INBOX_MAIL_USER`); each inbox sees only messages
+whose `To:` is its address and that arrived after creation.
 
 ```text
 POST /api/v1/temp-inboxes                          -> 201 {id, address, access_token, expires_at, expires_in_seconds}
@@ -41,6 +73,45 @@ GET  /api/v1/temp-inboxes/:id/messages/:message_id -> message detail
 Wrong/missing token: 404/401. Past `expires_at`: 410 `expired` (row flipped to `expired`).
 Limits: 10 creates/hour per IP (`X-Real-IP` trusted only from loopback proxy), 3 active per browser (`iris_temp_client` cookie).
 Expired inboxes are purged by the in-process cleanup job (see Deployment). Not yet: extend/delete endpoints, Bcc delivery in the UI (To: header only).
+
+## Configuration
+
+Every variable in [`.env.example`](.env.example) is read by the code
+(`crates/config/src/lib.rs`, `apps/api/src/integration_apps.rs`). Copy it to
+`.env` (git-ignored, mode 600) and edit.
+
+| Variable | Default | Notes |
+|---|---|---|
+| `IRIS_ENV` | `development` | `production` enables Secure cookies and refuses a weak `SESSION_SECRET` |
+| `IRIS_HOST` / `IRIS_PORT` | `127.0.0.1` / `8000` | API listen address (put a proxy in front) |
+| `DATABASE_URL` | `sqlite:iris.db` | SQLite; use an absolute path on a persistent volume in production, e.g. `sqlite:/var/lib/iris/iris.db` |
+| `SESSION_SECRET` | `dev-secret-change-in-prod` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
+| `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
+| `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
+| `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
+| `TEMP_INBOX_MAIL_USER`, `TEMP_INBOX_MAIL_PASSWORD` | (empty) | Catch-all mailbox credentials |
+| `SEND_LOCAL_DOMAINS` | `example.com` | Domains IRIS may send to while no outbound relay is configured (comma-separated) |
+| `SEND_EXTERNAL` | `false` | Allow sending to any domain once the mail server has a working outbound relay |
+| `IRIS_INTEGRATION_EMAIL_FROM` | (empty) | Fixed sender for the transactional email API; leave blank to disable |
+| `IRIS_INTEGRATION_EMAIL_ENABLED` | `false` | Explicit opt-in for integration email delivery |
+| `IRIS_INTEGRATION_APPS` | (unset) | JSON registry of apps allowed to send transactional email; when unset, a built-in example registry is used — see `apps/api/src/integration_apps.rs` |
+| `RESEND_API_KEY` | (empty) | When set, mail to other domains is relayed through Resend |
+| `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
+| `IRIS_TIMELESS_SERVICE_TOKEN`, `IRIS_TIMELESS_EMAIL_FROM`, `IRIS_TIMELESS_EMAIL_TO`, `TIMELESS_PUBLIC_ORIGIN` | (empty) | Optional password-reset integration for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer |
+| `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
+
+Public site settings (build-time, all optional — defaults in `apps/web/vite.config.ts`):
+
+| Variable | Default | Used for |
+|---|---|---|
+| `VITE_SITE_URL` | `https://mail.example.com` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
+| `VITE_CONTACT_EMAIL` | `admin@example.com` | footer + Privacy/Terms contact |
+| `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
+| `VITE_ANALYTICS_SRC` | empty (off) | Umami tracking script |
+| `VITE_ANALYTICS_WEBSITE_ID` | empty (off) | Umami website ID. Analytics loads only when set **and** the visitor allows it in the cookie notice; only route names are sent. |
+| `VITE_MAIL_CONTENT_ORIGIN` | empty (srcdoc) | separate HTML-mail origin for the web build |
+
+Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.txt` and `sitemap.xml`.
 
 ## Deployment
 
@@ -60,19 +131,8 @@ cargo build --release -p iris-api
 cp .env.example .env   # then edit
 ```
 
-| Variable | Production value |
-|---|---|
-| `IRIS_ENV` | `production` (Secure cookies; refuses weak `SESSION_SECRET`) |
-| `IRIS_HOST` / `IRIS_PORT` | `127.0.0.1` / `8000` (proxy in front) |
-| `DATABASE_URL` | `sqlite:/var/lib/iris/iris.db` (persistent volume, not container FS) |
-| `SESSION_SECRET` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
-| `STALWART_API_URL` | `http://127.0.0.1:8092` |
-| `TEMP_INBOX_DOMAIN`, `TEMP_INBOX_MAIL_USER`, `TEMP_INBOX_MAIL_PASSWORD` | catch-all domain + account |
-| `IRIS_TIMELESS_EMAIL_FROM` | verified sender identity for Timeless recovery messages |
-| `IRIS_TIMELESS_EMAIL_TO` | fixed recovery recipient; store only in the ignored, mode-600 `.env` or deployment secret store; never accept from request data |
-
 Migrations run automatically on start. Run under systemd (`Restart=always`) as an unprivileged user.
-The cleanup job runs inside the API every 60 s (log line `cleanup marked=… purged=…`). As a safety net for when the API is down, `iris-api cleanup-once` runs one retention pass and exits; [`deploy/systemd/iris-cleanup.timer`](deploy/systemd/iris-cleanup.timer) runs it every 15 min. The timer is inert until activated — see [`deploy/systemd/README.md`](deploy/systemd/README.md) for the activation steps (separate approval) and rollback; overlapping runs with a live API are safe.
+The cleanup job runs inside the API every 60 s (log line `cleanup marked=… purged=…`). As a safety net for when the API is down, `iris-api cleanup-once` runs one retention pass and exits; [`deploy/systemd/iris-cleanup.timer`](deploy/systemd/iris-cleanup.timer) runs it every 15 min. The timer is inert until activated — see [`deploy/systemd/README.md`](deploy/systemd/README.md) for the activation steps and rollback; overlapping runs with a live API are safe.
 
 Login does not keep the user's password: it mints a Stalwart app password per session (expires with the
 session, destroyed on logout) and stores it ChaCha20-Poly1305-sealed in SQLite.
@@ -86,14 +146,14 @@ npm --prefix apps/web ci && npm --prefix apps/web run build   # -> apps/web/dist
 Serve `apps/web/dist` and proxy `/api` and `/auth` to the API on the same origin (CSRF cookie + `SameSite`
 rely on it). Proxy must set `X-Real-IP` (trusted only from loopback).
 
-Production (`mail.meowlabs.id`, behind Cloudflare) runs **nginx**: use [`deploy/nginx/mail.meowlabs.id`](deploy/nginx/mail.meowlabs.id)
-plus the [`iris-headers.conf`](deploy/nginx/iris-headers.conf) snippet (it also needs the host's `snippets/cloudflare-realip.conf`):
+With nginx, use [`deploy/nginx/mail.example.com`](deploy/nginx/mail.example.com)
+plus the [`iris-headers.conf`](deploy/nginx/iris-headers.conf) snippet:
 
 ```bash
-VITE_SITE_URL=https://mail.meowlabs.id npm --prefix apps/web run build
+VITE_SITE_URL=https://mail.example.com npm --prefix apps/web run build
 rsync -a --delete apps/web/dist/ /srv/iris/dist/
 sudo cp deploy/nginx/iris-headers.conf /etc/nginx/snippets/
-sudo cp deploy/nginx/mail.meowlabs.id /etc/nginx/sites-available/
+sudo cp deploy/nginx/mail.example.com /etc/nginx/sites-available/
 sudo nginx -t && sudo systemctl reload nginx
 ```
 
@@ -107,29 +167,21 @@ sudo cp deploy/caddy/Caddyfile /etc/caddy/Caddyfile
 sudo caddy validate --config /etc/caddy/Caddyfile && sudo systemctl reload caddy
 ```
 
-Public site settings (build-time, all optional — defaults in `apps/web/vite.config.ts`):
-
-| Variable | Default | Used for |
-|---|---|---|
-| `VITE_SITE_URL` | `https://mail.meowlabs.id` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
-| `VITE_CONTACT_EMAIL` | `admin@meowlabs.id` | footer + Privacy/Terms contact |
-| `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
-| `VITE_ANALYTICS_SRC` | `https://analytics.meowlabs.id/script.js` | Umami tracking script |
-| `VITE_ANALYTICS_WEBSITE_ID` | empty (off) | Umami website ID. Analytics loads only when set **and** the visitor allows it in the cookie notice; only route names are sent. |
-
-Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.txt` and `sitemap.xml`.
-
 ### 4. Verify before go-live
 
 ```bash
 cargo test --workspace
 npm --prefix apps/web run build
 python3 scripts/license_audit.py                       # no GPL/LGPL/AGPL/SSPL deps
-IRIS_URL=https://mail.meowlabs.id IRIS_USER=... IRIS_PASS=... \
-  SMTP_HOST=mx-iris.meowlabs.id python3 scripts/security_smoke.py   # CSRF, rotation, creds, 25 MiB limit
+IRIS_URL=https://mail.example.com IRIS_USER=... IRIS_PASS=... \
+  SMTP_HOST=mx.example.com python3 scripts/security_smoke.py   # CSRF, rotation, creds, 25 MiB limit
 ```
 
 Then work through `docs/07-PRODUCTION-READINESS.md` (TLS, backups, monitoring, policies).
+
+## Contributing
+
+See [`CONTRIBUTING.md`](CONTRIBUTING.md). Security issues: see [`SECURITY.md`](SECURITY.md) — do not open a public issue for a vulnerability.
 
 ## License
 
