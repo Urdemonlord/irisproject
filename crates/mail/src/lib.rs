@@ -154,6 +154,34 @@ const SUMMARY_PROPS: [&str; 8] = [
     "hasAttachment",
 ];
 
+/// JMAP `Email/query` filter for one folder, optionally narrowed by a
+/// full-text `text` condition.
+///
+/// Stalwart answers the `text` condition from its full-text search index
+/// (default indexed email fields: attachment, bcc, body, cc, from, subject,
+/// to). Indexing runs in the background, so a message received seconds ago
+/// may not match yet; the web UI keeps its local `matches()` filter as a
+/// fallback for the list it already loaded.
+fn folder_filter(mailbox_id: &str, query: Option<&str>) -> Value {
+    let in_mailbox = json!({ "inMailbox": mailbox_id });
+    match query.map(str::trim).filter(|q| !q.is_empty()) {
+        Some(q) => json!({
+            "operator": "AND",
+            "conditions": [in_mailbox, { "text": q }],
+        }),
+        None => in_mailbox,
+    }
+}
+
+/// Paging and search options for listing one folder.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ListPage<'a> {
+    pub limit: u32,
+    pub position: u32,
+    /// Full-text search terms; `None` lists the whole folder.
+    pub query: Option<&'a str>,
+}
+
 impl JmapClient {
     pub fn new(base_url: String) -> Self {
         let http = reqwest::Client::builder()
@@ -332,19 +360,32 @@ impl JmapClient {
         limit: u32,
         position: u32,
     ) -> Result<(Vec<MessageSummary>, u64), MailError> {
-        self.list_folder(user, pass, account, "inbox", limit, position)
-            .await
+        self.list_folder(
+            user,
+            pass,
+            account,
+            "inbox",
+            ListPage {
+                limit,
+                position,
+                query: None,
+            },
+        )
+        .await
     }
 
     /// Lists a standard folder by role (inbox, sent, drafts, archive, trash), newest first.
+    /// With `page.query`, only messages matching the full-text search
+    /// (subject, sender, recipients, body, attachments) are returned;
+    /// `total` is then the number of matches, so pagination works over the
+    /// search results.
     pub async fn list_folder(
         &self,
         user: &str,
         pass: &str,
         account: &str,
         role: &str,
-        limit: u32,
-        position: u32,
+        page: ListPage<'_>,
     ) -> Result<(Vec<MessageSummary>, u64), MailError> {
         let folders = self.folders(user, pass, account).await?;
         let inbox = folders
@@ -358,9 +399,9 @@ impl JmapClient {
                 user,
                 pass,
                 json!([
-                    ["Email/query", {"accountId": account, "filter": {"inMailbox": inbox},
+                    ["Email/query", {"accountId": account, "filter": folder_filter(&inbox, page.query),
                         "sort": [{"property": "receivedAt", "isAscending": false}],
-                        "position": position, "limit": limit, "calculateTotal": true}, "q"],
+                        "position": page.position, "limit": page.limit, "calculateTotal": true}, "q"],
                     ["Email/get", {"accountId": account,
                         "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
                         "properties": SUMMARY_PROPS}, "g"]
@@ -1288,6 +1329,19 @@ mod tests {
         assert!(out.text.contains("<feedback>"));
 
         assert!(extract_text_attachment("photo.png", "image/png", b"not-text").is_err());
+    }
+
+    #[test]
+    fn folder_filter_combines_mailbox_and_text() {
+        let plain = folder_filter("m1", None);
+        assert_eq!(plain["inMailbox"], "m1");
+        assert!(plain.get("operator").is_none());
+        let searched = folder_filter("m1", Some("  invoice  "));
+        assert_eq!(searched["operator"], "AND");
+        assert_eq!(searched["conditions"][0]["inMailbox"], "m1");
+        assert_eq!(searched["conditions"][1]["text"], "invoice");
+        // A blank search term is the same as no search.
+        assert_eq!(folder_filter("m1", Some("   "))["inMailbox"], "m1");
     }
 }
 

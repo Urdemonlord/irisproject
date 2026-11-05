@@ -9,7 +9,7 @@ use axum::{
 use iris_auth as auth;
 use iris_config::Config;
 use iris_mail::{
-    extract_text_attachment, Attachment, Compose, JmapClient, MailError, MessageDetail,
+    extract_text_attachment, Attachment, Compose, JmapClient, ListPage, MailError, MessageDetail,
     ResendClient, MAX_ATTACHMENT_BYTES, MAX_PREVIEW_BYTES, MAX_RAW_BYTES,
 };
 use serde::Deserialize;
@@ -613,6 +613,7 @@ struct Page {
     limit: Option<u32>,
     position: Option<u32>,
     folder: Option<String>,
+    q: Option<String>,
 }
 
 async fn list_messages(
@@ -625,6 +626,12 @@ async fn list_messages(
     let limit = p.limit.unwrap_or(50).clamp(1, 100);
     let position = p.position.unwrap_or(0);
     let folder = compose::folder_role(p.folder.as_deref().unwrap_or("inbox"))?;
+    // Search terms are capped so a huge `q` is never forwarded verbatim to JMAP.
+    let q =
+        p.q.as_deref()
+            .map(str::trim)
+            .filter(|q| !q.is_empty())
+            .map(|q| q.chars().take(200).collect::<String>());
     let (messages, total) = s
         .jmap
         .list_folder(
@@ -632,8 +639,11 @@ async fn list_messages(
             &u.creds.pass,
             &account,
             folder,
-            limit,
-            position,
+            ListPage {
+                limit,
+                position,
+                query: q.as_deref(),
+            },
         )
         .await?;
     Ok(Json(json!({ "messages": messages, "total": total, "position": position })).into_response())

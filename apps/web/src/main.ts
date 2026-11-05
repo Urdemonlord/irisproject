@@ -416,7 +416,7 @@ function mailShell(o: { topbar: HTMLElement; nav: HTMLElement[]; listTop: HTMLEl
 }
 
 /** Render message rows. Rows are buttons; an optional OTP copy button sits beside each row (never nested). */
-function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void }) {
+function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; footer?: HTMLElement; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void }) {
   if (!messages.length) return list.replaceChildren(o.empty)
   const prevList = list.querySelector('.message-list')
   const seen = new Set([...list.querySelectorAll<HTMLElement>('.msg-item')].map((li) => li.dataset.id))
@@ -447,7 +447,7 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
     const code = o.compact ? `${m.subject} ${m.preview}`.match(/\b(\d{4,8})\b/)?.[1] : undefined
     if (code) li.append(copyButton(code, `Copy code ${code}`, 'otp-chip', code))
     return li
-  })))
+  })), ...(o.footer ? [o.footer] : []))
 }
 
 function copyButton(text: string, label: string, cls: string, visible?: string) {
@@ -463,7 +463,7 @@ function copyButton(text: string, label: string, cls: string, visible?: string) 
 }
 
 function searchBox(onSearch: (q: string) => void) {
-  const input = h('input', { type: 'search', placeholder: 'Search this list', ariaLabel: 'Search messages', autocomplete: 'off' }) as HTMLInputElement
+  const input = h('input', { type: 'search', placeholder: 'Search messages', ariaLabel: 'Search messages', autocomplete: 'off' }) as HTMLInputElement
   input.addEventListener('input', () => onSearch(input.value.trim().toLowerCase()))
   return h('label', { className: 'topbar-search' }, icon('search'), input)
 }
@@ -706,6 +706,12 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   let all: Summary[] = (mb && readListCache(email, mb, folder)) || []
   let query = ''
   let current = ''
+  /** Server-side total for the current folder/search; `all` is only page 1 until load-more appends. */
+  let total = 0
+  /** The query `all` was last fetched with. While it differs from `query`, draw() falls back to the local matches() filter (cached list / search in flight). */
+  let loadedQuery = ''
+  let loadingMore = false
+  let searchTimer: number | undefined
 
   const signOut = () => { clearMailCache(); account = null; closeComposer?.() }
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
@@ -722,7 +728,12 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
 
   const topbar = h('header', { className: 'topbar' },
     brand(location.hostname),
-    searchBox((q) => { query = q; draw() }),
+    searchBox((q) => {
+      query = q
+      draw() // instant local filter on the loaded list; the server search below replaces it
+      window.clearTimeout(searchTimer)
+      searchTimer = window.setTimeout(() => { void load() }, 300)
+    }),
     h('div', { className: 'topbar-right' }, synced,
       h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email)),
       logout))
@@ -835,8 +846,17 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     } catch { toast('Could not open the draft.') }
   }
 
+  const loadMoreFooter = () => {
+    if (loadedQuery !== query || all.length === 0 || all.length >= total) return undefined
+    return h('div', { className: 'load-more' },
+      h('span', { className: 'load-more-count' }, `Showing ${all.length} of ${total}`),
+      btn('btn btn-secondary btn-sm', loadingMore ? 'Loading…' : 'Load more', undefined, { disabled: loadingMore, onclick: () => { void loadMore() } }))
+  }
+
   const draw = () => {
-    const shown = all.filter((m) => matches(m, query))
+    // When the loaded list already matches the query (server-side search),
+    // show it as-is: a body-only hit would fail the local from/subject/preview filter.
+    const shown = loadedQuery === query ? all : all.filter((m) => matches(m, query))
     const unread = all.filter((m) => !m.is_read).length
     unreadChip.textContent = `${unread} unread`
     unreadChip.hidden = folder !== 'inbox' || !unread
@@ -845,6 +865,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
       current,
       showTo: folder === 'sent' || folder === 'drafts',
       empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, title, text),
+      footer: loadMoreFooter(),
       onOpen: (m, i, wasUnread) => {
         if (folder === 'drafts') return void openDraft(m)
         if (wasUnread) {
@@ -866,9 +887,13 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     const restore = busy(refresh, '')
     refresh.classList.add('is-spinning')
     try {
-      const fresh = (await api<{ messages: Summary[] }>(`${base}/messages?folder=${folder}&limit=50`)).messages
+      const params = new URLSearchParams({ folder, limit: '50' })
+      if (query) params.set('q', query)
+      const { messages: fresh, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
       all = fresh.map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) }))
+      total = t
+      loadedQuery = query
       writeListCache(email, mb, folder, all)
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
@@ -878,6 +903,31 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
       ui.list.replaceChildren(errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.', load))
     } finally { restore(); refresh.classList.remove('is-spinning') }
   }
+  const loadMore = async () => {
+    if (loadingMore || loadedQuery !== query || all.length >= total) return
+    loadingMore = true
+    draw()
+    try {
+      const params = new URLSearchParams({ folder, limit: '50', position: String(all.length) })
+      if (query) params.set('q', query)
+      const { messages, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
+      total = t
+      const seen = new Set(all.map((m) => m.id))
+      const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
+      all = [
+        ...all,
+        ...messages.filter((m) => !seen.has(m.id)).map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) })),
+      ]
+      loadedQuery = query
+      writeListCache(email, mb, folder, all)
+    } catch {
+      toast('Could not load more messages.')
+    } finally {
+      loadingMore = false
+      draw()
+    }
+  }
+
   // After sending or saving: refresh counts, and the list if it's the folder that changed.
   function onMutate() {
     loadFolders()
