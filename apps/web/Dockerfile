@@ -7,6 +7,11 @@ WORKDIR /app
 COPY apps/web/package.json apps/web/package-lock.json ./
 RUN npm ci
 COPY apps/web/ ./
+# Build-time public site key for the Turnstile login widget (empty =
+# no widget). Passed as a build arg so the secret never enters the
+# image; see deploy/compose/docker-compose.yaml for the wiring.
+ARG VITE_TURNSTILE_SITE_KEY
+ENV VITE_TURNSTILE_SITE_KEY=$VITE_TURNSTILE_SITE_KEY
 RUN npm run build
 
 FROM nginx:alpine

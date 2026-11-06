@@ -125,7 +125,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `DATABASE_URL` | `sqlite:iris.db` | SQLite; use an absolute path on a persistent volume in production, e.g. `sqlite:/var/lib/iris/iris.db` |
 | `SESSION_SECRET` | `dev-secret-change-in-prod` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
 | `TURNSTILE_SECRET_KEY` | (empty) | Cloudflare Turnstile secret key for login verification; empty = logins skip the challenge. The public half is the web build-time variable `VITE_TURNSTILE_SITE_KEY` — see "Login CAPTCHA" below |
-| `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.meowlabs.id`); while the secret is set, an empty list rejects every login. Never list `localhost` or `127.0.0.1` in production |
+| `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.example.com`); while the secret is set, an empty list rejects every login. Never list `localhost` or `127.0.0.1` in production |
 | `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
 | `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
 | `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
@@ -147,9 +147,12 @@ set, `POST /auth/login` accepts an optional `turnstile_token` and
 verifies it server-side against Cloudflare's Siteverify API *before*
 the mail server is contacted. The check requires `success === true`,
 the `action` `"login"`, and a `hostname` inside `TURNSTILE_HOSTNAMES`;
-a missing/invalid token is rejected with `turnstile_failed` (400), a
-Siteverify outage fails closed with `turnstile_unavailable` (503).
-While the secret is set but `TURNSTILE_HOSTNAMES` is empty, every
+a missing/invalid token is rejected with `turnstile_failed` (400). A
+Siteverify outage — and a server-side error such as a wrong secret
+(`invalid-input-secret`) — fails closed with `turnstile_unavailable`
+(503). Failed verifications are capped per IP (20 per 15 minutes);
+past the cap logins answer `too_many_attempts` (429) without calling
+Siteverify. While the secret is set but `TURNSTILE_HOSTNAMES` is empty, every
 login is rejected — set the allowlist to the same hostnames the
 widget is registered for, and never add `localhost` or `127.0.0.1` in
 production. When the secret is unset, logins work exactly as before
@@ -161,7 +164,7 @@ The web widget needs the public site key at build time:
 `TURNSTILE_SITE_KEY` and pass it to the web build as
 `VITE_TURNSTILE_SITE_KEY`. Create both keys in the Cloudflare
 dashboard → Turnstile → Add site (hostname: your mail domain, e.g.
-`mail.meowlabs.id`), then set the secret in `.env` and rebuild the web
+`mail.example.com`), then set the secret in `.env` and rebuild the web
 with the site key. Tokens are single-use and expire after 5 minutes;
 the form mints a fresh one after every login attempt.
 
@@ -210,6 +213,7 @@ Public site settings (build-time, all optional — defaults in `apps/web/vite.co
 | `VITE_ANALYTICS_SRC` | empty (off) | Umami tracking script |
 | `VITE_ANALYTICS_WEBSITE_ID` | empty (off) | Umami website ID. Analytics loads only when set **and** the visitor allows it in the cookie notice; only route names are sent. |
 | `VITE_MAIL_CONTENT_ORIGIN` | empty (srcdoc) | separate HTML-mail origin for the web build |
+| `VITE_TURNSTILE_SITE_KEY` | empty (no widget) | Cloudflare Turnstile site key for the login widget; must be set at build time whenever `TURNSTILE_SECRET_KEY` is set — otherwise the login form has no widget and every login fails. See "Login CAPTCHA" above |
 
 Static pages: `/privacy/`, `/terms/`, `/404.html`. The build also emits `robots.txt` and `sitemap.xml`.
 
@@ -254,8 +258,12 @@ session, destroyed on logout) and stores it ChaCha20-Poly1305-sealed in SQLite.
 
 ### 3. Web + reverse proxy
 
+The web build needs the Turnstile site key whenever the secret is set
+(`TURNSTILE_SECRET_KEY` in `.env`): without it the bundle has no login
+widget and every login fails. Read it from `.env` the same way below:
+
 ```bash
-npm --prefix apps/web ci && npm --prefix apps/web run build   # -> apps/web/dist
+npm --prefix apps/web ci && VITE_TURNSTILE_SITE_KEY=$(grep '^TURNSTILE_SITE_KEY=' .env | cut -d= -f2- | tr -d ' ') npm --prefix apps/web run build   # -> apps/web/dist
 ```
 
 Serve `apps/web/dist` and proxy `/api` and `/auth` to the API on the same origin (CSRF cookie + `SameSite`
@@ -265,7 +273,7 @@ With nginx, use [`deploy/nginx/mail.example.com`](deploy/nginx/mail.example.com)
 plus the [`iris-headers.conf`](deploy/nginx/iris-headers.conf) snippet:
 
 ```bash
-VITE_SITE_URL=https://mail.example.com npm --prefix apps/web run build
+VITE_SITE_URL=https://mail.example.com VITE_TURNSTILE_SITE_KEY=$(grep '^TURNSTILE_SITE_KEY=' .env | cut -d= -f2- | tr -d ' ') npm --prefix apps/web run build
 rsync -a --delete apps/web/dist/ /srv/iris/dist/
 sudo cp deploy/nginx/iris-headers.conf /etc/nginx/snippets/
 sudo cp deploy/nginx/mail.example.com /etc/nginx/sites-available/

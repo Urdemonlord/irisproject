@@ -142,7 +142,17 @@ echo "install.sh: building release API (this takes a few minutes)…"
 cargo build --release -p iris-api
 echo "install.sh: building web bundle…"
 npm --prefix apps/web ci
-npm --prefix apps/web run build
+# Forward the Turnstile site key (public) to the Vite build so the
+# login widget is baked in; the secret stays server-side only. Read
+# from .env the same way STALWART_API_URL is read above.
+SITE_KEY=$(grep '^TURNSTILE_SITE_KEY=' .env | cut -d= -f2- | tr -d ' ' || true)
+SECRET_SET=$(grep '^TURNSTILE_SECRET_KEY=' .env | cut -d= -f2- | tr -d ' ' || true)
+if [ -n "$SECRET_SET" ] && [ -z "$SITE_KEY" ]; then
+  echo "install.sh: WARNING: TURNSTILE_SECRET_KEY is set but TURNSTILE_SITE_KEY is empty —" >&2
+  echo "install.sh:   the login form will have no widget and every login will fail." >&2
+  echo "install.sh:   Set TURNSTILE_SITE_KEY in .env and rebuild the web." >&2
+fi
+VITE_TURNSTILE_SITE_KEY="$SITE_KEY" npm --prefix apps/web run build
 
 [ -x target/release/iris-api ] || { echo "install.sh: build failed — no target/release/iris-api" >&2; exit 1; }
 [ -f apps/web/dist/index.html ] || { echo "install.sh: build failed — no apps/web/dist/index.html" >&2; exit 1; }
