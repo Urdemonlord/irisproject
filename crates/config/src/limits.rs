@@ -106,6 +106,19 @@ pub const HTML_BODY_TOKEN_TTL_SECS: u64 = 120;
 /// so a runaway client cannot grow the in-memory store without bound.
 pub const MAX_PENDING_HTML_BODIES: usize = 512;
 
+// --- Labels, custom folders and filters ------------------------------------
+
+/// Max labels one mailbox can define.
+pub const MAX_LABELS: i64 = 50;
+/// Max custom folders one mailbox can have.
+pub const MAX_CUSTOM_FOLDERS: usize = 50;
+/// Max length of a custom folder name, in characters.
+pub const MAX_FOLDER_NAME_CHARS: usize = 64;
+/// Max filter rules per mailbox.
+pub const MAX_FILTERS: i64 = 50;
+/// Max length of a filter's match text, in characters.
+pub const MAX_FILTER_VALUE_CHARS: usize = 200;
+
 #[cfg(test)]
 mod tests {
     use super::*;

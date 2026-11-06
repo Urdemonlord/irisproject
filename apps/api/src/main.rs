@@ -15,8 +15,8 @@ use iris_config::limits::{
 };
 use iris_config::Config;
 use iris_mail::{
-    extract_text_attachment, Attachment, Compose, JmapClient, ListPage, MailError, MessageDetail,
-    ResendClient,
+    extract_text_attachment, valid_label, Attachment, Compose, JmapClient, ListPage, MailError,
+    MessageDetail, ResendClient, View,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -26,9 +26,11 @@ use std::sync::Arc;
 mod cleanup;
 mod compose;
 mod email_address;
+mod filters;
 mod html_body;
 mod integration_apps;
 mod integration_keys;
+mod organize;
 mod temp;
 mod transactional_email;
 mod turnstile;
@@ -98,6 +100,7 @@ impl From<MailError> for ApiError {
             MailError::Auth => ApiError(StatusCode::UNAUTHORIZED, "unauthorized"),
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
             MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
+            MailError::NotEmpty => ApiError(StatusCode::CONFLICT, "folder_not_empty"),
             // The mail server could not be reached at all.
             MailError::Unavailable(_) => {
                 ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable")
@@ -206,7 +209,35 @@ async fn main() {
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/folders",
-            get(compose::folders),
+            get(compose::folders).post(organize::create_folder),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/folders/:folder_id",
+            axum::routing::patch(organize::rename_folder).delete(organize::delete_folder),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/labels",
+            get(organize::list_labels).post(organize::create_label),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/labels/:name",
+            axum::routing::delete(organize::delete_label),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/messages/:message_id/star",
+            post(organize::set_star),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/messages/:message_id/labels",
+            post(organize::set_message_label),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/filters",
+            get(filters::list).post(filters::create),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/filters/:filter_id",
+            axum::routing::delete(filters::delete),
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id/move",
@@ -816,8 +847,42 @@ pub(crate) async fn check_read_limit(s: &AppState, u: &CurrentUser) -> Result<()
 struct Page {
     limit: Option<u32>,
     position: Option<u32>,
+    /// Standard folder role (default `inbox`).
     folder: Option<String>,
+    /// Custom folder id; wins over `folder`.
+    folder_id: Option<String>,
+    /// `starred`; wins over `folder` / `folder_id`.
+    view: Option<String>,
+    /// Label name; wins over everything else.
+    label: Option<String>,
     q: Option<String>,
+}
+
+/// Which list a `Page` asks for. Every input is validated here.
+fn page_view(p: &Page) -> Result<View<'_>, ApiError> {
+    let bad = |code| ApiError(StatusCode::BAD_REQUEST, code);
+    if let Some(l) = p.label.as_deref() {
+        return if valid_label(l) {
+            Ok(View::Label(l))
+        } else {
+            Err(bad("invalid_label"))
+        };
+    }
+    match p.view.as_deref() {
+        Some("starred") => return Ok(View::Starred),
+        Some(_) => return Err(bad("invalid_view")),
+        None => {}
+    }
+    if let Some(id) = p.folder_id.as_deref() {
+        return if valid_message_id(id) {
+            Ok(View::Folder(id))
+        } else {
+            Err(bad("invalid_folder"))
+        };
+    }
+    Ok(View::Role(compose::folder_role(
+        p.folder.as_deref().unwrap_or("inbox"),
+    )?))
 }
 
 async fn list_messages(
@@ -833,7 +898,7 @@ async fn list_messages(
         .unwrap_or(DEFAULT_LIST_LIMIT)
         .clamp(1, MAX_LIST_LIMIT);
     let position = p.position.unwrap_or(0);
-    let folder = compose::folder_role(p.folder.as_deref().unwrap_or("inbox"))?;
+    let view = page_view(&p)?;
     // Search terms are capped so a huge `q` is never forwarded verbatim to JMAP.
     let q =
         p.q.as_deref()
@@ -842,11 +907,11 @@ async fn list_messages(
             .map(|q| q.chars().take(MAX_SEARCH_QUERY_CHARS).collect::<String>());
     let (messages, total) = s
         .jmap
-        .list_folder(
+        .list_view(
             &u.creds.user,
             &u.creds.pass,
             &account,
-            folder,
+            view,
             ListPage {
                 limit,
                 position,
@@ -2198,6 +2263,10 @@ mod handler_integration_tests {
         message: Option<Value>,
         /// Bytes served by GET /jmap/download/... for any blob id.
         blob: Vec<u8>,
+        /// Custom folders (id, name): role-less mailboxes in Mailbox/get.
+        custom: Vec<(&'static str, &'static str)>,
+        /// Whether SieveScript/set succeeds.
+        sieve_ok: bool,
     }
 
     impl Default for JmapScript {
@@ -2209,6 +2278,8 @@ mod handler_integration_tests {
                 query_list: vec![],
                 message: None,
                 blob: vec![],
+                custom: vec![],
+                sieve_ok: true,
             }
         }
     }
@@ -2237,8 +2308,19 @@ mod handler_integration_tests {
             .unwrap_or_default()
             .to_string();
         let responses: Vec<Value> = match first.as_str() {
-            "Mailbox/get" => vec![
-                json!(["Mailbox/get", {"list": script.roles.iter().map(|r| folder_json(r)).collect::<Vec<_>>()}, "m"]),
+            "Mailbox/get" => {
+                let mut list: Vec<Value> = script.roles.iter().map(|r| folder_json(r)).collect();
+                list.extend(script.custom.iter().map(|(id, name)| {
+                    json!({"id": id, "role": null, "name": name, "totalEmails": 0, "unreadEmails": 0})
+                }));
+                vec![json!(["Mailbox/get", {"list": list}, "m"])]
+            }
+            "SieveScript/get" => vec![json!(["SieveScript/get", {"list": []}, "g"])],
+            "SieveScript/set" if script.sieve_ok => vec![
+                json!(["SieveScript/set", {"created": {"n": {"id": "sieve-1"}}, "notCreated": {}}, "s"]),
+            ],
+            "SieveScript/set" => vec![
+                json!(["SieveScript/set", {"created": {}, "notCreated": {"n": {"type": "invalidSieve"}}}, "s"]),
             ],
             "Mailbox/set" => {
                 vec![json!(["Mailbox/set", {"created": {}, "notCreated": {}}, "s"])]
@@ -2262,6 +2344,15 @@ mod handler_integration_tests {
                 json!(["Email/set", {"created": {"n": {"id": "msg-1"}}, "notCreated": {}}, "e"]),
                 json!(["EmailSubmission/set", {"created": {"s": {"id": "sub-1"}}, "notCreated": {}}, "x"]),
             ],
+            "Email/set" if calls[0][1]["update"].is_object() => {
+                let updated: serde_json::Map<String, Value> = calls[0][1]["update"]
+                    .as_object()
+                    .unwrap()
+                    .keys()
+                    .map(|k| (k.clone(), Value::Null))
+                    .collect();
+                vec![json!(["Email/set", {"updated": updated}, "u"])]
+            }
             "Email/set" => match script.email_set {
                 EmailSet::Created => {
                     vec![
@@ -2365,6 +2456,16 @@ mod handler_integration_tests {
                             "404 Not Found",
                             "application/json",
                             br#"{"error":"no such route"}"#.to_vec(),
+                        )
+                    } else if method == "POST" && path.starts_with("/jmap/upload/") {
+                        task_requests
+                            .lock()
+                            .unwrap()
+                            .push(json!({"upload": String::from_utf8_lossy(&body)}));
+                        (
+                            "200 OK",
+                            "application/json",
+                            br#"{"blobId":"blob-1"}"#.to_vec(),
                         )
                     } else if method == "GET" && path.starts_with("/jmap/download/") {
                         ("200 OK", "application/octet-stream", script.blob.clone())
@@ -2634,6 +2735,9 @@ mod handler_integration_tests {
                 limit: Some(2),
                 position: Some(2),
                 folder: None,
+                folder_id: None,
+                view: None,
+                label: None,
                 q: Some("invoice".into()),
             }),
         )
@@ -2658,6 +2762,288 @@ mod handler_integration_tests {
         assert_eq!(args["calculateTotal"], true);
     }
 
+    fn page(f: impl FnOnce(&mut Page)) -> Query<Page> {
+        let mut p = Page {
+            limit: None,
+            position: None,
+            folder: None,
+            folder_id: None,
+            view: None,
+            label: None,
+            q: None,
+        };
+        f(&mut p);
+        Query(p)
+    }
+
+    fn query_filter(jmap: &FakeJmap) -> Value {
+        let reqs = jmap.requests.lock().unwrap();
+        reqs.iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/query")
+            .expect("list must query JMAP")["methodCalls"][0][1]["filter"]
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn starred_view_queries_flagged_outside_trash() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let p = page(|p| p.view = Some("starred".into()));
+        list_messages(State(s), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap();
+        let f = query_filter(&jmap);
+        assert_eq!(f["conditions"][0]["hasKeyword"], "$flagged");
+        assert_eq!(f["conditions"][1]["inMailboxOtherThan"][0], "f-trash");
+    }
+
+    #[tokio::test]
+    async fn label_and_custom_folder_views() {
+        let jmap = fake_jmap(JmapScript {
+            custom: vec![("c-1", "Receipts")],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let p = page(|p| p.label = Some("work".into()));
+        list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap();
+        assert_eq!(query_filter(&jmap)["conditions"][0]["hasKeyword"], "work");
+
+        jmap.requests.lock().unwrap().clear();
+        let p = page(|p| p.folder_id = Some("c-1".into()));
+        list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap();
+        assert_eq!(query_filter(&jmap)["inMailbox"], "c-1");
+
+        // A standard folder's id is not a custom folder.
+        let p = page(|p| p.folder_id = Some("f-inbox".into()));
+        let e = list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap_err();
+        assert_eq!(e.0, StatusCode::NOT_FOUND);
+
+        for p in [
+            page(|p| p.label = Some("$seen".into())),
+            page(|p| p.view = Some("junk".into())),
+            page(|p| p.folder_id = Some("../x".into())),
+        ] {
+            let e = list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+                .await
+                .unwrap_err();
+            assert_eq!(e.0, StatusCode::BAD_REQUEST);
+        }
+    }
+
+    #[tokio::test]
+    async fn star_and_label_set_keywords() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let star: organize::StarBody = serde_json::from_value(json!({"starred": true})).unwrap();
+        organize::set_star(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            Json(star),
+        )
+        .await
+        .unwrap();
+
+        let body = || {
+            Json(
+                serde_json::from_value::<organize::MessageLabelBody>(
+                    json!({"label": "Work", "on": true}),
+                )
+                .unwrap(),
+            )
+        };
+        let e = organize::set_message_label(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            body(),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.1, "unknown_label");
+
+        let new: organize::LabelBody = serde_json::from_value(json!({"name": "work"})).unwrap();
+        organize::create_label(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            Json(new),
+        )
+        .await
+        .unwrap();
+        organize::set_message_label(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            body(),
+        )
+        .await
+        .unwrap();
+
+        let reqs = jmap.requests.lock().unwrap();
+        let updates: Vec<Value> = reqs
+            .iter()
+            .filter(|r| r["methodCalls"][0][0] == "Email/set")
+            .map(|r| r["methodCalls"][0][1]["update"]["m1"].clone())
+            .collect();
+        assert_eq!(
+            updates,
+            vec![
+                json!({"keywords/$flagged": true}),
+                json!({"keywords/work": true})
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn move_to_custom_folder_checks_the_id() {
+        let jmap = fake_jmap(JmapScript {
+            custom: vec![("c-1", "Receipts")],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let mv = |id: &str| {
+            Json(serde_json::from_value::<compose::MoveBody>(json!({"folder_id": id})).unwrap())
+        };
+        let e = compose::move_message(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            mv("f-sent"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.1, "invalid_folder");
+        jmap.requests.lock().unwrap().clear();
+        compose::move_message(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            mv("c-1"),
+        )
+        .await
+        .unwrap();
+        let reqs = jmap.requests.lock().unwrap();
+        let set = reqs
+            .iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/set")
+            .unwrap();
+        assert_eq!(
+            set["methodCalls"][0][1]["update"]["m1"]["mailboxIds"],
+            json!({"c-1": true})
+        );
+    }
+
+    async fn filter_count(s: &AppState) -> i64 {
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_filters")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap()
+    }
+
+    fn new_rule(v: Value) -> Json<filters::NewRule> {
+        Json(serde_json::from_value(v).unwrap())
+    }
+
+    #[tokio::test]
+    async fn filter_create_installs_sieve_script() {
+        let jmap = fake_jmap(JmapScript {
+            custom: vec![("c-1", "Receipts")],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let resp = filters::create(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            new_rule(
+                json!({"field": "from", "value": "shop.test", "action": "move", "target": "c-1"}),
+            ),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(filter_count(&s).await, 1);
+        {
+            let reqs = jmap.requests.lock().unwrap();
+            let script = reqs
+                .iter()
+                .find_map(|r| r["upload"].as_str())
+                .expect("script uploaded");
+            assert!(script.contains("fileinto :mailboxid \"c-1\" \"Receipts\";"));
+            let set = reqs
+                .iter()
+                .find(|r| r["methodCalls"][0][0] == "SieveScript/set")
+                .unwrap();
+            assert_eq!(set["methodCalls"][0][1]["onSuccessActivateScript"], "#n");
+            assert_eq!(set["methodCalls"][0][1]["create"]["n"]["blobId"], "blob-1");
+        }
+
+        // Inbox is not a filter target; a folder in use cannot be deleted.
+        let e = filters::create(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            new_rule(json!({"field": "from", "value": "x", "action": "move", "target": "f-inbox"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.1, "invalid_folder");
+        let e = organize::delete_folder(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "c-1".into())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.1, "folder_in_use_by_filter");
+    }
+
+    #[tokio::test]
+    async fn filter_is_rolled_back_when_the_script_is_refused() {
+        let jmap = fake_jmap(JmapScript {
+            sieve_ok: false,
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let e = filters::create(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            new_rule(json!({"field": "subject", "value": "news", "action": "read"})),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(filter_count(&s).await, 0);
+        for bad in [
+            json!({"field": "body", "value": "x", "action": "read"}),
+            json!({"field": "from", "value": " ", "action": "read"}),
+            json!({"field": "from", "value": "a\nb", "action": "read"}),
+            json!({"field": "from", "value": "x", "action": "delete"}),
+        ] {
+            let e = filters::create(
+                State(s.clone()),
+                Extension(user()),
+                Path("mbx-1".into()),
+                new_rule(bad),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(e.1, "invalid_filter");
+        }
+    }
+
     /// Handler-side clamps: a huge page is capped at MAX_LIST_LIMIT and a
     /// huge search term is truncated to MAX_SEARCH_QUERY_CHARS before JMAP.
     #[tokio::test]
@@ -2673,6 +3059,9 @@ mod handler_integration_tests {
                 limit: Some(500),
                 position: None,
                 folder: None,
+                folder_id: None,
+                view: None,
+                label: None,
                 q: Some(long_q),
             }),
         )
@@ -2712,6 +3101,9 @@ mod handler_integration_tests {
                 limit: None,
                 position: None,
                 folder: Some("archive".into()),
+                folder_id: None,
+                view: None,
+                label: None,
                 q: None,
             }),
         )
