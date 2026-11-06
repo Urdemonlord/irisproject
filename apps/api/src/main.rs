@@ -122,6 +122,12 @@ async fn main() {
         tracing::warn!(
             "turnstile: TURNSTILE_SECRET_KEY is not set; login Turnstile verification is disabled"
         );
+    } else if config.turnstile_hostnames.is_empty() {
+        // Fail closed (see `turnstile::verify`): a secret without a
+        // hostname allowlist rejects every login, so warn loudly.
+        tracing::warn!(
+            "turnstile: TURNSTILE_SECRET_KEY is set but TURNSTILE_HOSTNAMES is empty; login Turnstile verification will reject every login"
+        );
     }
     if config.env == "production"
         && (config.session_secret.len() < 32 || config.session_secret.starts_with("dev-secret"))
@@ -485,13 +491,17 @@ async fn login(
     // Bot gate, after the cheap rate-limit checks and before any JMAP
     // attempt: a failed check never touches the mail server and never
     // records a login failure. Off entirely while no secret is
-    // configured (see `turnstile::verify`).
+    // configured (see `turnstile::verify`). The gate requires
+    // success, the "login" action, and a hostname in
+    // TURNSTILE_HOSTNAMES — a token minted anywhere else is rejected.
     if !s.config.turnstile_secret_key.is_empty() {
         match turnstile::verify(
             &s.http,
             &s.config.turnstile_secret_key,
             b.turnstile_token.as_deref(),
             &ip,
+            turnstile::EXPECTED_ACTION,
+            &s.config.turnstile_hostnames,
             turnstile::SITEVERIFY_URL,
         )
         .await
@@ -1282,6 +1292,7 @@ mod password_reset_webhook_tests {
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
+                turnstile_hostnames: Vec::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -1994,6 +2005,7 @@ mod read_limit_tests {
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
+                turnstile_hostnames: Vec::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -2371,6 +2383,7 @@ mod handler_integration_tests {
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
+                turnstile_hostnames: Vec::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,

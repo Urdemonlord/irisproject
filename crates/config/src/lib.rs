@@ -15,6 +15,12 @@ pub struct Config {
     /// never ship it to the browser — the public half is the
     /// `VITE_TURNSTILE_SITE_KEY` build-time variable of the web app.
     pub turnstile_secret_key: String,
+    /// Frontend hostnames a Turnstile token must have been minted on.
+    /// Read from `TURNSTILE_HOSTNAMES` (comma-separated, lowercased).
+    /// While the secret is set, an empty list fails closed: every login
+    /// is rejected (see `apps/api/src/turnstile.rs`). Production must
+    /// never list `localhost` or `127.0.0.1` here.
+    pub turnstile_hostnames: Vec<String>,
     pub stalwart_api_url: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
@@ -76,6 +82,12 @@ impl Config {
             session_secret: std::env::var("SESSION_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-in-prod".to_string()),
             turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default(),
+            turnstile_hostnames: std::env::var("TURNSTILE_HOSTNAMES")
+                .unwrap_or_default()
+                .split(',')
+                .map(|h| h.trim().to_lowercase())
+                .filter(|h| !h.is_empty())
+                .collect(),
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")

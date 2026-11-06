@@ -5,6 +5,13 @@
 //! Cloudflare's Siteverify API before the login is attempted. See
 //! <https://developers.cloudflare.com/turnstile/get-started/server-side-validation/>.
 //!
+//! The check follows the canonical siteverify contract (see
+//! <https://developers.cloudflare.com/turnstile/spin/prompt.md>): it
+//! requires `success === true`, the expected `action` (`"login"`), and
+//! a `hostname` inside the `TURNSTILE_HOSTNAMES` allowlist. An empty
+//! allowlist fails closed — every login is rejected — so a half-wired
+//! deployment cannot silently accept tokens minted anywhere.
+//!
 //! The check is off unless `TURNSTILE_SECRET_KEY` is set (see
 //! `iris_config::Config`): an unconfigured deployment keeps logging in
 //! exactly as before. When configured, a missing/invalid token rejects
@@ -38,20 +45,51 @@ pub enum TurnstileError {
 #[derive(Debug, Deserialize)]
 struct SiteverifyResponse {
     success: bool,
+    /// The `action` the token was minted for (the widget's `data-action`
+    /// / render `action`; `"login"` here). Absent on old-style responses.
+    #[serde(default)]
+    action: Option<String>,
+    /// The hostname the token was minted on. Absent on old-style
+    /// responses; a missing hostname never matches the allowlist.
+    #[serde(default)]
+    hostname: Option<String>,
     #[serde(default, rename = "error-codes")]
     error_codes: Vec<String>,
 }
 
-fn outcome(resp: &SiteverifyResponse) -> Result<(), TurnstileError> {
-    if resp.success {
-        Ok(())
-    } else {
+/// The action the login widget mints tokens for. Must match the
+/// widget's `action` (render option / `data-action="login"`).
+pub const EXPECTED_ACTION: &str = "login";
+
+fn outcome(
+    resp: &SiteverifyResponse,
+    expected_action: &str,
+    expected_hostnames: &[String],
+) -> Result<(), TurnstileError> {
+    if !resp.success {
         tracing::warn!(
             "turnstile: siteverify rejected token: {:?}",
             resp.error_codes
         );
-        Err(TurnstileError::Invalid)
+        return Err(TurnstileError::Invalid);
     }
+    if resp.action.as_deref() != Some(expected_action) {
+        tracing::warn!(
+            "turnstile: token action {:?} is not {:?}",
+            resp.action,
+            expected_action
+        );
+        return Err(TurnstileError::Invalid);
+    }
+    let hostname = resp.hostname.as_deref().unwrap_or_default().to_lowercase();
+    if !expected_hostnames.iter().any(|h| h == &hostname) {
+        tracing::warn!(
+            "turnstile: token hostname {:?} is not in the allowlist",
+            resp.hostname
+        );
+        return Err(TurnstileError::Invalid);
+    }
+    Ok(())
 }
 
 /// Verify `token` against Siteverify. `remoteip` is the login's client IP
@@ -63,12 +101,22 @@ pub async fn verify(
     secret: &str,
     token: Option<&str>,
     remoteip: &str,
+    expected_action: &str,
+    expected_hostnames: &[String],
     siteverify_url: &str,
 ) -> Result<(), TurnstileError> {
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return Err(TurnstileError::MissingToken);
     };
     if token.len() > MAX_TOKEN_LEN {
+        return Err(TurnstileError::Invalid);
+    }
+    // No allowlist, no acceptance: a secret without hostnames would
+    // otherwise accept tokens minted on any domain the widget allows.
+    if expected_hostnames.is_empty() {
+        tracing::error!(
+            "turnstile: TURNSTILE_HOSTNAMES is empty while verification is on; rejecting login"
+        );
         return Err(TurnstileError::Invalid);
     }
     let resp = client
@@ -92,7 +140,7 @@ pub async fn verify(
         tracing::warn!("turnstile: siteverify returned undecodable JSON: {e}");
         TurnstileError::Unavailable
     })?;
-    outcome(&parsed)
+    outcome(&parsed, expected_action, expected_hostnames)
 }
 
 #[cfg(test)]
@@ -194,10 +242,23 @@ mod tests {
             .unwrap()
     }
 
+    fn hostnames() -> Vec<String> {
+        vec!["mail.example.com".to_string()]
+    }
+
     #[tokio::test]
     async fn missing_token_is_rejected_without_a_call() {
         let fake = fake_siteverify("200 OK", r#"{"success":true}"#).await;
-        let result = verify(&client(), "secret", None, "127.0.0.1", &fake.url).await;
+        let result = verify(
+            &client(),
+            "secret",
+            None,
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
         assert_eq!(result, Err(TurnstileError::MissingToken));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
         fake.task.abort();
@@ -206,7 +267,16 @@ mod tests {
     #[tokio::test]
     async fn empty_token_is_rejected_without_a_call() {
         let fake = fake_siteverify("200 OK", r#"{"success":true}"#).await;
-        let result = verify(&client(), "secret", Some(""), "127.0.0.1", &fake.url).await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some(""),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
         assert_eq!(result, Err(TurnstileError::MissingToken));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
         fake.task.abort();
@@ -216,7 +286,38 @@ mod tests {
     async fn overlong_token_is_rejected_without_a_call() {
         let fake = fake_siteverify("200 OK", r#"{"success":true}"#).await;
         let token = "x".repeat(2049);
-        let result = verify(&client(), "secret", Some(&token), "127.0.0.1", &fake.url).await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some(&token),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
+        assert_eq!(result, Err(TurnstileError::Invalid));
+        assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
+        fake.task.abort();
+    }
+
+    #[tokio::test]
+    async fn empty_allowlist_rejects_without_a_call() {
+        let fake = fake_siteverify(
+            "200 OK",
+            r#"{"success":true,"action":"login","hostname":"mail.example.com"}"#,
+        )
+        .await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &[],
+            &fake.url,
+        )
+        .await;
         assert_eq!(result, Err(TurnstileError::Invalid));
         assert_eq!(fake.calls.load(Ordering::SeqCst), 0);
         fake.task.abort();
@@ -226,7 +327,7 @@ mod tests {
     async fn success_response_verifies_and_sends_secret_token_and_ip() {
         let fake = fake_siteverify(
             "200 OK",
-            r#"{"success":true,"challenge_ts":"2026-11-06T00:00:00Z","hostname":"mail.example.com"}"#,
+            r#"{"success":true,"action":"login","challenge_ts":"2026-11-06T00:00:00Z","hostname":"mail.example.com"}"#,
         )
         .await;
         let result = verify(
@@ -234,6 +335,8 @@ mod tests {
             "test-secret",
             Some("test-token"),
             "203.0.113.7",
+            EXPECTED_ACTION,
+            &hostnames(),
             &fake.url,
         )
         .await;
@@ -242,6 +345,86 @@ mod tests {
         assert_eq!(sent["secret"], "test-secret");
         assert_eq!(sent["response"], "test-token");
         assert_eq!(sent["remoteip"], "203.0.113.7");
+        fake.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostname_match_is_case_insensitive() {
+        let fake = fake_siteverify(
+            "200 OK",
+            r#"{"success":true,"action":"login","hostname":"MAIL.EXAMPLE.COM"}"#,
+        )
+        .await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        fake.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn wrong_action_is_invalid() {
+        let fake = fake_siteverify(
+            "200 OK",
+            r#"{"success":true,"action":"signup","hostname":"mail.example.com"}"#,
+        )
+        .await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
+        assert_eq!(result, Err(TurnstileError::Invalid));
+        fake.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostname_outside_allowlist_is_invalid() {
+        let fake = fake_siteverify(
+            "200 OK",
+            r#"{"success":true,"action":"login","hostname":"evil.example.com"}"#,
+        )
+        .await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
+        assert_eq!(result, Err(TurnstileError::Invalid));
+        fake.task.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn hostname_missing_from_response_is_invalid() {
+        let fake = fake_siteverify("200 OK", r#"{"success":true,"action":"login"}"#).await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
+        assert_eq!(result, Err(TurnstileError::Invalid));
         fake.task.await.unwrap();
     }
 
@@ -257,6 +440,8 @@ mod tests {
             "secret",
             Some("stale-token"),
             "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
             &fake.url,
         )
         .await;
@@ -267,7 +452,16 @@ mod tests {
     #[tokio::test]
     async fn http_error_is_unavailable() {
         let fake = fake_siteverify("500 Internal Server Error", r#"{"success":false}"#).await;
-        let result = verify(&client(), "secret", Some("token"), "127.0.0.1", &fake.url).await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
         assert_eq!(result, Err(TurnstileError::Unavailable));
         fake.task.await.unwrap();
     }
@@ -275,7 +469,16 @@ mod tests {
     #[tokio::test]
     async fn undecodable_response_is_unavailable() {
         let fake = fake_siteverify("200 OK", "this is not json").await;
-        let result = verify(&client(), "secret", Some("token"), "127.0.0.1", &fake.url).await;
+        let result = verify(
+            &client(),
+            "secret",
+            Some("token"),
+            "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
+            &fake.url,
+        )
+        .await;
         assert_eq!(result, Err(TurnstileError::Unavailable));
         fake.task.await.unwrap();
     }
@@ -288,6 +491,8 @@ mod tests {
             "secret",
             Some("token"),
             "127.0.0.1",
+            EXPECTED_ACTION,
+            &hostnames(),
             "http://127.0.0.1:9",
         )
         .await;
