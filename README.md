@@ -125,6 +125,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `DATABASE_URL` | `sqlite:iris.db` | SQLite; use an absolute path on a persistent volume in production, e.g. `sqlite:/var/lib/iris/iris.db` |
 | `SESSION_SECRET` | `dev-secret-change-in-prod` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
 | `TURNSTILE_SECRET_KEY` | (empty) | Cloudflare Turnstile secret key for login verification; empty = logins skip the challenge. The public half is the web build-time variable `VITE_TURNSTILE_SITE_KEY` — see "Login CAPTCHA" below |
+| `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.meowlabs.id`); while the secret is set, an empty list rejects every login. Never list `localhost` or `127.0.0.1` in production |
 | `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
 | `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
 | `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
@@ -144,10 +145,15 @@ Every variable in [`.env.example`](.env.example) is read by the code
 Optional bot gate on the sign-in form. When `TURNSTILE_SECRET_KEY` is
 set, `POST /auth/login` accepts an optional `turnstile_token` and
 verifies it server-side against Cloudflare's Siteverify API *before*
-the mail server is contacted; a missing/invalid token is rejected with
-`turnstile_failed` (400), a Siteverify outage fails closed with
-`turnstile_unavailable` (503). When the secret is unset, logins work
-exactly as before and the API logs a startup warning.
+the mail server is contacted. The check requires `success === true`,
+the `action` `"login"`, and a `hostname` inside `TURNSTILE_HOSTNAMES`;
+a missing/invalid token is rejected with `turnstile_failed` (400), a
+Siteverify outage fails closed with `turnstile_unavailable` (503).
+While the secret is set but `TURNSTILE_HOSTNAMES` is empty, every
+login is rejected — set the allowlist to the same hostnames the
+widget is registered for, and never add `localhost` or `127.0.0.1` in
+production. When the secret is unset, logins work exactly as before
+and the API logs a startup warning.
 
 The web widget needs the public site key at build time:
 `VITE_TURNSTILE_SITE_KEY` (empty = no widget; see
@@ -157,7 +163,13 @@ The web widget needs the public site key at build time:
 dashboard → Turnstile → Add site (hostname: your mail domain, e.g.
 `mail.meowlabs.id`), then set the secret in `.env` and rebuild the web
 with the site key. Tokens are single-use and expire after 5 minutes;
-the form mints a fresh one after every failed login.
+the form mints a fresh one after every login attempt.
+
+IRIS sets no Content-Security-Policy on the app shell, so no CSP
+change is needed for the Turnstile script
+(`https://challenges.cloudflare.com/turnstile/v0/api.js`) and its
+challenge iframe. The strict CSP in the mail-body renderer is
+untouched — Turnstile never runs inside untrusted mail HTML.
 
 ### Password-reset webhook
 
