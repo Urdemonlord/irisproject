@@ -26,9 +26,11 @@ pub struct Config {
     /// Frontend hostnames a Turnstile token must have been minted on.
     /// Read from `TURNSTILE_HOSTNAMES` (comma-separated, lowercased).
     /// While the secret is set, an empty list fails closed: every login
-    /// is rejected (see `apps/api/src/turnstile.rs`). Loopback
-    /// hostnames are rejected at startup by `parse_turnstile_hostnames`
-    /// — a token minted on `localhost` must never pass this check.
+    /// is rejected (see `apps/api/src/turnstile.rs`). In production,
+    /// loopback hostnames are rejected at startup by
+    /// `parse_turnstile_hostnames` — a token minted on `localhost` must
+    /// never pass this check; outside production they are allowed, so
+    /// localhost Turnstile testing works.
     pub turnstile_hostnames: Vec<String>,
     /// Siteverify endpoint for Turnstile token checks. Read from
     /// `TURNSTILE_SITEVERIFY_URL`; unset = the real Cloudflare
@@ -90,6 +92,10 @@ impl Config {
             &env,
             std::env::var("TURNSTILE_SITEVERIFY_URL").ok().as_deref(),
         );
+        let turnstile_hostnames = parse_turnstile_hostnames(
+            &env,
+            &std::env::var("TURNSTILE_HOSTNAMES").unwrap_or_default(),
+        )?;
         Ok(Self {
             env,
             host: std::env::var("IRIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -104,9 +110,7 @@ impl Config {
             turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY")
                 .map(|v| v.trim().to_owned())
                 .unwrap_or_default(),
-            turnstile_hostnames: parse_turnstile_hostnames(
-                &std::env::var("TURNSTILE_HOSTNAMES").unwrap_or_default(),
-            )?,
+            turnstile_hostnames,
             turnstile_siteverify_url,
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
@@ -223,23 +227,29 @@ fn is_local_http_endpoint(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1") && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
-/// Parse `TURNSTILE_HOSTNAMES` (comma-separated, lowercased). A
-/// loopback hostname is rejected outright: a token minted on
-/// `localhost` must never pass the hostname check, in any
-/// environment — a deploy that copied a dev allowlist would otherwise
-/// accept tokens from a local widget. Fails at startup (`from_env`
-/// returns `Err`, and `main` panics on it), never silently.
-fn parse_turnstile_hostnames(raw: &str) -> anyhow::Result<Vec<String>> {
+/// Parse `TURNSTILE_HOSTNAMES` (comma-separated, lowercased). In
+/// production a loopback hostname is rejected: a token minted on
+/// `localhost` must never pass the hostname check on a live deploy —
+/// a deploy that copied a dev allowlist would otherwise accept
+/// tokens from a local widget. Outside production loopback hostnames
+/// are allowed, so localhost Turnstile testing works. Fails at
+/// startup (`from_env` returns `Err`, and `main` panics on it),
+/// never silently. `env` uses the same `IRIS_ENV` value as
+/// `turnstile_siteverify_endpoint` / `resend_api_endpoint`
+/// (`"production"` = production).
+fn parse_turnstile_hostnames(env: &str, raw: &str) -> anyhow::Result<Vec<String>> {
     let hostnames: Vec<String> = raw
         .split(',')
         .map(|h| h.trim().to_lowercase())
         .filter(|h| !h.is_empty())
         .collect();
-    for host in &hostnames {
-        if is_loopback_hostname(host) {
-            return Err(anyhow::anyhow!(
-                "TURNSTILE_HOSTNAMES contains loopback hostname '{host}'; remove it — a Turnstile token minted on localhost must never be accepted"
-            ));
+    if env.eq_ignore_ascii_case("production") {
+        for host in &hostnames {
+            if is_loopback_hostname(host) {
+                return Err(anyhow::anyhow!(
+                    "TURNSTILE_HOSTNAMES contains loopback hostname '{host}'; remove it — a Turnstile token minted on localhost must never be accepted in production"
+                ));
+            }
         }
     }
     Ok(hostnames)
@@ -334,6 +344,7 @@ mod tests {
 
     #[test]
     fn turnstile_hostnames_reject_loopback() {
+        // Production rejects every loopback form.
         for bad in [
             "localhost",
             "LOCALHOST",
@@ -347,20 +358,35 @@ mod tests {
             "0:0:0:0:0:0:0:1",
         ] {
             assert!(
-                parse_turnstile_hostnames(bad).is_err(),
-                "{bad} must be rejected"
+                parse_turnstile_hostnames("production", bad).is_err(),
+                "{bad} must be rejected in production"
             );
         }
-        // One loopback entry poisons the whole list.
-        assert!(parse_turnstile_hostnames("mail.example.com, localhost").is_err());
+        // One loopback entry poisons the whole list in production.
+        assert!(parse_turnstile_hostnames("production", "mail.example.com, localhost").is_err());
+        // Outside production loopback hostnames are allowed, so
+        // localhost Turnstile testing works.
+        for env in ["development", "test", "staging"] {
+            for host in ["localhost", "127.0.0.1", "::1", "[::1]"] {
+                assert_eq!(
+                    parse_turnstile_hostnames(env, host).unwrap(),
+                    vec![host.to_string()],
+                    "{host} must be allowed in {env}"
+                );
+            }
+        }
         // Ordinary hostnames still parse (lowercased, trimmed).
         assert_eq!(
-            parse_turnstile_hostnames("mail.example.com, APP.Example.com ").unwrap(),
+            parse_turnstile_hostnames("production", "mail.example.com, APP.Example.com ").unwrap(),
             vec!["mail.example.com", "app.example.com"]
         );
         // Empty stays empty (fails closed later, at verify time).
-        assert!(parse_turnstile_hostnames("").unwrap().is_empty());
-        assert!(parse_turnstile_hostnames(" , ").unwrap().is_empty());
+        assert!(parse_turnstile_hostnames("production", "")
+            .unwrap()
+            .is_empty());
+        assert!(parse_turnstile_hostnames("production", " , ")
+            .unwrap()
+            .is_empty());
     }
 
     #[test]
