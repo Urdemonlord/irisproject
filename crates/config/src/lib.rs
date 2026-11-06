@@ -2,6 +2,12 @@ pub mod limits;
 
 use serde::{Deserialize, Serialize};
 
+/// Cloudflare's Turnstile token-validation endpoint. Single source of
+/// truth: `apps/api/src/turnstile.rs` re-exports it as `SITEVERIFY_URL`,
+/// and `Config::turnstile_siteverify_url` defaults to it.
+pub const TURNSTILE_SITEVERIFY_URL: &str =
+    "https://challenges.cloudflare.com/turnstile/v0/siteverify";
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Config {
     pub env: String,
@@ -11,8 +17,9 @@ pub struct Config {
     pub session_secret: String,
     /// Cloudflare Turnstile secret key for login verification. Empty =
     /// disabled: logins skip the Turnstile check (see
-    /// `apps/api/src/turnstile.rs`). Read from `TURNSTILE_SECRET_KEY`;
-    /// never ship it to the browser — the public half is the
+    /// `apps/api/src/turnstile.rs`). Read from `TURNSTILE_SECRET_KEY`
+    /// (trimmed — a stray space would make Siteverify reject every
+    /// login); never ship it to the browser — the public half is the
     /// `VITE_TURNSTILE_SITE_KEY` build-time variable of the web app.
     pub turnstile_secret_key: String,
     /// Frontend hostnames a Turnstile token must have been minted on.
@@ -21,6 +28,11 @@ pub struct Config {
     /// is rejected (see `apps/api/src/turnstile.rs`). Production must
     /// never list `localhost` or `127.0.0.1` here.
     pub turnstile_hostnames: Vec<String>,
+    /// Siteverify endpoint for Turnstile token checks. Read from
+    /// `TURNSTILE_SITEVERIFY_URL`; unset = the real Cloudflare
+    /// endpoint. A test/dev override so handler tests can point at a
+    /// local mock — never set it in production.
+    pub turnstile_siteverify_url: String,
     pub stalwart_api_url: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
@@ -81,13 +93,18 @@ impl Config {
                 .unwrap_or_else(|_| "sqlite:iris.db".to_string()),
             session_secret: std::env::var("SESSION_SECRET")
                 .unwrap_or_else(|_| "dev-secret-change-in-prod".to_string()),
-            turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY").unwrap_or_default(),
+            turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY")
+                .map(|v| v.trim().to_owned())
+                .unwrap_or_default(),
             turnstile_hostnames: std::env::var("TURNSTILE_HOSTNAMES")
                 .unwrap_or_default()
                 .split(',')
                 .map(|h| h.trim().to_lowercase())
                 .filter(|h| !h.is_empty())
                 .collect(),
+            turnstile_siteverify_url: std::env::var("TURNSTILE_SITEVERIFY_URL")
+                .map(|v| v.trim().to_owned())
+                .unwrap_or_else(|_| TURNSTILE_SITEVERIFY_URL.to_string()),
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")

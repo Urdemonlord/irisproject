@@ -56,6 +56,12 @@ pub const TEMP_INBOX_MESSAGE_LIMIT: u32 = 50;
 pub const MAX_FAILED_LOGINS: i64 = 10;
 /// Max failed logins per client IP per 15 minutes (tolerant of shared NAT).
 pub const MAX_FAILED_LOGINS_PER_IP: i64 = 50;
+/// Max failed Turnstile verifications per client IP per 15 minutes.
+/// Separate from the login buckets: a failed verification never
+/// reaches JMAP, so it never increments them, and without its own cap
+/// an attacker could force one outbound Siteverify call per attempt,
+/// forever.
+pub const MAX_TURNSTILE_ATTEMPTS_PER_IP: i64 = 20;
 
 // --- Authenticated message reads (debt round 2, slice 9) -------------------
 // One shared bucket for every JMAP-backed read behind the session:

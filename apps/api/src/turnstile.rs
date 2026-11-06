@@ -21,9 +21,6 @@
 use reqwest::Client;
 use serde::Deserialize;
 
-/// Cloudflare's token-validation endpoint.
-pub const SITEVERIFY_URL: &str = "https://challenges.cloudflare.com/turnstile/v0/siteverify";
-
 /// Tokens are at most 2048 characters (Cloudflare docs); anything longer
 /// cannot be a real token, so reject it without an outbound call.
 const MAX_TOKEN_LEN: usize = 2048;
@@ -67,6 +64,27 @@ fn outcome(
     expected_hostnames: &[String],
 ) -> Result<(), TurnstileError> {
     if !resp.success {
+        // Server-side problems are not the user's fault: our secret is
+        // wrong (`missing-input-secret`, `invalid-input-secret`) or
+        // Cloudflare failed (`internal-error`). Report them as an
+        // outage (503) instead of a bad token (400) so the user is not
+        // told to retry something retrying cannot fix.
+        const SERVER_ERRORS: [&str; 3] = [
+            "missing-input-secret",
+            "invalid-input-secret",
+            "internal-error",
+        ];
+        if resp
+            .error_codes
+            .iter()
+            .any(|c| SERVER_ERRORS.contains(&c.as_str()))
+        {
+            tracing::error!(
+                "turnstile: siteverify server-side failure: {:?}",
+                resp.error_codes
+            );
+            return Err(TurnstileError::Unavailable);
+        }
         tracing::warn!(
             "turnstile: siteverify rejected token: {:?}",
             resp.error_codes
@@ -94,8 +112,8 @@ fn outcome(
 
 /// Verify `token` against Siteverify. `remoteip` is the login's client IP
 /// (the same `client_ip` value the login handler already computes).
-/// `siteverify_url` is [`SITEVERIFY_URL`] in production; tests point it
-/// at a local mock server.
+/// `siteverify_url` is [`iris_config::TURNSTILE_SITEVERIFY_URL`] in
+/// production; tests point it at a local mock server.
 pub async fn verify(
     client: &Client,
     secret: &str,
@@ -450,6 +468,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn server_side_error_codes_are_unavailable() {
+        // Our secret is wrong, or Cloudflare failed: an outage (503),
+        // not a bad token (400). Each code gets its own fake server.
+        for (code, body) in [
+            (
+                "missing-input-secret",
+                r#"{"success":false,"error-codes":["missing-input-secret"]}"#,
+            ),
+            (
+                "invalid-input-secret",
+                r#"{"success":false,"error-codes":["invalid-input-secret"]}"#,
+            ),
+            (
+                "internal-error",
+                r#"{"success":false,"error-codes":["internal-error"]}"#,
+            ),
+        ] {
+            let fake = fake_siteverify("200 OK", body).await;
+            let result = verify(
+                &client(),
+                "secret",
+                Some("token"),
+                "127.0.0.1",
+                EXPECTED_ACTION,
+                &hostnames(),
+                &fake.url,
+            )
+            .await;
+            assert_eq!(result, Err(TurnstileError::Unavailable), "{code}");
+            fake.task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
     async fn http_error_is_unavailable() {
         let fake = fake_siteverify("500 Internal Server Error", r#"{"success":false}"#).await;
         let result = verify(
@@ -485,7 +537,13 @@ mod tests {
 
     #[tokio::test]
     async fn unreachable_siteverify_is_unavailable() {
-        // Port 9 (discard) is closed on loopback; nothing listens there.
+        // A just-closed ephemeral port: nothing can be listening there,
+        // without assuming any particular port is closed.
+        let addr = TcpListener::bind("127.0.0.1:0")
+            .await
+            .unwrap()
+            .local_addr()
+            .unwrap();
         let result = verify(
             &client(),
             "secret",
@@ -493,7 +551,7 @@ mod tests {
             "127.0.0.1",
             EXPECTED_ACTION,
             &hostnames(),
-            "http://127.0.0.1:9",
+            &format!("http://{addr}"),
         )
         .await;
         assert_eq!(result, Err(TurnstileError::Unavailable));

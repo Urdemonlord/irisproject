@@ -11,7 +11,7 @@ use iris_config::limits::{
     DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
     MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PASSWORD_RESET_BODY_BYTES, MAX_PREVIEW_BYTES,
     MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
-    MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, READ_WINDOW_MINUTES,
+    MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, MAX_TURNSTILE_ATTEMPTS_PER_IP, READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
 use iris_mail::{
@@ -494,7 +494,20 @@ async fn login(
     // configured (see `turnstile::verify`). The gate requires
     // success, the "login" action, and a hostname in
     // TURNSTILE_HOSTNAMES — a token minted anywhere else is rejected.
+    //
+    // Failed verifications get their own per-IP bucket: they never
+    // reach JMAP, so the login buckets above never count them, and
+    // without this cap every attempt would cost one outbound
+    // Siteverify call. A Cloudflare outage (`Unavailable`) is not
+    // the client's fault, so it is not recorded.
     if !s.config.turnstile_secret_key.is_empty() {
+        let turnstile_ip_subject = auth::hash_token(&format!("turnstile-ip:{ip}"));
+        let turnstile_failures: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM rate_limit_events WHERE subject_hash=? AND action='turnstile' AND outcome='blocked' AND occurred_at>?",
+        ).bind(&turnstile_ip_subject).bind(&since).fetch_one(&s.pool).await?;
+        if turnstile_failures >= MAX_TURNSTILE_ATTEMPTS_PER_IP {
+            return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_attempts"));
+        }
         match turnstile::verify(
             &s.http,
             &s.config.turnstile_secret_key,
@@ -502,13 +515,16 @@ async fn login(
             &ip,
             turnstile::EXPECTED_ACTION,
             &s.config.turnstile_hostnames,
-            turnstile::SITEVERIFY_URL,
+            &s.config.turnstile_siteverify_url,
         )
         .await
         {
             Ok(()) => {}
             Err(turnstile::TurnstileError::MissingToken)
             | Err(turnstile::TurnstileError::Invalid) => {
+                sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'turnstile',?,'blocked')")
+                    .bind(uuid::Uuid::new_v4().to_string()).bind(&turnstile_ip_subject).bind(auth::now())
+                    .execute(&s.pool).await?;
                 return Err(ApiError(StatusCode::BAD_REQUEST, "turnstile_failed"));
             }
             Err(turnstile::TurnstileError::Unavailable) => {
@@ -1293,6 +1309,7 @@ mod password_reset_webhook_tests {
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
                 turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -2006,6 +2023,7 @@ mod read_limit_tests {
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
                 turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -2201,6 +2219,9 @@ mod handler_integration_tests {
         /// Parsed JSON bodies of every POST /jmap/ request, in order.
         requests: Arc<Mutex<Vec<Value>>>,
         relay_calls: Arc<AtomicUsize>,
+        /// GET /jmap/session hits — the JMAP login entry point. A
+        /// handler that must not reach JMAP asserts this stays 0.
+        session_calls: Arc<AtomicUsize>,
     }
 
     fn folder_json(role: &str) -> Value {
@@ -2265,8 +2286,10 @@ mod handler_integration_tests {
         let address = listener.local_addr().unwrap();
         let requests = Arc::new(Mutex::new(Vec::new()));
         let relay_calls = Arc::new(AtomicUsize::new(0));
+        let session_calls = Arc::new(AtomicUsize::new(0));
         let task_requests = requests.clone();
         let task_relay = relay_calls.clone();
+        let task_session = session_calls.clone();
         drop(tokio::spawn(async move {
             loop {
                 let Ok(Ok((mut stream, _))) =
@@ -2333,6 +2356,16 @@ mod handler_integration_tests {
                             "application/json",
                             br#"{"id":"re_mock_1"}"#.to_vec(),
                         )
+                    } else if method == "GET" && path == "/jmap/session" {
+                        // Counted, then 404 like any unknown route: no
+                        // test needs a real session here, but the
+                        // login-gate tests assert this is never hit.
+                        task_session.fetch_add(1, Ordering::SeqCst);
+                        (
+                            "404 Not Found",
+                            "application/json",
+                            br#"{"error":"no such route"}"#.to_vec(),
+                        )
                     } else if method == "GET" && path.starts_with("/jmap/download/") {
                         ("200 OK", "application/octet-stream", script.blob.clone())
                     } else {
@@ -2357,6 +2390,7 @@ mod handler_integration_tests {
             relay_url: format!("http://{address}/emails"),
             requests,
             relay_calls,
+            session_calls,
         }
     }
 
@@ -2384,6 +2418,7 @@ mod handler_integration_tests {
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
                 turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
@@ -2771,5 +2806,247 @@ mod handler_integration_tests {
         let v = body_json(resp).await;
         assert_eq!(v["inner_name"], "report.xml");
         assert!(v["text"].as_str().unwrap().contains("google.com"));
+    }
+
+    /// Loopback fake for Cloudflare Siteverify: answers every POST with
+    /// the same canned body and counts calls. The login handler points
+    /// at it via `turnstile_siteverify_url` in the test `Config`, so
+    /// these tests exercise the real gate without touching Cloudflare.
+    struct FakeSiteverify {
+        url: String,
+        calls: Arc<AtomicUsize>,
+    }
+
+    async fn fake_siteverify_multi(
+        status_line: &'static str,
+        response_body: &'static str,
+    ) -> FakeSiteverify {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let calls = Arc::new(AtomicUsize::new(0));
+        let task_calls = calls.clone();
+        let response_body = response_body.to_string();
+        drop(tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(5), listener.accept()).await
+                else {
+                    return;
+                };
+                // Read one request: headers, then Content-Length body.
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut expected: Option<usize> = None;
+                loop {
+                    let Ok(n) = stream.read(&mut chunk).await else {
+                        return;
+                    };
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if expected.is_none() {
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected = Some(end + 4 + length);
+                        }
+                    }
+                    if let Some(end) = expected {
+                        if bytes.len() >= end {
+                            break;
+                        }
+                    }
+                }
+                task_calls.fetch_add(1, Ordering::SeqCst);
+                let response = format!(
+                    "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                    response_body.len(),
+                );
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        }));
+        FakeSiteverify {
+            url: format!("http://{address}"),
+            calls,
+        }
+    }
+
+    /// `test_state` with the Turnstile gate switched on: secret set,
+    /// hostname allowlist `mail.example.com`, Siteverify pointed at
+    /// the given mock URL.
+    async fn turnstile_test_state(jmap: &FakeJmap, siteverify_url: &str) -> Arc<AppState> {
+        let mut s = test_state(jmap, None).await;
+        let state = Arc::get_mut(&mut s).expect("test_state is the only owner");
+        state.config.turnstile_secret_key = "test-secret".into();
+        state.config.turnstile_hostnames = vec!["mail.example.com".into()];
+        state.config.turnstile_siteverify_url = siteverify_url.into();
+        s
+    }
+
+    /// One login attempt against the handler, from 127.0.0.1.
+    async fn login_attempt(s: &Arc<AppState>, token: Option<&str>) -> Result<Response, ApiError> {
+        login(
+            State(s.clone()),
+            axum::extract::ConnectInfo(std::net::SocketAddr::from(([127, 0, 0, 1], 12345))),
+            HeaderMap::new(),
+            Json(LoginBody {
+                email: "alice@example.com".into(),
+                password: "secret".into(),
+                turnstile_token: token.map(str::to_string),
+            }),
+        )
+        .await
+    }
+
+    fn assert_api_error<T: std::fmt::Debug>(
+        result: Result<T, ApiError>,
+        status: StatusCode,
+        code: &str,
+    ) {
+        let err = result.expect_err("expected an ApiError");
+        assert_eq!(err.0, status);
+        assert_eq!(err.1, code);
+    }
+
+    /// No JMAP request may happen on a gate failure: the login must
+    /// die at the Turnstile check, before any mail-server contact.
+    fn assert_jmap_untouched(jmap: &FakeJmap) {
+        assert_eq!(
+            jmap.session_calls.load(Ordering::SeqCst),
+            0,
+            "gate failure must not reach JMAP (GET /jmap/session)"
+        );
+        assert!(
+            jmap.requests.lock().unwrap().is_empty(),
+            "gate failure must not reach JMAP (POST /jmap/)"
+        );
+    }
+
+    #[tokio::test]
+    async fn login_gate_missing_token_returns_400_and_never_touches_jmap() {
+        let siteverify = fake_siteverify_multi(
+            "200 OK",
+            r#"{"success":true,"action":"login","hostname":"mail.example.com"}"#,
+        )
+        .await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        assert_api_error(
+            login_attempt(&s, None).await,
+            StatusCode::BAD_REQUEST,
+            "turnstile_failed",
+        );
+        assert_eq!(siteverify.calls.load(Ordering::SeqCst), 0);
+        assert_jmap_untouched(&jmap);
+    }
+
+    #[tokio::test]
+    async fn login_gate_invalid_token_returns_400_and_never_touches_jmap() {
+        let siteverify = fake_siteverify_multi(
+            "200 OK",
+            r#"{"success":false,"error-codes":["timeout-or-duplicate"]}"#,
+        )
+        .await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        assert_api_error(
+            login_attempt(&s, Some("stale-token")).await,
+            StatusCode::BAD_REQUEST,
+            "turnstile_failed",
+        );
+        assert_eq!(siteverify.calls.load(Ordering::SeqCst), 1);
+        assert_jmap_untouched(&jmap);
+    }
+
+    #[tokio::test]
+    async fn login_gate_unavailable_returns_503_and_never_touches_jmap() {
+        let siteverify =
+            fake_siteverify_multi("500 Internal Server Error", r#"{"success":false}"#).await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        assert_api_error(
+            login_attempt(&s, Some("token")).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "turnstile_unavailable",
+        );
+        assert_eq!(siteverify.calls.load(Ordering::SeqCst), 1);
+        assert_jmap_untouched(&jmap);
+    }
+
+    #[tokio::test]
+    async fn login_gate_server_side_error_returns_503_and_never_touches_jmap() {
+        let siteverify = fake_siteverify_multi(
+            "200 OK",
+            r#"{"success":false,"error-codes":["invalid-input-secret"]}"#,
+        )
+        .await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        assert_api_error(
+            login_attempt(&s, Some("token")).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "turnstile_unavailable",
+        );
+        assert_jmap_untouched(&jmap);
+    }
+
+    #[tokio::test]
+    async fn login_gate_valid_token_reaches_jmap() {
+        // Positive control: a good token passes the gate, so the
+        // handler contacts JMAP. The fake 404s /jmap/session, which
+        // surfaces as 502 — the point is JMAP *was* reached.
+        let siteverify = fake_siteverify_multi(
+            "200 OK",
+            r#"{"success":true,"action":"login","hostname":"mail.example.com"}"#,
+        )
+        .await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        assert_api_error(
+            login_attempt(&s, Some("good-token")).await,
+            StatusCode::BAD_GATEWAY,
+            "mail_server_unavailable",
+        );
+        assert_eq!(siteverify.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(jmap.session_calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn login_gate_per_ip_attempt_limit_returns_429() {
+        let siteverify = fake_siteverify_multi(
+            "200 OK",
+            r#"{"success":false,"error-codes":["timeout-or-duplicate"]}"#,
+        )
+        .await;
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = turnstile_test_state(&jmap, &siteverify.url).await;
+        for _ in 0..MAX_TURNSTILE_ATTEMPTS_PER_IP {
+            assert_api_error(
+                login_attempt(&s, Some("bad-token")).await,
+                StatusCode::BAD_REQUEST,
+                "turnstile_failed",
+            );
+        }
+        // The next attempt is capped before Siteverify is called.
+        assert_api_error(
+            login_attempt(&s, Some("bad-token")).await,
+            StatusCode::TOO_MANY_REQUESTS,
+            "too_many_attempts",
+        );
+        assert_eq!(
+            siteverify.calls.load(Ordering::SeqCst),
+            MAX_TURNSTILE_ATTEMPTS_PER_IP as usize
+        );
+        assert_jmap_untouched(&jmap);
     }
 }

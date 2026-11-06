@@ -148,6 +148,7 @@ mod tests {
                 session_secret: "test-secret".into(),
                 turnstile_secret_key: String::new(),
                 turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
