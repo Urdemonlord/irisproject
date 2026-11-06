@@ -183,7 +183,9 @@ function loadTurnstileScript(): Promise<void> {
       s.src = TURNSTILE_SCRIPT
       s.defer = true
       s.onload = () => resolve()
-      s.onerror = () => reject(new Error('turnstile script failed to load'))
+      // Clear the cache so a later visit to the login route retries
+      // the load instead of reusing this rejected promise forever.
+      s.onerror = () => { turnstileScript = null; reject(new Error('turnstile script failed to load')) }
       document.head.append(s)
     })
   }
@@ -248,6 +250,9 @@ function renderLogin() {
           'expired-callback': resetTurnstile,
           'error-callback': () => {
             turnstileToken = null
+            // Mark the failure so a submit shows the actionable
+            // refresh message instead of "wait for verification".
+            turnstileFailed = true
             status.replaceChildren(icon('alert'), h('span', {}, 'Verification failed to load. Refresh the page and try again.'))
           },
         })
