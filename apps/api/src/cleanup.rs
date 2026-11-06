@@ -137,6 +137,7 @@ mod tests {
         let state = Arc::new(AppState {
             pool: pool.clone(),
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
+            http: reqwest::Client::new(),
             relay: None,
             html_bodies: crate::html_body::HtmlBodyStore::new(),
             config: iris_config::Config {
@@ -145,6 +146,9 @@ mod tests {
                 port: 8000,
                 database_url: "sqlite::memory:".into(),
                 session_secret: "test-secret".into(),
+                turnstile_secret_key: String::new(),
+                turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,

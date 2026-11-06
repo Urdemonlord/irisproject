@@ -12,6 +12,11 @@ export const SITE = {
   // Separate origin that serves HTML mail bodies under one-time token
   // URLs. Empty = the app renders mail in a same-origin srcdoc iframe.
   mailContentOrigin: env.VITE_MAIL_CONTENT_ORIGIN || '',
+  // Cloudflare Turnstile site key for the login widget. Empty = no
+  // widget; the server only requires a token while
+  // TURNSTILE_SECRET_KEY is set (see apps/api/src/turnstile.rs).
+  // Build-time only: changing it needs a web rebuild.
+  turnstileSiteKey: env.VITE_TURNSTILE_SITE_KEY || '',
 }
 const analyticsConfigured = !!(SITE.analyticsSrc && SITE.analyticsWebsiteId)
 

@@ -80,6 +80,15 @@ prompt() {
   esac
 }
 
+# env_value <KEY> — read one KEY= line from .env, stripping surrounding
+# whitespace and one pair of surrounding single/double quotes
+# (dotenv-style quoting). Without the quote strip, a quoted "0x…"
+# value would reach the build (or the secret check) with literal
+# quotes attached.
+env_value() {
+  grep "^$1=" .env | cut -d= -f2- | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e "s/^'//" -e "s/'\$//" -e 's/^"//' -e 's/"$//' || true
+}
+
 # set_env <KEY> <VALUE> — replace or append a KEY= line in .env
 set_env() {
   _key=$1; _val=$2
@@ -142,7 +151,18 @@ echo "install.sh: building release API (this takes a few minutes)…"
 cargo build --release -p iris-api
 echo "install.sh: building web bundle…"
 npm --prefix apps/web ci
-npm --prefix apps/web run build
+# Forward the Turnstile site key (public) to the Vite build so the
+# login widget is baked in; the secret stays server-side only. Values
+# are read with env_value so a quoted "0x…" line in .env does not
+# reach the build (or the secret check) with literal quotes attached.
+SITE_KEY=$(env_value TURNSTILE_SITE_KEY)
+SECRET_SET=$(env_value TURNSTILE_SECRET_KEY)
+if [ -n "$SECRET_SET" ] && [ -z "$SITE_KEY" ]; then
+  echo "install.sh: WARNING: TURNSTILE_SECRET_KEY is set but TURNSTILE_SITE_KEY is empty —" >&2
+  echo "install.sh:   the login form will have no widget and every login will fail." >&2
+  echo "install.sh:   Set TURNSTILE_SITE_KEY in .env and rebuild the web." >&2
+fi
+VITE_TURNSTILE_SITE_KEY="$SITE_KEY" npm --prefix apps/web run build
 
 [ -x target/release/iris-api ] || { echo "install.sh: build failed — no target/release/iris-api" >&2; exit 1; }
 [ -f apps/web/dist/index.html ] || { echo "install.sh: build failed — no apps/web/dist/index.html" >&2; exit 1; }

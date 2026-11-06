@@ -8,6 +8,12 @@
 #   - set a real TEMP_INBOX_DOMAIN (the default is the example value);
 #   - put TLS + a public domain in front for anything beyond localhost.
 #
+# Turnstile (optional login CAPTCHA): set TURNSTILE_SECRET_KEY and
+# TURNSTILE_HOSTNAMES for the API, and TURNSTILE_SITE_KEY for the web
+# build — both keys together or neither. A secret without a site key
+# locks every login out (the form renders no widget), so the web
+# build arg below is wired the same way as the API variables.
+#
 # Known limitation: the API trusts X-Real-IP only from a loopback proxy
 # (see apps/api/src/main.rs: client_ip). In this stack nginx runs in its
 # own container, so per-IP rate limits see the proxy's IP, not the real
@@ -36,6 +42,8 @@ services:
       IRIS_PASSWORD_RESET_EMAIL_TO: ${IRIS_PASSWORD_RESET_EMAIL_TO:-}
       IRIS_PASSWORD_RESET_PUBLIC_ORIGIN: ${IRIS_PASSWORD_RESET_PUBLIC_ORIGIN:-}
       IRIS_RESEND_API_URL: ${IRIS_RESEND_API_URL:-}
+      TURNSTILE_SECRET_KEY: ${TURNSTILE_SECRET_KEY:-}
+      TURNSTILE_HOSTNAMES: ${TURNSTILE_HOSTNAMES:-}
     volumes:
       - api-data:/data
     depends_on:
@@ -45,6 +53,8 @@ services:
     build:
       context: ../../
       dockerfile: ./apps/web/Dockerfile
+      args:
+        VITE_TURNSTILE_SITE_KEY: ${TURNSTILE_SITE_KEY:-}
     ports:
       - "127.0.0.1:8080:80"
     depends_on:

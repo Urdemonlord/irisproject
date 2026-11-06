@@ -300,6 +300,10 @@ button:disabled { cursor: not-allowed; }
 .login-panel h1 { font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-h2); letter-spacing: var(--iris-tracking-display); position: relative; padding-bottom: var(--iris-space-3); }
 .login-panel h1::after { content: ""; position: absolute; left: 0; bottom: 0; width: 48px; height: 2px; background: var(--iris-ink); }
 .login-form { display: flex; flex-direction: column; gap: var(--iris-space-4); }
+/* Turnstile widget on the login form. The box only exists when a site
+ * key is baked into the build; reserve the widget height so the form
+ * does not jump when the challenge renders. */
+.turnstile-box { min-height: 65px; display: flex; align-items: center; }
 .field { display: flex; flex-direction: column; gap: var(--iris-space-2); }
 .field label { font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-graphite); }
 .input-wrap { position: relative; display: flex; align-items: center; }
