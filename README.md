@@ -125,7 +125,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `DATABASE_URL` | `sqlite:iris.db` | SQLite; use an absolute path on a persistent volume in production, e.g. `sqlite:/var/lib/iris/iris.db` |
 | `SESSION_SECRET` | `dev-secret-change-in-prod` | `openssl rand -hex 32`. Also the key for sealed mail credentials: rotating it logs everyone out |
 | `TURNSTILE_SECRET_KEY` | (empty) | Cloudflare Turnstile secret key for login verification; empty = logins skip the challenge. The public half is the web build-time variable `VITE_TURNSTILE_SITE_KEY` — see "Login CAPTCHA" below |
-| `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.example.com`); while the secret is set, an empty list rejects every login. Never list `localhost` or `127.0.0.1` in production |
+| `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.example.com`); while the secret is set, an empty list rejects every login. Loopback hostnames (`localhost`, `127.0.0.1`, `::1`) are rejected at startup |
 | `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
 | `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
 | `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
@@ -154,9 +154,16 @@ Siteverify outage — and a server-side error such as a wrong secret
 past the cap logins answer `too_many_attempts` (429) without calling
 Siteverify. While the secret is set but `TURNSTILE_HOSTNAMES` is empty, every
 login is rejected — set the allowlist to the same hostnames the
-widget is registered for, and never add `localhost` or `127.0.0.1` in
-production. When the secret is unset, logins work exactly as before
-and the API logs a startup warning.
+widget is registered for. Loopback hostnames (`localhost`,
+`127.0.0.1`, `::1`) are rejected at startup. When the secret is
+unset, the API skips verification and logins are accepted without a
+server-side Turnstile check (the API logs a startup warning) — but
+that alone does not remove the challenge: if the web bundle was built
+with `VITE_TURNSTILE_SITE_KEY`, the login form still renders the
+widget and blocks submit until a token is minted, so users still see
+(and must pass) the challenge even though the server never verifies
+the token. To remove the challenge entirely, rebuild the web without
+the site key.
 
 The web widget needs the public site key at build time:
 `VITE_TURNSTILE_SITE_KEY` (empty = no widget; see

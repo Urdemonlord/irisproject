@@ -12,10 +12,14 @@ const DEFAULTS: Record<string, string> = {
   VITE_ANALYTICS_SRC: '', // Umami — empty = analytics off
   VITE_ANALYTICS_WEBSITE_ID: '', // Umami website ID — empty = analytics off
   VITE_MAIL_CONTENT_ORIGIN: '', // separate HTML-mail origin — empty = srcdoc frame
-  // No VITE_TURNSTILE_SITE_KEY default here: a default of '' in
-  // process.env would shadow apps/web/.env.production.local (Vite
-  // prefers process.env over .env files), so a key set only in that
-  // file would never reach the bundle. site.ts treats unset as ''.
+  // No VITE_TURNSTILE_SITE_KEY default here: Vite prefers process.env
+  // over .env files, so a default placed in process.env would shadow
+  // a key set only in apps/web/.env.production.local. That shadowing
+  // rule is general — it applies to every entry in DEFAULTS below,
+  // not just this key. The Turnstile key is omitted because it has no
+  // safe built-in default: '' would silently build a bundle with no
+  // widget even when the key is set in the file. site.ts treats unset
+  // as ''.
 }
 for (const [k, v] of Object.entries(DEFAULTS)) process.env[k] ??= v
 

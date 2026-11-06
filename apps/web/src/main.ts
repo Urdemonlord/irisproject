@@ -246,7 +246,7 @@ function renderLogin() {
           sitekey: SITE.turnstileSiteKey,
           action: 'login',
           theme: 'light',
-          callback: (token) => { turnstileToken = token },
+          callback: (token) => { turnstileToken = token; turnstileFailed = false },
           'expired-callback': resetTurnstile,
           'error-callback': () => {
             turnstileToken = null
