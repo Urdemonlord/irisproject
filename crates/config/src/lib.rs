@@ -3,8 +3,9 @@ pub mod limits;
 use serde::{Deserialize, Serialize};
 
 /// Cloudflare's Turnstile token-validation endpoint. Single source of
-/// truth: `apps/api/src/turnstile.rs` re-exports it as `SITEVERIFY_URL`,
-/// and `Config::turnstile_siteverify_url` defaults to it.
+/// truth: `Config::turnstile_siteverify_url` defaults to it (and the
+/// production config pins it to this URL — see
+/// `turnstile_siteverify_endpoint`).
 pub const TURNSTILE_SITEVERIFY_URL: &str =
     "https://challenges.cloudflare.com/turnstile/v0/siteverify";
 
@@ -25,13 +26,16 @@ pub struct Config {
     /// Frontend hostnames a Turnstile token must have been minted on.
     /// Read from `TURNSTILE_HOSTNAMES` (comma-separated, lowercased).
     /// While the secret is set, an empty list fails closed: every login
-    /// is rejected (see `apps/api/src/turnstile.rs`). Production must
-    /// never list `localhost` or `127.0.0.1` here.
+    /// is rejected (see `apps/api/src/turnstile.rs`). Loopback
+    /// hostnames are rejected at startup by `parse_turnstile_hostnames`
+    /// — a token minted on `localhost` must never pass this check.
     pub turnstile_hostnames: Vec<String>,
     /// Siteverify endpoint for Turnstile token checks. Read from
     /// `TURNSTILE_SITEVERIFY_URL`; unset = the real Cloudflare
-    /// endpoint. A test/dev override so handler tests can point at a
-    /// local mock — never set it in production.
+    /// endpoint. Production is pinned to the official endpoint by
+    /// `turnstile_siteverify_endpoint`; outside production an override
+    /// is honoured only with an `https://` scheme, so the secret key
+    /// is never POSTed to an arbitrary or plaintext URL.
     pub turnstile_siteverify_url: String,
     pub stalwart_api_url: String,
     pub temp_inbox_domain: String,
@@ -82,6 +86,10 @@ impl Config {
         let env = std::env::var("IRIS_ENV").unwrap_or_else(|_| "development".to_string());
         let resend_api_url =
             resend_api_endpoint(&env, std::env::var("IRIS_RESEND_API_URL").ok().as_deref());
+        let turnstile_siteverify_url = turnstile_siteverify_endpoint(
+            &env,
+            std::env::var("TURNSTILE_SITEVERIFY_URL").ok().as_deref(),
+        );
         Ok(Self {
             env,
             host: std::env::var("IRIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -96,15 +104,10 @@ impl Config {
             turnstile_secret_key: std::env::var("TURNSTILE_SECRET_KEY")
                 .map(|v| v.trim().to_owned())
                 .unwrap_or_default(),
-            turnstile_hostnames: std::env::var("TURNSTILE_HOSTNAMES")
-                .unwrap_or_default()
-                .split(',')
-                .map(|h| h.trim().to_lowercase())
-                .filter(|h| !h.is_empty())
-                .collect(),
-            turnstile_siteverify_url: std::env::var("TURNSTILE_SITEVERIFY_URL")
-                .map(|v| v.trim().to_owned())
-                .unwrap_or_else(|_| TURNSTILE_SITEVERIFY_URL.to_string()),
+            turnstile_hostnames: parse_turnstile_hostnames(
+                &std::env::var("TURNSTILE_HOSTNAMES").unwrap_or_default(),
+            )?,
+            turnstile_siteverify_url,
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")
@@ -220,6 +223,68 @@ fn is_local_http_endpoint(url: &str) -> bool {
     matches!(host, "localhost" | "127.0.0.1") && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
+/// Parse `TURNSTILE_HOSTNAMES` (comma-separated, lowercased). A
+/// loopback hostname is rejected outright: a token minted on
+/// `localhost` must never pass the hostname check, in any
+/// environment — a deploy that copied a dev allowlist would otherwise
+/// accept tokens from a local widget. Fails at startup (`from_env`
+/// returns `Err`, and `main` panics on it), never silently.
+fn parse_turnstile_hostnames(raw: &str) -> anyhow::Result<Vec<String>> {
+    let hostnames: Vec<String> = raw
+        .split(',')
+        .map(|h| h.trim().to_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    for host in &hostnames {
+        if is_loopback_hostname(host) {
+            return Err(anyhow::anyhow!(
+                "TURNSTILE_HOSTNAMES contains loopback hostname '{host}'; remove it — a Turnstile token minted on localhost must never be accepted"
+            ));
+        }
+    }
+    Ok(hostnames)
+}
+
+/// True for hostnames that point at this machine: `localhost` (and
+/// `*.localhost`), the whole `127.0.0.0/8` range, and IPv6 loopback
+/// `::1` in any textual form (including `[::1]` and the expanded
+/// `0:0:0:0:0:0:0:1`). `IpAddr::is_loopback` covers the IP forms;
+/// the name forms need a string check.
+fn is_loopback_hostname(host: &str) -> bool {
+    let host = host.trim_end_matches('.');
+    if host == "localhost" || host.ends_with(".localhost") {
+        return true;
+    }
+    // Bracketed IPv6 literal: "[::1]" does not parse as IpAddr.
+    let bare = host
+        .strip_prefix('[')
+        .and_then(|h| h.strip_suffix(']'))
+        .unwrap_or(host);
+    bare.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
+
+/// Siteverify endpoint for Turnstile token checks. Mirrors
+/// `resend_api_endpoint`: production is pinned to Cloudflare's
+/// official endpoint, so a misconfigured deploy can never POST the
+/// secret key to an arbitrary host (and a mock answering
+/// `success:true` can never disable the gate). Outside production an
+/// override is honoured only with an `https://` scheme — an `http://`
+/// override, a bare host, or no override all fall back to the
+/// official endpoint.
+fn turnstile_siteverify_endpoint(env: &str, override_url: Option<&str>) -> String {
+    if env.eq_ignore_ascii_case("production") {
+        return TURNSTILE_SITEVERIFY_URL.to_string();
+    }
+    match override_url
+        .map(str::trim)
+        .filter(|url| url.starts_with("https://") && url.len() > "https://".len())
+    {
+        Some(url) => url.to_string(),
+        None => TURNSTILE_SITEVERIFY_URL.to_string(),
+    }
+}
+
 fn resend_api_endpoint(env: &str, override_url: Option<&str>) -> String {
     const RESEND_URL: &str = "https://api.resend.com/emails";
     if env.eq_ignore_ascii_case("production") {
@@ -265,6 +330,79 @@ mod tests {
                 "https://api.resend.com/emails"
             );
         }
+    }
+
+    #[test]
+    fn turnstile_hostnames_reject_loopback() {
+        for bad in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "foo.localhost",
+            "127.0.0.1",
+            "127.0.0.2",
+            "127.9.9.9",
+            "::1",
+            "[::1]",
+            "0:0:0:0:0:0:0:1",
+        ] {
+            assert!(
+                parse_turnstile_hostnames(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        // One loopback entry poisons the whole list.
+        assert!(parse_turnstile_hostnames("mail.example.com, localhost").is_err());
+        // Ordinary hostnames still parse (lowercased, trimmed).
+        assert_eq!(
+            parse_turnstile_hostnames("mail.example.com, APP.Example.com ").unwrap(),
+            vec!["mail.example.com", "app.example.com"]
+        );
+        // Empty stays empty (fails closed later, at verify time).
+        assert!(parse_turnstile_hostnames("").unwrap().is_empty());
+        assert!(parse_turnstile_hostnames(" , ").unwrap().is_empty());
+    }
+
+    #[test]
+    fn production_pins_siteverify_to_cloudflare() {
+        for override_url in [
+            Some("https://mock.invalid/siteverify"),
+            Some("http://127.0.0.1:8765"),
+            Some("http://mock.invalid/siteverify"),
+            None,
+        ] {
+            assert_eq!(
+                turnstile_siteverify_endpoint("production", override_url),
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                "production must ignore {override_url:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn development_allows_only_https_siteverify_override() {
+        assert_eq!(
+            turnstile_siteverify_endpoint("development", Some("https://mock.invalid/siteverify")),
+            "https://mock.invalid/siteverify"
+        );
+        // http (even loopback), bare hosts and empty all fall back.
+        for bad in [
+            "http://127.0.0.1:8765",
+            "http://mock.invalid/siteverify",
+            "mock.invalid",
+            "https://",
+            "",
+        ] {
+            assert_eq!(
+                turnstile_siteverify_endpoint("development", Some(bad)),
+                "https://challenges.cloudflare.com/turnstile/v0/siteverify",
+                "{bad} must fall back to the official endpoint"
+            );
+        }
+        assert_eq!(
+            turnstile_siteverify_endpoint("development", None),
+            "https://challenges.cloudflare.com/turnstile/v0/siteverify"
+        );
     }
 
     #[test]

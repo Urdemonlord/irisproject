@@ -130,6 +130,7 @@ mod tests {
         assert_eq!(TEMP_INBOX_MESSAGE_LIMIT, 50);
         assert_eq!(MAX_FAILED_LOGINS, 10);
         assert_eq!(MAX_FAILED_LOGINS_PER_IP, 50);
+        assert_eq!(MAX_TURNSTILE_ATTEMPTS_PER_IP, 20);
         assert_eq!(MAX_READS_PER_WINDOW, 600);
         assert_eq!(READ_WINDOW_MINUTES, 10);
         assert_eq!(DEFAULT_LIST_LIMIT, 50);
