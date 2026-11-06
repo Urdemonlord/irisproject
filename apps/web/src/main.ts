@@ -159,6 +159,9 @@ declare global {
         container: HTMLElement,
         params: {
           sitekey: string
+          // The action the token is minted for; the server requires
+          // it to be "login" (see apps/api/src/turnstile.rs).
+          action?: string
           theme?: 'light' | 'dark' | 'auto'
           callback?: (token: string) => void
           'expired-callback'?: () => void
@@ -219,9 +222,12 @@ function renderLogin() {
   trackEyes(email, catWrap)
 
   // Turnstile widget, only when a site key is baked into the build.
-  // The token is single-use and expires after 5 minutes: it is cleared
-  // (and the widget reset) on every failed login, and when it expires,
-  // so the next attempt always mints a fresh token.
+  // Explicit rendering: the login form mounts after page load (SPA),
+  // so implicit rendering could miss it. The token is single-use and
+  // expires after 5 minutes: it is cleared (and the widget reset)
+  // after every completed login request and when it expires, so the
+  // next attempt always mints a fresh token. The widget mints tokens
+  // with action "login", which the server requires.
   let turnstileToken: string | null = null
   let turnstileWidgetId: string | null = null
   let turnstileFailed = false
@@ -236,6 +242,7 @@ function renderLogin() {
         if (!window.turnstile) return
         turnstileWidgetId = window.turnstile.render(turnstileBox, {
           sitekey: SITE.turnstileSiteKey,
+          action: 'login',
           theme: 'light',
           callback: (token) => { turnstileToken = token },
           'expired-callback': resetTurnstile,
@@ -292,6 +299,9 @@ function renderLogin() {
     const restore = busy(submit, 'Signing in…')
     try {
       await api('/auth/login', { method: 'POST', body: JSON.stringify({ email: email.value.trim(), password: password.value, turnstile_token: turnstileToken ?? undefined }) })
+      // The token was spent by the request: reset so the widget mints
+      // a fresh one (single-use tokens cannot be replayed).
+      resetTurnstile()
       await renderMailbox()
     } catch (err) {
       const code = (err as HttpError).code
