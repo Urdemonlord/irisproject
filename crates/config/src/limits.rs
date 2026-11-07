@@ -44,6 +44,20 @@ pub const MAX_HEADER_IDS: usize = 20;
 pub const MAX_HEADER_ID_LEN: usize = 250;
 /// Max sends per user per hour.
 pub const SENDS_PER_HOUR: i64 = 100;
+/// Max attachments on one composed message.
+pub const MAX_COMPOSE_ATTACHMENTS: usize = 5;
+/// Max size of one composed attachment, in bytes (decoded).
+pub const MAX_COMPOSE_ATTACHMENT_BYTES: usize = 5_000_000;
+/// Max total size of all attachments on one composed message, in bytes (decoded).
+pub const MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES: usize = 10_000_000;
+/// Max attachment filename length, in characters.
+pub const MAX_ATTACHMENT_NAME_CHARS: usize = 255;
+/// Max JSON body for the compose send/draft endpoints. Base64 inflates the
+/// 10 MB attachment cap to ~13.4 MB, plus up to 1 MB of body text; 16 MB
+/// leaves headroom without letting an unbounded body reach the handlers.
+/// (Named separately from the attachment caps: retuning one must never
+/// silently retune the other.)
+pub const MAX_COMPOSE_JSON_BYTES: usize = 16_000_000;
 
 // --- Temp inboxes (were `apps/api/src/temp.rs`) ----------------------------
 
@@ -143,6 +157,11 @@ mod tests {
         assert_eq!(MAX_HEADER_IDS, 20);
         assert_eq!(MAX_HEADER_ID_LEN, 250);
         assert_eq!(SENDS_PER_HOUR, 100);
+        assert_eq!(MAX_COMPOSE_ATTACHMENTS, 5);
+        assert_eq!(MAX_COMPOSE_ATTACHMENT_BYTES, 5_000_000);
+        assert_eq!(MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES, 10_000_000);
+        assert_eq!(MAX_ATTACHMENT_NAME_CHARS, 255);
+        assert_eq!(MAX_COMPOSE_JSON_BYTES, 16_000_000);
         assert_eq!(IP_CREATES_PER_HOUR, 10);
         assert_eq!(ACTIVE_PER_CLIENT, 3);
         assert_eq!(TEMP_INBOX_MESSAGE_LIMIT, 50);

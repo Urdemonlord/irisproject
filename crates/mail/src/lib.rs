@@ -1,5 +1,6 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use iris_config::limits::{MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -159,6 +160,26 @@ pub struct Compose {
     pub text: String,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
+    /// Files to attach. Bytes are already validated and bounded by the API
+    /// (see `iris_config::limits`); the mail crate never re-checks sizes,
+    /// it only uploads what it is given.
+    pub attachments: Vec<ComposeAttachment>,
+}
+
+/// One file attached to an outgoing message: validated by the API, in memory.
+#[derive(Debug, Clone)]
+pub struct ComposeAttachment {
+    pub name: String,
+    pub content_type: String,
+    pub bytes: Vec<u8>,
+}
+
+/// A composed attachment after upload: the blob id JMAP references.
+#[derive(Debug, Clone)]
+pub struct UploadedAttachment {
+    pub blob_id: String,
+    pub name: String,
+    pub content_type: String,
 }
 
 #[derive(Clone)]
@@ -970,6 +991,33 @@ impl JmapClient {
             .ok_or_else(|| MailError::Protocol("upload: no blobId".into()))
     }
 
+    /// Uploads every composed attachment, in order, and returns their blob
+    /// ids. Fails fast on the first failed upload: callers run this BEFORE
+    /// any Email/set, so a failed upload never leaves a half-attached
+    /// message behind. Blobs uploaded before the failure are orphaned on
+    /// the server (never referenced by any message); JMAP blobs are
+    /// unaddressable without their id, so nothing leaks.
+    async fn upload_attachments(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        attachments: &[ComposeAttachment],
+    ) -> Result<Vec<UploadedAttachment>, MailError> {
+        let mut out = Vec::with_capacity(attachments.len());
+        for a in attachments {
+            let blob_id = self
+                .upload(user, pass, account, &a.content_type, a.bytes.clone())
+                .await?;
+            out.push(UploadedAttachment {
+                blob_id,
+                name: a.name.clone(),
+                content_type: a.content_type.clone(),
+            });
+        }
+        Ok(out)
+    }
+
     /// Permanently deletes one message.
     pub async fn destroy_one(
         &self,
@@ -994,7 +1042,11 @@ impl JmapClient {
         replace: Option<&str>,
     ) -> Result<String, MailError> {
         let drafts = self.folder_id(user, pass, account, "drafts").await?;
-        let mut set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut set =
+            json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
         if let Some(old) = replace {
             set["destroy"] = json!([old]);
         }
@@ -1026,7 +1078,12 @@ impl JmapClient {
         };
         let (drafts, sent) = (id_of("drafts")?, id_of("sent")?);
         let identity = self.identity(user, pass, account, &c.from).await?;
-        let mut email_set = json!({"accountId": account, "create": {"n": email_json(c, &drafts)}});
+        // Uploads first: if one fails, no Email/set runs and nothing is sent.
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut email_set =
+            json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
         if let Some(old) = draft {
             email_set["destroy"] = json!([old]);
         }
@@ -1066,7 +1123,10 @@ impl JmapClient {
         draft: Option<&str>,
     ) -> Result<(), MailError> {
         let sent = self.folder_id(user, pass, account, "sent").await?;
-        let mut e = email_json(c, &sent);
+        let uploaded = self
+            .upload_attachments(user, pass, account, &c.attachments)
+            .await?;
+        let mut e = email_json(c, &sent, &uploaded);
         e["keywords"] = json!({"$seen": true});
         let mut set = json!({"accountId": account, "create": {"n": e}});
         if let Some(old) = draft {
@@ -1597,7 +1657,11 @@ fn updated(r: &Value, id: &str) -> Result<(), MailError> {
 }
 
 /// JMAP Email/create object for a plain-text message in `mailbox`, flagged as a draft.
-fn email_json(c: &Compose, mailbox: &str) -> Value {
+/// `uploaded` holds the blob ids of already-uploaded attachments (JMAP
+/// EmailBodyPart: `blobId` + `type` + `name`; `disposition` marks them as
+/// attachments rather than inline parts). Empty when there are none, in
+/// which case the `attachments` property is omitted entirely.
+fn email_json(c: &Compose, mailbox: &str, uploaded: &[UploadedAttachment]) -> Value {
     let addrs = |v: &[String]| v.iter().map(|e| json!({"email": e})).collect::<Vec<_>>();
     let mut e = json!({
         "mailboxIds": {mailbox: true},
@@ -1620,6 +1684,17 @@ fn email_json(c: &Compose, mailbox: &str) -> Value {
     if !c.references.is_empty() {
         e["references"] = json!(c.references);
     }
+    if !uploaded.is_empty() {
+        e["attachments"] = json!(uploaded
+            .iter()
+            .map(|a| json!({
+                "blobId": a.blob_id,
+                "type": a.content_type,
+                "name": a.name,
+                "disposition": "attachment",
+            }))
+            .collect::<Vec<_>>());
+    }
     e
 }
 
@@ -1638,14 +1713,47 @@ mod tests {
             references: vec!["m0@x".into(), "m1@x".into()],
             ..Default::default()
         };
-        let e = email_json(&c, "D");
+        let e = email_json(&c, "D", &[]);
         assert_eq!(e["mailboxIds"]["D"], true);
         assert_eq!(e["keywords"]["$draft"], true);
         assert_eq!(e["to"][0]["email"], "b@x.id");
         assert!(e.get("cc").is_none() && e.get("bcc").is_none());
+        assert!(e.get("attachments").is_none());
         assert_eq!(e["bodyValues"]["b"]["value"], "Body");
         assert_eq!(e["inReplyTo"][0], "m1@x");
         assert_eq!(e["references"][1], "m1@x");
+    }
+
+    #[test]
+    fn email_json_emits_attachments() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            ..Default::default()
+        };
+        let uploaded = vec![
+            UploadedAttachment {
+                blob_id: "blob-1".into(),
+                name: "notes.txt".into(),
+                content_type: "text/plain".into(),
+            },
+            UploadedAttachment {
+                blob_id: "blob-2".into(),
+                name: "photo.png".into(),
+                content_type: "image/png".into(),
+            },
+        ];
+        let e = email_json(&c, "D", &uploaded);
+        let atts = e["attachments"].as_array().expect("attachments array");
+        assert_eq!(atts.len(), 2);
+        assert_eq!(atts[0]["blobId"], "blob-1");
+        assert_eq!(atts[0]["type"], "text/plain");
+        assert_eq!(atts[0]["name"], "notes.txt");
+        assert_eq!(atts[0]["disposition"], "attachment");
+        assert_eq!(atts[1]["blobId"], "blob-2");
+        assert_eq!(atts[1]["name"], "photo.png");
     }
 
     #[test]
@@ -1924,6 +2032,17 @@ fn resend_json(c: &Compose) -> Value {
     if !c.bcc.is_empty() {
         v["bcc"] = json!(c.bcc);
     }
+    if !c.attachments.is_empty() {
+        // Resend's format: base64 content + filename per attachment.
+        v["attachments"] = json!(c
+            .attachments
+            .iter()
+            .map(|a| json!({
+                "content": BASE64.encode(&a.bytes),
+                "filename": a.name,
+            }))
+            .collect::<Vec<_>>());
+    }
     let mut headers = serde_json::Map::new();
     if let Some(r) = &c.in_reply_to {
         headers.insert("In-Reply-To".into(), json!(format!("<{r}>")));
@@ -1965,8 +2084,34 @@ mod resend_tests {
         assert_eq!(v["from"], "a@x.id");
         assert_eq!(v["to"][0], "b@gmail.com");
         assert!(v.get("cc").is_none());
+        assert!(v.get("attachments").is_none());
         assert_eq!(v["bcc"][0], "c@y.id");
         assert_eq!(v["headers"]["In-Reply-To"], "<m1@x>");
         assert_eq!(v["headers"]["References"], "<m0@x> <m1@x>");
+    }
+
+    #[test]
+    fn resend_payload_with_attachments() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@gmail.com".into()],
+            subject: "files".into(),
+            text: "t".into(),
+            attachments: vec![ComposeAttachment {
+                name: "hello.txt".into(),
+                content_type: "text/plain".into(),
+                bytes: b"hello".to_vec(),
+            }],
+            ..Default::default()
+        };
+        let v = resend_json(&c);
+        let atts = v["attachments"].as_array().expect("attachments array");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["filename"], "hello.txt");
+        // Resend wants base64 content; it must decode back to the raw bytes.
+        let decoded = BASE64
+            .decode(atts[0]["content"].as_str().expect("base64 string"))
+            .expect("valid base64");
+        assert_eq!(decoded, b"hello");
     }
 }

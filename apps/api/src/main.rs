@@ -8,9 +8,9 @@ use axum::{
 };
 use iris_auth as auth;
 use iris_config::limits::{
-    DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP,
-    MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PASSWORD_RESET_BODY_BYTES, MAX_PREVIEW_BYTES,
-    MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
+    DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_COMPOSE_JSON_BYTES, MAX_FAILED_LOGINS,
+    MAX_FAILED_LOGINS_PER_IP, MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PASSWORD_RESET_BODY_BYTES,
+    MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
     MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, MAX_TURNSTILE_ATTEMPTS_PER_IP, READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
@@ -258,9 +258,14 @@ async fn main() {
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/drafts",
-            post(compose::save_draft),
+            // Base64 attachments inflate the JSON body past Axum's 2 MB
+            // default; the cap lives in limits so a retune stays deliberate.
+            post(compose::save_draft).layer(DefaultBodyLimit::max(MAX_COMPOSE_JSON_BYTES)),
         )
-        .route("/api/v1/mailboxes/:mailbox_id/send", post(compose::send))
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/send",
+            post(compose::send).layer(DefaultBodyLimit::max(MAX_COMPOSE_JSON_BYTES)),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             require_session,
