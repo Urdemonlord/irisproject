@@ -16,7 +16,7 @@ use iris_config::limits::{
 use iris_config::Config;
 use iris_mail::{
     extract_text_attachment, valid_label, Attachment, Compose, JmapClient, ListPage, MailError,
-    MessageDetail, ResendClient, View, FILTER_SCRIPT_NAME,
+    MessageDetail, ResendClient, View,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -2244,6 +2244,7 @@ mod handler_integration_tests {
     use super::*;
     use axum::body::to_bytes;
     use iris_config::limits::{MAX_LIST_LIMIT, MAX_SEARCH_QUERY_CHARS, SENDS_PER_HOUR};
+    use iris_mail::FILTER_SCRIPT_NAME;
     use serde_json::Value;
     use std::{
         sync::{
@@ -2999,16 +3000,14 @@ mod handler_integration_tests {
         )
         .await
         .unwrap();
-        let reqs = jmap.requests.lock().unwrap();
-        let set = reqs
-            .iter()
-            .find(|r| r["methodCalls"][0][0] == "Email/set")
-            .unwrap();
-        assert_eq!(
-            set["methodCalls"][0][1]["update"]["m1"]["mailboxIds"],
-            json!({"c-1": true})
-        );
-        drop(reqs);
+        let set = {
+            let reqs = jmap.requests.lock().unwrap();
+            reqs.iter()
+                .find(|r| r["methodCalls"][0][0] == "Email/set")
+                .unwrap()["methodCalls"][0][1]["update"]["m1"]["mailboxIds"]
+                .clone()
+        };
+        assert_eq!(set, json!({"c-1": true}));
         jmap.requests.lock().unwrap().clear();
 
         // Moving back into Sent works: Undo restores a message to the
