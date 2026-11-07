@@ -858,9 +858,9 @@ struct Page {
     position: Option<u32>,
     /// Standard folder role (default `inbox`).
     folder: Option<String>,
-    /// Custom folder id. Giving both `folder` and `folder_id` is an error:
-    /// they name different folders and silently picking one would list
-    /// the wrong folder.
+    /// Custom folder id. Giving both `folder` and `folder_id` is an error
+    /// unless a `label` or `view` is also given: those win over the folder
+    /// selectors, so the combination is only ambiguous on its own.
     folder_id: Option<String>,
     /// `starred`; wins over `folder` / `folder_id`.
     view: Option<String>,
@@ -872,7 +872,7 @@ struct Page {
 /// Which list a `Page` asks for. Every input is validated here.
 fn page_view(p: &Page) -> Result<View<'_>, ApiError> {
     let bad = |code| ApiError(StatusCode::BAD_REQUEST, code);
-    if p.folder.is_some() && p.folder_id.is_some() {
+    if p.folder.is_some() && p.folder_id.is_some() && p.label.is_none() && p.view.is_none() {
         return Err(bad("invalid_request"));
     }
     if let Some(l) = p.label.as_deref() {
@@ -2904,6 +2904,33 @@ mod handler_integration_tests {
                 .unwrap_err();
             assert_eq!(e.0, StatusCode::BAD_REQUEST);
         }
+
+        // A higher-priority label or view wins over both folder selectors,
+        // so the combination is only refused when neither is given.
+        jmap.requests.lock().unwrap().clear();
+        let p = page(|p| {
+            p.folder = Some("inbox".into());
+            p.folder_id = Some("c-1".into());
+            p.label = Some("work".into());
+        });
+        list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap();
+        assert_eq!(query_filter(&jmap)["conditions"][0]["hasKeyword"], "work");
+
+        jmap.requests.lock().unwrap().clear();
+        let p = page(|p| {
+            p.folder = Some("inbox".into());
+            p.folder_id = Some("c-1".into());
+            p.view = Some("starred".into());
+        });
+        list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
+            .await
+            .unwrap();
+        assert_eq!(
+            query_filter(&jmap)["conditions"][0]["hasKeyword"],
+            "$flagged"
+        );
     }
 
     #[tokio::test]
