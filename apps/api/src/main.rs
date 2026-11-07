@@ -858,7 +858,9 @@ struct Page {
     position: Option<u32>,
     /// Standard folder role (default `inbox`).
     folder: Option<String>,
-    /// Custom folder id; wins over `folder`.
+    /// Custom folder id. Giving both `folder` and `folder_id` is an error:
+    /// they name different folders and silently picking one would list
+    /// the wrong folder.
     folder_id: Option<String>,
     /// `starred`; wins over `folder` / `folder_id`.
     view: Option<String>,
@@ -870,6 +872,9 @@ struct Page {
 /// Which list a `Page` asks for. Every input is validated here.
 fn page_view(p: &Page) -> Result<View<'_>, ApiError> {
     let bad = |code| ApiError(StatusCode::BAD_REQUEST, code);
+    if p.folder.is_some() && p.folder_id.is_some() {
+        return Err(bad("invalid_request"));
+    }
     if let Some(l) = p.label.as_deref() {
         return if valid_label(l) {
             Ok(View::Label(l))
@@ -2886,6 +2891,12 @@ mod handler_integration_tests {
             page(|p| p.label = Some("$seen".into())),
             page(|p| p.view = Some("junk".into())),
             page(|p| p.folder_id = Some("../x".into())),
+            // Both a role and a custom folder id: ambiguous, refused
+            // instead of silently listing one of them.
+            page(|p| {
+                p.folder = Some("inbox".into());
+                p.folder_id = Some("c-1".into());
+            }),
         ] {
             let e = list_messages(State(s.clone()), Extension(user()), Path("mbx-1".into()), p)
                 .await
