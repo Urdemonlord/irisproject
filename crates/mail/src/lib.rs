@@ -851,8 +851,9 @@ impl JmapClient {
             .map(str::to_string);
         let Some(script) = script else {
             let Some(id) = existing_id else { return Ok(()) };
+            let was_active = existing.as_ref().is_some_and(|s| s["isActive"] == true);
             let mut calls = vec![];
-            if existing.as_ref().is_some_and(|s| s["isActive"] == true) {
+            if was_active {
                 calls.push(json!(["SieveScript/set", {"accountId": account, "onSuccessDeactivateScript": true}, "a"]));
             }
             calls.push(json!(["SieveScript/set", {"accountId": account, "destroy": [id]}, "d"]));
@@ -862,6 +863,36 @@ impl JmapClient {
             let last = r.last().cloned().unwrap_or_default();
             if last["destroyed"].as_array().is_some_and(|d| !d.is_empty()) {
                 return Ok(());
+            }
+            // The deactivate in this same request already ran, so the script
+            // is now inactive while the caller (filter delete) restores the
+            // database rule on this error. Reactivate it, so the running
+            // script still matches the stored rules instead of silently
+            // stopping every filter.
+            if was_active {
+                let reactivated = match self
+                    .call_using(
+                        user,
+                        pass,
+                        &USING_SIEVE,
+                        json!([["SieveScript/set", {"accountId": account, "onSuccessActivateScript": id}, "r"]]),
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        let first = r.first().cloned().unwrap_or_default();
+                        !["notCreated", "notUpdated", "notDestroyed"].iter().any(|k| {
+                            first[k].as_object().is_some_and(|o| !o.is_empty())
+                        })
+                    }
+                    Err(_) => false,
+                };
+                if !reactivated {
+                    return Err(MailError::Protocol(format!(
+                        "filter script not removed and could not be reactivated; filters are inactive: {}",
+                        last["notDestroyed"]
+                    )));
+                }
             }
             return Err(MailError::Protocol(format!(
                 "filter script not removed: {}",

@@ -16,7 +16,7 @@ use iris_config::limits::{
 use iris_config::Config;
 use iris_mail::{
     extract_text_attachment, valid_label, Attachment, Compose, JmapClient, ListPage, MailError,
-    MessageDetail, ResendClient, View,
+    MessageDetail, ResendClient, View, FILTER_SCRIPT_NAME,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -2278,6 +2278,10 @@ mod handler_integration_tests {
         custom: Vec<(&'static str, &'static str)>,
         /// Whether SieveScript/set succeeds.
         sieve_ok: bool,
+        /// Existing `iris-filters` script for SieveScript/get: (id, is_active).
+        sieve_existing: Option<(&'static str, bool)>,
+        /// Whether the destroy in a script-removal request succeeds.
+        sieve_destroy_ok: bool,
     }
 
     impl Default for JmapScript {
@@ -2291,6 +2295,8 @@ mod handler_integration_tests {
                 blob: vec![],
                 custom: vec![],
                 sieve_ok: true,
+                sieve_existing: None,
+                sieve_destroy_ok: true,
             }
         }
     }
@@ -2326,7 +2332,26 @@ mod handler_integration_tests {
                 }));
                 vec![json!(["Mailbox/get", {"list": list}, "m"])]
             }
-            "SieveScript/get" => vec![json!(["SieveScript/get", {"list": []}, "g"])],
+            "SieveScript/get" => {
+                let list: Vec<Value> = script
+                    .sieve_existing
+                    .map(|(id, active)| {
+                        json!({"id": id, "name": FILTER_SCRIPT_NAME, "isActive": active})
+                    })
+                    .into_iter()
+                    .collect();
+                vec![json!(["SieveScript/get", {"list": list}, "g"])]
+            }
+            // Script removal sends deactivate + destroy in one request.
+            // The mock answers one response per call, in order.
+            "SieveScript/set" if calls.len() == 2 => {
+                let destroy = if script.sieve_destroy_ok {
+                    json!(["SieveScript/set", {"destroyed": ["sieve-1"], "notDestroyed": {}}, "d"])
+                } else {
+                    json!(["SieveScript/set", {"destroyed": [], "notDestroyed": {"sieve-1": {"type": "serverFail"}}}, "d"])
+                };
+                vec![json!(["SieveScript/set", {}, "a"]), destroy]
+            }
             "SieveScript/set" if script.sieve_ok => vec![
                 json!(["SieveScript/set", {"created": {"n": {"id": "sieve-1"}}, "notCreated": {}}, "s"]),
             ],
@@ -3054,6 +3079,44 @@ mod handler_integration_tests {
             .unwrap_err();
             assert_eq!(e.1, "invalid_filter");
         }
+    }
+
+    /// Deleting the last filter when the server refuses to destroy the
+    /// active script: the database rule is restored AND the script is
+    /// reactivated, so the stored rules and the running script agree.
+    #[tokio::test]
+    async fn filter_delete_reactivates_script_when_destroy_fails() {
+        let jmap = fake_jmap(JmapScript {
+            sieve_existing: Some(("sieve-1", true)),
+            sieve_destroy_ok: false,
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        sqlx::query(
+            "INSERT INTO mail_filters (id, mailbox_id, field, value, action, target, created_at) \
+             VALUES ('r-1', 'mbx-1', 'subject', 'news', 'read', NULL, '2026-01-01T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let e = filters::delete(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "r-1".into())),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.0, StatusCode::BAD_GATEWAY);
+        // The rule is restored, so the delete did not happen.
+        assert_eq!(filter_count(&s).await, 1);
+        // And the script was reactivated after the failed destroy.
+        let reqs = jmap.requests.lock().unwrap();
+        assert!(
+            reqs.iter()
+                .any(|r| r["methodCalls"][0][1]["onSuccessActivateScript"] == "sieve-1"),
+            "expected a reactivation call, got: {reqs:?}"
+        );
     }
 
     /// A filter create waits on the organize lock: while the lock is held
