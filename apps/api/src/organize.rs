@@ -160,6 +160,10 @@ pub(crate) async fn delete_label(
     Path((mailbox_id, name)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    // Held across the in-use check, the keyword clear and the row delete:
+    // a filter created between the check and the delete would otherwise
+    // keep pointing at a label that no longer exists.
+    let _guard = s.organize_lock.lock().await;
     let name = clean_label(&name)?;
     if !label_exists(&s, &mailbox_id, &name).await? {
         return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
@@ -280,6 +284,10 @@ pub(crate) async fn delete_folder(
     Path((mailbox_id, folder_id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    // Held across the in-use check and the delete: a filter created
+    // between them would otherwise keep moving mail into a folder that
+    // no longer exists.
+    let _guard = s.organize_lock.lock().await;
     message_id(&folder_id)?;
     let folders = s
         .jmap

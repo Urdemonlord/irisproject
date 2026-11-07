@@ -39,6 +39,14 @@ pub(crate) struct AppState {
     pool: SqlitePool,
     config: Config,
     jmap: JmapClient,
+    /// Serializes filter mutations and label/folder deletes. Each of those
+    /// handlers is a check-then-act spanning SQLite and JMAP (insert a rule,
+    /// then rebuild and install the Sieve script; check no filter uses a
+    /// label, then delete it), so no SQLite transaction can make it atomic:
+    /// the Sieve install and the JMAP delete live outside the database.
+    /// One process serves this API, so a process-local mutex is enough.
+    /// Hold it across the whole mutation, including the JMAP call.
+    organize_lock: tokio::sync::Mutex<()>,
     /// Shared outbound HTTP client (Turnstile Siteverify). One client for
     /// the process, like `JmapClient`'s own; a fresh client per login
     /// would throw away connection reuse on every attempt.
@@ -155,6 +163,7 @@ async fn main() {
     }
     let state = Arc::new(AppState {
         pool,
+        organize_lock: tokio::sync::Mutex::new(()),
         html_bodies: html_body::HtmlBodyStore::new(),
         jmap: JmapClient::new(config.stalwart_api_url.clone()),
         http: reqwest::Client::builder()
@@ -1362,6 +1371,7 @@ mod password_reset_webhook_tests {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         Arc::new(AppState {
             pool,
+            organize_lock: tokio::sync::Mutex::new(()),
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay,
@@ -2076,6 +2086,7 @@ mod read_limit_tests {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         Arc::new(AppState {
             pool,
+            organize_lock: tokio::sync::Mutex::new(()),
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,
@@ -2507,6 +2518,7 @@ mod handler_integration_tests {
             .unwrap();
         Arc::new(AppState {
             pool,
+            organize_lock: tokio::sync::Mutex::new(()),
             jmap: JmapClient::new(jmap.base_url.clone()),
             http: reqwest::Client::new(),
             relay,
@@ -3042,6 +3054,37 @@ mod handler_integration_tests {
             .unwrap_err();
             assert_eq!(e.1, "invalid_filter");
         }
+    }
+
+    /// A filter create waits on the organize lock: while the lock is held
+    /// it cannot reach the insert or the Sieve install, so two concurrent
+    /// creates (or a create racing a label delete) can never interleave a
+    /// stale rule read with a newer install.
+    #[tokio::test]
+    async fn filter_create_waits_for_the_organize_lock() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let guard = s.organize_lock.lock().await;
+        let s2 = s.clone();
+        let mut create = tokio::spawn(async move {
+            filters::create(
+                State(s2),
+                Extension(user()),
+                Path("mbx-1".into()),
+                new_rule(json!({"field": "subject", "value": "news", "action": "read"})),
+            )
+            .await
+        });
+        assert!(
+            timeout(Duration::from_millis(200), &mut create)
+                .await
+                .is_err(),
+            "create finished while the organize lock was held"
+        );
+        drop(guard);
+        let resp = create.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        assert_eq!(filter_count(&s).await, 1);
     }
 
     /// Handler-side clamps: a huge page is capped at MAX_LIST_LIMIT and a

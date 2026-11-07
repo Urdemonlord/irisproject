@@ -180,6 +180,11 @@ pub(crate) async fn create(
     Json(b): Json<NewRule>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    // Held across validation, the insert and the Sieve install: the
+    // install must read the rule set this insert just wrote, with no
+    // concurrent filter change or label/folder delete in between.
+    // See `organize_lock`.
+    let _guard = s.organize_lock.lock().await;
     let bad = |code| ApiError(StatusCode::BAD_REQUEST, code);
     if !["from", "to", "subject"].contains(&b.field.as_str()) {
         return Err(bad("invalid_filter"));
@@ -261,6 +266,9 @@ pub(crate) async fn delete(
     Path((mailbox_id, id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    // Held across the delete and the Sieve install: same reason as in
+    // `create`, so a concurrent change cannot install a stale script.
+    let _guard = s.organize_lock.lock().await;
     let row: Option<(String, String, String, Option<String>, String)> = sqlx::query_as(
         "SELECT field, value, action, target, created_at FROM mail_filters WHERE id=? AND mailbox_id=?",
     )
