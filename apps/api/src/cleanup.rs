@@ -136,6 +136,7 @@ mod tests {
             .unwrap();
         let state = Arc::new(AppState {
             pool: pool.clone(),
+            organize_lock: tokio::sync::Mutex::new(()),
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,

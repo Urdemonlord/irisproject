@@ -50,7 +50,10 @@ pub(crate) async fn folders(
 
 #[derive(Deserialize)]
 pub(crate) struct MoveBody {
-    folder: String,
+    /// A standard folder role.
+    folder: Option<String>,
+    /// Or a custom folder id.
+    folder_id: Option<String>,
 }
 
 pub(crate) async fn move_message(
@@ -61,9 +64,28 @@ pub(crate) async fn move_message(
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
     message_id(&id)?;
-    let role = folder_role(&b.folder)?;
-    if role == "drafts" || role == "sent" {
-        // Drafts/Sent are filled by composing and sending, not by moving mail in.
+    if let Some(target) = b.folder_id {
+        message_id(&target)?;
+        let folders = s
+            .jmap
+            .folders(&u.creds.user, &u.creds.pass, &account)
+            .await?;
+        if !folders
+            .iter()
+            .any(|f| f.id == target && f.role == iris_mail::CUSTOM_ROLE)
+        {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
+        }
+        s.jmap
+            .move_to_id(&u.creds.user, &u.creds.pass, &account, &id, &target)
+            .await?;
+        return Ok(StatusCode::NO_CONTENT.into_response());
+    }
+    let role = folder_role(b.folder.as_deref().unwrap_or_default())?;
+    if role == "drafts" {
+        // Drafts are filled by composing, not by moving mail in. Sent is
+        // allowed: Undo moves a message back to where it was, and a message
+        // that was in Sent is a sent message.
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
     }
     s.jmap

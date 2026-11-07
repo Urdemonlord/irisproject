@@ -1,6 +1,6 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
-use iris_config::limits::{MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
+use iris_config::limits::{MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -18,6 +18,9 @@ pub enum MailError {
     /// The mail server refused to send (e.g. recipient rejected).
     #[error("rejected: {0}")]
     Rejected(String),
+    /// A folder still holds messages, so it cannot be deleted.
+    #[error("folder is not empty")]
+    NotEmpty,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -32,6 +35,11 @@ pub struct MessageSummary {
     pub is_draft: bool,
     pub has_attachment: bool,
     pub size_bytes: u64,
+    /// `$flagged` keyword.
+    pub is_starred: bool,
+    /// IRIS labels: the message's keywords that are valid label names
+    /// (no `$` system keywords), sorted.
+    pub labels: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -90,7 +98,8 @@ pub struct ExtractedText {
     pub truncated: bool,
 }
 
-/// A folder (JMAP mailbox) with its standard role.
+/// A folder (JMAP mailbox): one of the standard roles, or `custom` for a
+/// user-made folder (a mailbox with no role).
 #[derive(Debug, Clone, Serialize)]
 pub struct Folder {
     pub id: String,
@@ -108,6 +117,36 @@ pub const FOLDER_ROLES: [(&str, &str); 5] = [
     ("archive", "Archive"),
     ("trash", "Trash"),
 ];
+
+/// `Folder::role` of a user-made folder.
+pub const CUSTOM_ROLE: &str = "custom";
+
+/// Name of the Sieve script IRIS owns for a mailbox's filters.
+pub const FILTER_SCRIPT_NAME: &str = "iris-filters";
+
+/// What a message list shows.
+#[derive(Debug, Clone, Copy)]
+pub enum View<'a> {
+    /// A standard folder by role (inbox, sent, drafts, archive, trash).
+    Role(&'a str),
+    /// A custom folder by JMAP mailbox id.
+    Folder(&'a str),
+    /// Starred messages in every folder except Trash.
+    Starred,
+    /// Messages with this label in every folder except Trash.
+    Label(&'a str),
+}
+
+/// True for a valid IRIS label name: 1-32 of `a-z 0-9 _ -`, starting with a
+/// letter or digit. This is also what makes it safe as a JMAP keyword, a
+/// JSON-pointer segment (`keywords/<name>`) and a Sieve flag.
+pub fn valid_label(name: &str) -> bool {
+    (1..=32).contains(&name.len())
+        && name.as_bytes()[0].is_ascii_alphanumeric()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
 
 /// An outgoing message or draft. `from` is always the signed-in user.
 #[derive(Debug, Clone, Default)]
@@ -130,6 +169,7 @@ pub struct JmapClient {
 
 const USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
 const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
+const USING_SIEVE: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"];
 const USING_SUBMIT: [&str; 3] = [
     "urn:ietf:params:jmap:core",
     "urn:ietf:params:jmap:mail",
@@ -155,13 +195,26 @@ const SUMMARY_PROPS: [&str; 8] = [
 /// may not match yet; the web UI keeps its local `matches()` filter as a
 /// fallback for the list it already loaded.
 fn folder_filter(mailbox_id: &str, query: Option<&str>) -> Value {
-    let in_mailbox = json!({ "inMailbox": mailbox_id });
+    with_text(json!({ "inMailbox": mailbox_id }), query)
+}
+
+/// Starred / label views: a keyword anywhere except Trash.
+fn keyword_filter(keyword: &str, trash_id: Option<&str>, query: Option<&str>) -> Value {
+    let mut conditions = vec![json!({ "hasKeyword": keyword })];
+    if let Some(t) = trash_id {
+        conditions.push(json!({ "inMailboxOtherThan": [t] }));
+    }
+    let base = json!({ "operator": "AND", "conditions": conditions });
+    with_text(base, query)
+}
+
+fn with_text(base: Value, query: Option<&str>) -> Value {
     match query.map(str::trim).filter(|q| !q.is_empty()) {
         Some(q) => json!({
             "operator": "AND",
-            "conditions": [in_mailbox, { "text": q }],
+            "conditions": [base, { "text": q }],
         }),
-        None => in_mailbox,
+        None => base,
     }
 }
 
@@ -377,19 +430,50 @@ impl JmapClient {
         role: &str,
         page: ListPage<'_>,
     ) -> Result<(Vec<MessageSummary>, u64), MailError> {
+        self.list_view(user, pass, account, View::Role(role), page)
+            .await
+    }
+
+    /// Lists one view (standard folder, custom folder, starred, label),
+    /// newest first. A custom folder id that is not a custom folder of this
+    /// account is `NotFound`.
+    pub async fn list_view(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        view: View<'_>,
+        page: ListPage<'_>,
+    ) -> Result<(Vec<MessageSummary>, u64), MailError> {
         let folders = self.folders(user, pass, account).await?;
-        let inbox = folders
+        let trash = folders
             .iter()
-            .find(|f| f.role == role)
-            .ok_or(MailError::NotFound)?
-            .id
-            .clone();
+            .find(|f| f.role == "trash")
+            .map(|f| f.id.as_str());
+        let filter = match view {
+            View::Role(role) => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.role == role)
+                    .ok_or(MailError::NotFound)?;
+                folder_filter(&f.id, page.query)
+            }
+            View::Folder(id) => {
+                let f = folders
+                    .iter()
+                    .find(|f| f.role == CUSTOM_ROLE && f.id == id)
+                    .ok_or(MailError::NotFound)?;
+                folder_filter(&f.id, page.query)
+            }
+            View::Starred => keyword_filter("$flagged", trash, page.query),
+            View::Label(name) => keyword_filter(name, trash, page.query),
+        };
         let r = self
             .call(
                 user,
                 pass,
                 json!([
-                    ["Email/query", {"accountId": account, "filter": folder_filter(&inbox, page.query),
+                    ["Email/query", {"accountId": account, "filter": filter,
                         "sort": [{"property": "receivedAt", "isAscending": false}],
                         "position": page.position, "limit": page.limit, "calculateTotal": true}, "q"],
                     ["Email/get", {"accountId": account,
@@ -485,19 +569,105 @@ impl JmapClient {
                 .cloned()
                 .unwrap_or_default();
         }
-        Ok(FOLDER_ROLES
-            .iter()
-            .filter_map(|(role, _)| {
-                let m = list.iter().find(|m| m["role"] == *role)?;
-                Some(Folder {
-                    id: m["id"].as_str()?.to_string(),
-                    role: role.to_string(),
-                    name: m["name"].as_str().unwrap_or(role).to_string(),
-                    total: m["totalEmails"].as_u64().unwrap_or(0),
-                    unread: m["unreadEmails"].as_u64().unwrap_or(0),
-                })
+        let folder = |m: &Value, role: &str| {
+            Some(Folder {
+                id: m["id"].as_str()?.to_string(),
+                role: role.to_string(),
+                name: m["name"].as_str().unwrap_or(role).to_string(),
+                total: m["totalEmails"].as_u64().unwrap_or(0),
+                unread: m["unreadEmails"].as_u64().unwrap_or(0),
             })
-            .collect())
+        };
+        let mut out: Vec<Folder> = FOLDER_ROLES
+            .iter()
+            .filter_map(|(role, _)| folder(list.iter().find(|m| m["role"] == *role)?, role))
+            .collect();
+        // Custom folders: every mailbox without a role, by name.
+        let mut custom: Vec<Folder> = list
+            .iter()
+            .filter(|m| m["role"].is_null())
+            .filter_map(|m| folder(m, CUSTOM_ROLE))
+            .collect();
+        custom.sort_by_key(|f| f.name.to_lowercase());
+        out.extend(custom);
+        Ok(out)
+    }
+
+    /// Creates a top-level custom folder; returns its id.
+    pub async fn create_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        name: &str,
+    ) -> Result<String, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "create": {"n": {"name": name, "parentId": null}}}, "s"]]),
+            )
+            .await?;
+        r[0]["created"]["n"]["id"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| {
+                MailError::Protocol(format!("folder not created: {}", r[0]["notCreated"]))
+            })
+    }
+
+    /// Renames a folder. The caller checks it is a custom folder.
+    pub async fn rename_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        name: &str,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "update": {id: {"name": name}}}, "s"]]),
+            )
+            .await?;
+        updated(&r[0], id)
+    }
+
+    /// Deletes an empty folder. A folder that still holds messages is
+    /// `NotEmpty`: its mail is never deleted along with it.
+    pub async fn delete_folder(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Mailbox/set", {"accountId": account,
+                "destroy": [id], "onDestroyRemoveEmails": false}, "s"]]),
+            )
+            .await?;
+        if r[0]["destroyed"]
+            .as_array()
+            .is_some_and(|d| d.iter().any(|x| x == id))
+        {
+            return Ok(());
+        }
+        match r[0]["notDestroyed"][id]["type"].as_str() {
+            Some("mailboxHasEmail") | Some("mailboxHasChild") => Err(MailError::NotEmpty),
+            Some("notFound") => Err(MailError::NotFound),
+            _ => Err(MailError::Protocol(format!(
+                "folder not deleted: {}",
+                r[0]["notDestroyed"]
+            ))),
+        }
     }
 
     async fn folder_id(
@@ -545,6 +715,19 @@ impl JmapClient {
         role: &str,
     ) -> Result<(), MailError> {
         let target = self.folder_id(user, pass, account, role).await?;
+        self.move_to_id(user, pass, account, id, &target).await
+    }
+
+    /// Moves a message into exactly one folder, by mailbox id. The caller
+    /// checks the id is one of this account's folders.
+    pub async fn move_to_id(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        target: &str,
+    ) -> Result<(), MailError> {
         let r = self
             .call(
                 user,
@@ -564,16 +747,227 @@ impl JmapClient {
         id: &str,
         seen: bool,
     ) -> Result<(), MailError> {
-        let patch = if seen { json!(true) } else { Value::Null };
+        self.set_keyword(user, pass, account, id, "$seen", seen)
+            .await
+    }
+
+    /// Adds or removes one keyword (`$seen`, `$flagged`, or a label). The
+    /// keyword is used as a JSON-pointer segment, so the caller passes only
+    /// `$seen`/`$flagged` or a `valid_label` name (no `/` or `~`).
+    pub async fn set_keyword(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        id: &str,
+        keyword: &str,
+        on: bool,
+    ) -> Result<(), MailError> {
+        let patch = if on { json!(true) } else { Value::Null };
+        let mut update = serde_json::Map::new();
+        update.insert(format!("keywords/{keyword}"), patch);
         let r = self
             .call(
                 user,
                 pass,
                 json!([["Email/set", {"accountId": account,
-            "update": {id: {"keywords/$seen": patch}}}, "u"]]),
+            "update": {id: update}}, "u"]]),
             )
             .await?;
         updated(&r[0], id)
+    }
+
+    /// Removes a label keyword from every message that carries it.
+    /// `Email/query` returns at most `MAX_DESTROY_PER_CALL` ids, so a label
+    /// on more messages is cleared in passes: each pass removes the keyword
+    /// from the messages it found, so the next query finds the rest.
+    /// Returns how many were updated. Fails past `MAX_CLEAR_KEYWORD_BATCHES`
+    /// passes instead of looping forever; the caller then keeps the label,
+    /// so no message is left carrying a keyword whose label row is gone.
+    pub async fn clear_keyword(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        keyword: &str,
+    ) -> Result<usize, MailError> {
+        let mut total = 0;
+        for _ in 0..MAX_CLEAR_KEYWORD_BATCHES {
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/query", {"accountId": account,
+                    "filter": {"hasKeyword": keyword}, "limit": MAX_DESTROY_PER_CALL}, "q"]]),
+                )
+                .await?;
+            let ids: Vec<&str> = r[0]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if ids.is_empty() {
+                return Ok(total);
+            }
+            let mut update = serde_json::Map::new();
+            for id in &ids {
+                update.insert(
+                    id.to_string(),
+                    json!({ format!("keywords/{keyword}"): null }),
+                );
+            }
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/set", {"accountId": account, "update": update}, "u"]]),
+                )
+                .await?;
+            total += r[0]["updated"].as_object().map_or(0, |o| o.len());
+        }
+        Err(MailError::Protocol(format!(
+            "clear_keyword: {keyword} still on messages after {MAX_CLEAR_KEYWORD_BATCHES} passes"
+        )))
+    }
+
+    /// Installs (or with `None`, removes) the IRIS filter Sieve script and
+    /// makes it the active script. Activating it deactivates any other
+    /// script on the account: Sieve allows one active script.
+    pub async fn put_filter_script(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        script: Option<&str>,
+    ) -> Result<(), MailError> {
+        let r = self
+            .call_using(
+                user,
+                pass,
+                &USING_SIEVE,
+                json!([["SieveScript/get", {"accountId": account,
+                "ids": null, "properties": ["name", "isActive"]}, "g"]]),
+            )
+            .await?;
+        let existing = r[0]["list"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|s| s["name"] == FILTER_SCRIPT_NAME)
+            .cloned();
+        let existing_id = existing
+            .as_ref()
+            .and_then(|s| s["id"].as_str())
+            .map(str::to_string);
+        let Some(script) = script else {
+            let Some(id) = existing_id else { return Ok(()) };
+            let was_active = existing.as_ref().is_some_and(|s| s["isActive"] == true);
+            let mut calls = vec![];
+            if was_active {
+                calls.push(json!(["SieveScript/set", {"accountId": account, "onSuccessDeactivateScript": true}, "a"]));
+            }
+            calls.push(json!(["SieveScript/set", {"accountId": account, "destroy": [id]}, "d"]));
+            let r = self
+                .call_using(user, pass, &USING_SIEVE, Value::Array(calls))
+                .await?;
+            let last = r.last().cloned().unwrap_or_default();
+            if last["destroyed"].as_array().is_some_and(|d| !d.is_empty()) {
+                return Ok(());
+            }
+            // The deactivate in this same request already ran, so the script
+            // is now inactive while the caller (filter delete) restores the
+            // database rule on this error. Reactivate it, so the running
+            // script still matches the stored rules instead of silently
+            // stopping every filter.
+            if was_active {
+                let reactivated = match self
+                    .call_using(
+                        user,
+                        pass,
+                        &USING_SIEVE,
+                        json!([["SieveScript/set", {"accountId": account, "onSuccessActivateScript": id}, "r"]]),
+                    )
+                    .await
+                {
+                    Ok(r) => {
+                        let first = r.first().cloned().unwrap_or_default();
+                        !["notCreated", "notUpdated", "notDestroyed"].iter().any(|k| {
+                            first[k].as_object().is_some_and(|o| !o.is_empty())
+                        })
+                    }
+                    Err(_) => false,
+                };
+                if !reactivated {
+                    return Err(MailError::Protocol(format!(
+                        "filter script not removed and could not be reactivated; filters are inactive: {}",
+                        last["notDestroyed"]
+                    )));
+                }
+            }
+            return Err(MailError::Protocol(format!(
+                "filter script not removed: {}",
+                last["notDestroyed"]
+            )));
+        };
+        let blob = self
+            .upload(
+                user,
+                pass,
+                account,
+                "application/sieve",
+                script.as_bytes().to_vec(),
+            )
+            .await?;
+        let call = match &existing_id {
+            Some(id) => json!(["SieveScript/set", {"accountId": account,
+                "update": {id: {"blobId": blob}}, "onSuccessActivateScript": id}, "s"]),
+            None => json!(["SieveScript/set", {"accountId": account,
+                "create": {"n": {"name": FILTER_SCRIPT_NAME, "blobId": blob}},
+                "onSuccessActivateScript": "#n"}, "s"]),
+        };
+        let r = self
+            .call_using(user, pass, &USING_SIEVE, json!([call]))
+            .await?;
+        let ok = match &existing_id {
+            Some(id) => r[0]["updated"]
+                .as_object()
+                .is_some_and(|o| o.contains_key(id)),
+            None => r[0]["created"]["n"]["id"].is_string(),
+        };
+        if ok {
+            Ok(())
+        } else {
+            Err(MailError::Protocol(format!(
+                "filter script not saved: {} {}",
+                r[0]["notCreated"], r[0]["notUpdated"]
+            )))
+        }
+    }
+
+    /// Uploads a blob; returns its id.
+    async fn upload(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        content_type: &str,
+        bytes: Vec<u8>,
+    ) -> Result<String, MailError> {
+        let resp = self
+            .http
+            .post(format!("{}/jmap/upload/{account}/", self.base_url))
+            .basic_auth(user, Some(pass))
+            .header(reqwest::header::CONTENT_TYPE, content_type)
+            .body(bytes)
+            .send()
+            .await
+            .map_err(|e| MailError::Unavailable(e.to_string()))?;
+        let v = check(resp).await?;
+        v["blobId"]
+            .as_str()
+            .map(str::to_string)
+            .ok_or_else(|| MailError::Protocol("upload: no blobId".into()))
     }
 
     /// Permanently deletes one message.
@@ -1172,7 +1566,21 @@ fn summary(e: &Value) -> MessageSummary {
         is_draft: e["keywords"]["$draft"] == true,
         has_attachment: e["hasAttachment"] == true,
         size_bytes: e["size"].as_u64().unwrap_or(0),
+        is_starred: e["keywords"]["$flagged"] == true,
+        labels: labels_of(e),
     }
+}
+
+fn labels_of(e: &Value) -> Vec<String> {
+    let mut out: Vec<String> = e["keywords"]
+        .as_object()
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| **v == true && valid_label(k))
+        .map(|(k, _)| k.clone())
+        .collect();
+    out.sort();
+    out
 }
 
 fn updated(r: &Value, id: &str) -> Result<(), MailError> {

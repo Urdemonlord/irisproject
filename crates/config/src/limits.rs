@@ -25,6 +25,10 @@ pub const MAX_PREVIEW_BYTES: u64 = 5_000_000;
 pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
 /// Max messages destroyed per JMAP `destroy_to` / `destroy_before` call.
 pub const MAX_DESTROY_PER_CALL: u32 = 500;
+/// Max passes when clearing a label keyword: one pass handles at most
+/// MAX_DESTROY_PER_CALL messages, so 100 passes clear 50,000. Past that
+/// the clear fails instead of looping forever (see `clear_keyword`).
+pub const MAX_CLEAR_KEYWORD_BATCHES: u32 = 100;
 
 // --- Compose validation (were `apps/api/src/compose.rs`) ------------------
 
@@ -106,6 +110,19 @@ pub const HTML_BODY_TOKEN_TTL_SECS: u64 = 120;
 /// so a runaway client cannot grow the in-memory store without bound.
 pub const MAX_PENDING_HTML_BODIES: usize = 512;
 
+// --- Labels, custom folders and filters ------------------------------------
+
+/// Max labels one mailbox can define.
+pub const MAX_LABELS: i64 = 50;
+/// Max custom folders one mailbox can have.
+pub const MAX_CUSTOM_FOLDERS: usize = 50;
+/// Max length of a custom folder name, in characters.
+pub const MAX_FOLDER_NAME_CHARS: usize = 64;
+/// Max filter rules per mailbox.
+pub const MAX_FILTERS: i64 = 50;
+/// Max length of a filter's match text, in characters.
+pub const MAX_FILTER_VALUE_CHARS: usize = 200;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +136,7 @@ mod tests {
         assert_eq!(MAX_PREVIEW_BYTES, 5_000_000);
         assert_eq!(MAX_PREVIEW_TEXT, 2_000_000);
         assert_eq!(MAX_DESTROY_PER_CALL, 500);
+        assert_eq!(MAX_CLEAR_KEYWORD_BATCHES, 100);
         assert_eq!(MAX_RECIPIENTS, 50);
         assert_eq!(MAX_SUBJECT, 998);
         assert_eq!(MAX_BODY, 1_000_000);

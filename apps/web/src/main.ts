@@ -1,6 +1,6 @@
 import { SITE, footerLinks, initSite, setPage } from './site'
 
-type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean }
+type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[] }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
 type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
 type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
@@ -602,7 +602,7 @@ function mailShell(o: { topbar: HTMLElement; nav: HTMLElement[]; listTop: HTMLEl
 }
 
 /** Render message rows. Rows are buttons; an optional OTP copy button sits beside each row (never nested). */
-function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; footer?: HTMLElement; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void }) {
+function fillList(list: HTMLElement, messages: Summary[], o: { current: string; empty: HTMLElement; compact?: boolean; showTo?: boolean; footer?: HTMLElement; onOpen: (m: Summary, index: number, wasUnread: boolean) => void; onIntent?: (m: Summary) => void; onStar?: (m: Summary) => void }) {
   if (!messages.length) return list.replaceChildren(o.empty)
   const prevList = list.querySelector('.message-list')
   const seen = new Set([...list.querySelectorAll<HTMLElement>('.msg-item')].map((li) => li.dataset.id))
@@ -615,7 +615,8 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
         ...(m.has_attachment ? [icon('clip', 'icon icon-sm msg-clip')] : [])),
       h('time', { className: 'msg-date', dateTime: m.received_at, title: fmtDate(m.received_at) }, fmtShort(m.received_at)),
       h('span', { className: 'msg-subject' }, m.subject || '(no subject)'),
-      ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []))
+      ...(m.preview ? [h('span', { className: 'msg-preview' }, m.preview)] : []),
+      ...(m.labels?.length ? [h('span', { className: 'msg-labels' }, ...m.labels.map((l) => h('span', { className: 'label-chip' }, icon('tag', 'icon icon-xs'), l)))] : []))
     if (m.id === o.current) row.setAttribute('aria-current', 'true')
     if (o.onIntent) { const intent = () => o.onIntent!(m); row.addEventListener('pointerenter', intent, { once: true }); row.addEventListener('focus', intent, { once: true }); row.addEventListener('touchstart', intent, { once: true, passive: true }) }
     row.onclick = () => {
@@ -632,6 +633,11 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
     li.style.setProperty('--i', String(Math.min(i, 12)))
     const code = o.compact ? `${m.subject} ${m.preview}`.match(/\b(\d{4,8})\b/)?.[1] : undefined
     if (code) li.append(copyButton(code, `Copy code ${code}`, 'otp-chip', code))
+    if (o.onStar) {
+      const label = m.is_starred ? 'Unstar' : 'Star'
+      li.append(h('button', { type: 'button', className: `star-btn${m.is_starred ? ' is-on' : ''}`, ariaLabel: `${label}: ${m.subject || '(no subject)'}`, title: label, 'aria-pressed': String(!!m.is_starred), onclick: () => o.onStar!(m) },
+        icon(m.is_starred ? 'star-fill' : 'star', 'icon icon-sm')))
+    }
     return li
   })), ...(o.footer ? [o.footer] : []))
 }
@@ -657,7 +663,11 @@ const matches = (m: Summary, q: string) => !q || `${m.from} ${m.subject} ${m.pre
 
 // ---------- Mailbox ----------
 type FolderRole = 'inbox' | 'sent' | 'drafts' | 'archive' | 'trash'
-type FolderInfo = { id: string; role: FolderRole; name: string; total: number; unread: number }
+type FolderInfo = { id: string; role: FolderRole | 'custom'; name: string; total: number; unread: number }
+/** What a mailbox page lists: a standard folder, a custom folder, Starred, or one label. */
+type MailView = { kind: 'role'; role: FolderRole } | { kind: 'folder'; id: string } | { kind: 'starred' } | { kind: 'label'; name: string }
+type MoveTarget = { folder: FolderRole } | { folder_id: string }
+type FilterRule = { id: string; field: 'from' | 'to' | 'subject'; value: string; action: 'move' | 'label' | 'star' | 'read'; target: string | null }
 const FOLDERS: { role: FolderRole; label: string; icon: string; empty: [string, string] }[] = [
   { role: 'inbox', label: 'Inbox', icon: 'inbox', empty: ['Your inbox is clear', 'New mail for this address will appear here.'] },
   { role: 'sent', label: 'Sent', icon: 'send', empty: ['Nothing sent yet', 'Messages you send appear here.'] },
@@ -667,6 +677,24 @@ const FOLDERS: { role: FolderRole; label: string; icon: string; empty: [string, 
 ]
 const folderHash = (r: FolderRole) => (r === 'inbox' ? '#/' : `#/${r}`)
 const folderMeta = (r: FolderRole) => FOLDERS.find((f) => f.role === r)!
+
+/** Custom folders and labels, kept across navigation so the sidebar draws at once. */
+let org: { folders: FolderInfo[]; labels: string[] } = { folders: [], labels: [] }
+const customFolders = () => org.folders.filter((f) => f.role === 'custom')
+const viewHash = (v: MailView) => v.kind === 'role' ? folderHash(v.role) : v.kind === 'starred' ? '#/starred'
+  : v.kind === 'folder' ? `#/folder/${encodeURIComponent(v.id)}` : `#/label/${encodeURIComponent(v.name)}`
+/** Key for the list cache and for marking the current nav item. */
+const viewKey = (v: MailView) => v.kind === 'role' ? v.role : v.kind === 'starred' ? 'starred' : v.kind === 'folder' ? `folder:${v.id}` : `label:${v.name}`
+const viewParams = (v: MailView): Record<string, string> => v.kind === 'role' ? { folder: v.role } : v.kind === 'starred' ? { view: 'starred' }
+  : v.kind === 'folder' ? { folder_id: v.id } : { label: v.name }
+function viewMeta(v: MailView): { label: string; icon: string; empty: [string, string] } {
+  switch (v.kind) {
+    case 'role': return folderMeta(v.role)
+    case 'starred': return { label: 'Starred', icon: 'star', empty: ['No starred mail', 'Star a message to find it here quickly.'] }
+    case 'folder': return { label: org.folders.find((f) => f.id === v.id)?.name ?? 'Folder', icon: 'folder', empty: ['This folder is empty', 'Move messages here to keep them together.'] }
+    case 'label': return { label: v.name, icon: 'tag', empty: ['No messages with this label', 'Open a message and choose Labels to add one.'] }
+  }
+}
 
 /** Signed-in account, kept while switching folders so each switch skips two requests. */
 let account: { email: string; mb: string } | null = null
@@ -719,6 +747,52 @@ function confirmDialog(title: string, text: string, confirmLabel: string): Promi
     d.showModal()
     cancel.focus()
   })
+}
+
+/** Text-input dialog. `submit` returns an error to show, or null to close. Resolves true when submitted. */
+function promptDialog(o: { title: string; label: string; value?: string; confirm: string; hint?: string; submit: (v: string) => Promise<string | null> }): Promise<boolean> {
+  return new Promise((resolve) => {
+    const input = h('input', { id: 'prompt-input', type: 'text', value: o.value ?? '', autocomplete: 'off', spellcheck: false, 'aria-describedby': 'prompt-error' }) as HTMLInputElement
+    const err = h('p', { className: 'field-error', id: 'prompt-error', role: 'alert' })
+    const ok = h('button', { type: 'submit', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, o.confirm)) as HTMLButtonElement
+    const cancel = h('button', { type: 'button', className: 'btn btn-secondary' }, h('span', { className: 'btn-label' }, 'Cancel'))
+    const form = h('form', { className: 'prompt-form' },
+      h('div', { className: 'field' }, h('label', { htmlFor: 'prompt-input' }, o.label), input, ...(o.hint ? [h('p', { className: 'prompt-hint muted' }, o.hint)] : []), err),
+      h('div', { className: 'confirm-actions' }, cancel, ok))
+    const d = h('dialog', { className: 'confirm' }, h('h2', {}, o.title), form) as HTMLDialogElement
+    const done = (v: boolean) => { d.close(); d.remove(); resolve(v) }
+    form.onsubmit = async (e) => {
+      e.preventDefault()
+      const restore = busy(ok, 'Saving…')
+      const problem = await o.submit(input.value)
+      if (!problem) return done(true)
+      restore()
+      err.textContent = problem
+      input.setAttribute('aria-invalid', 'true')
+      input.focus()
+    }
+    input.oninput = () => { err.textContent = ''; input.removeAttribute('aria-invalid') }
+    cancel.onclick = () => done(false)
+    d.addEventListener('cancel', (e) => { e.preventDefault(); done(false) })
+    document.body.append(d)
+    d.showModal()
+    input.focus()
+    input.select()
+  })
+}
+
+/** List of one-click choices (e.g. Move to). */
+function choiceDialog(title: string, items: { label: string; icon: string; run: () => void }[], extra?: { label: string; run: () => void }) {
+  const d = h('dialog', { className: 'confirm' }) as HTMLDialogElement
+  const close = () => { if (d.open) d.close() }
+  const cancel = btn('btn btn-secondary', 'Cancel', undefined, { onclick: close })
+  d.append(h('h2', {}, title),
+    h('div', { className: 'choice-list' }, ...items.map((i) => h('button', { type: 'button', className: 'choice-item', onclick: () => { close(); i.run() } }, icon(i.icon, 'icon icon-sm'), h('span', {}, i.label)))),
+    h('div', { className: 'confirm-actions' }, ...(extra ? [btn('btn btn-ghost', extra.label, 'plus', { onclick: () => { close(); extra.run() } })] : []), cancel))
+  d.addEventListener('close', () => d.remove())
+  document.body.append(d)
+  d.showModal()
+  ;(d.querySelector('.choice-item') as HTMLElement | null ?? cancel).focus()
 }
 
 // ----- composer -----
@@ -896,7 +970,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
 }
 
 // ----- mailbox view -----
-async function renderMailbox(folder: FolderRole = 'inbox') {
+async function ensureAccount() {
   if (!account) {
     const [session, { mailboxes }] = await Promise.all([
       api<{ email: string }>('/api/v1/session'),
@@ -904,22 +978,113 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     ])
     account = { email: session.email, mb: mailboxes[0]?.id ?? '' }
   }
-  const { email, mb } = account
-  const meta = folderMeta(folder)
+  return account
+}
+
+/** Refreshes `org` (folders with counts + labels). Returns the folder list. */
+async function loadOrg(base: string) {
+  const [{ folders }, { labels }] = await Promise.all([
+    api<{ folders: FolderInfo[] }>(`${base}/folders`),
+    api<{ labels: { name: string }[] }>(`${base}/labels`),
+  ])
+  org = { folders, labels: labels.map((l) => l.name) }
+  return folders
+}
+
+/** Sidebar links (and mobile tabs) for Starred, custom folders, labels and Organize. */
+function orgNav(current: string) {
+  const link = (href: string, ic: string, label: string, key: string, count?: number) => {
+    const a = navItem(href, ic, label, key === current, count ? h('span', { className: 'nav-count' }, String(count)) : undefined)
+    a.classList.add('nav-folder')
+    return a
+  }
+  const tab = (href: string, label: string, key: string) =>
+    h('a', { href, className: 'folder-tab', ...(key === current ? { 'aria-current': 'page' } : {}) }, label)
+  const sidebar = h('div', { className: 'nav-group' })
+  const tabs = h('div', { className: 'nav-group' })
+  let drawn = ''
+  const draw = () => {
+    const custom = customFolders()
+    const sig = JSON.stringify([custom.map((f) => [f.id, f.name, f.unread]), org.labels])
+    if (sig === drawn) return
+    drawn = sig
+    sidebar.replaceChildren(
+      ...(custom.length ? [navSection('Folders')] : []),
+      ...custom.map((f) => link(viewHash({ kind: 'folder', id: f.id }), 'folder', f.name, `folder:${f.id}`, f.unread)),
+      ...(org.labels.length ? [navSection('Labels')] : []),
+      ...org.labels.map((l) => link(viewHash({ kind: 'label', name: l }), 'tag', l, `label:${l}`)),
+      link('#/organize', 'filter', 'Folders & filters', 'organize'))
+    tabs.replaceChildren(
+      tab('#/starred', 'Starred', 'starred'),
+      ...custom.map((f) => tab(viewHash({ kind: 'folder', id: f.id }), f.name, `folder:${f.id}`)),
+      ...org.labels.map((l) => tab(viewHash({ kind: 'label', name: l }), `# ${l}`, `label:${l}`)),
+      tab('#/organize', 'Folders & filters', 'organize'))
+  }
+  draw()
+  return { starred: link('#/starred', 'star', 'Starred', 'starred'), sidebar, tabs, draw }
+}
+
+const orgErrors: Record<string, string> = {
+  invalid_label: 'Use 1–32 lowercase letters, numbers, “-” or “_”.',
+  too_many_labels: 'You’ve reached the limit of 50 labels.',
+  invalid_folder_name: 'Use 1–64 characters, no “/”, and not a built-in folder name.',
+  folder_exists: 'A folder with this name already exists.',
+  too_many_folders: 'You’ve reached the limit of 50 folders.',
+  folder_not_empty: 'This folder still has messages. Move or delete them first.',
+  folder_in_use_by_filter: 'A filter moves mail into this folder. Delete that filter first.',
+  label_in_use_by_filter: 'A filter adds this label. Delete that filter first.',
+  invalid_filter: 'Choose what to match and enter the text to look for.',
+  too_many_filters: 'You’ve reached the limit of 50 filters.',
+  unknown_label: 'That label no longer exists. Reload the page and try again.',
+  invalid_folder: 'That folder can’t be used here.',
+  not_found: 'It no longer exists. Reload the page and try again.',
+  mail_server_unavailable: errorText.mail_server_unavailable,
+  mail_server_error: errorText.mail_server_error,
+  network: errorText.network,
+}
+const orgError = (err: unknown) => orgErrors[(err as HttpError).code] ?? 'Something went wrong. Try again.'
+const labelName = (v: string) => v.trim().toLowerCase().replace(/\s+/g, '-')
+
+const newLabelDialog = (base: string) => promptDialog({
+  title: 'New label', label: 'Label name', confirm: 'Create label', hint: 'Lowercase letters, numbers, “-” and “_”. Up to 32 characters.',
+  submit: async (v) => {
+    try {
+      const { label } = await api<{ label: { name: string } }>(`${base}/labels`, { method: 'POST', body: JSON.stringify({ name: labelName(v) }) })
+      org.labels = uniq([...org.labels, label.name]).sort()
+      return null
+    } catch (err) { return orgError(err) }
+  },
+})
+const newFolderDialog = (base: string) => promptDialog({
+  title: 'New folder', label: 'Folder name', confirm: 'Create folder',
+  submit: async (v) => {
+    try {
+      const { folder } = await api<{ folder: FolderInfo }>(`${base}/folders`, { method: 'POST', body: JSON.stringify({ name: v }) })
+      org.folders = [...org.folders, folder]
+      return null
+    } catch (err) { return orgError(err) }
+  },
+})
+
+async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
+  const { email, mb } = await ensureAccount()
+  const folder = view.kind === 'role' ? view.role : null
+  const key = viewKey(view)
+  let meta = viewMeta(view)
   const base = `/api/v1/mailboxes/${mb}`
   setPage({ title: meta.label, description: `Your IRIS ${meta.label.toLowerCase()}.`, path: '/', noindex: true })
 
-  let all: Summary[] = (mb && readListCache(email, mb, folder)) || []
+  let all: Summary[] = (mb && readListCache(email, mb, key)) || []
   let query = ''
   let current = ''
-  /** Server-side total for the current folder/search; `all` is only page 1 until load-more appends. */
+  /** Server-side total for the current view/search; `all` is only page 1 until load-more appends. */
   let total = 0
   /** The query `all` was last fetched with. While it differs from `query`, draw() falls back to the local matches() filter (cached list / search in flight). */
   let loadedQuery = ''
   let loadingMore = false
   let searchTimer: number | undefined
 
-  const signOut = () => { clearMailCache(); account = null; closeComposer?.() }
+  const signOut = () => { clearMailCache(); account = null; org = { folders: [], labels: [] }; closeComposer?.() }
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
   logout.onclick = async () => { busy(logout, ''); signOut(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
   const refresh = btn('btn btn-ghost btn-icon-sm', 'Refresh', 'refresh')
@@ -927,6 +1092,8 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   const unreadChip = h('span', { className: 'pane-chip', hidden: true })
   const counts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'nav-count' })]))
   const tabCounts = new Map(FOLDERS.map((f) => [f.role, h('span', { className: 'tab-count' })]))
+  const title = h('h2', { className: 'pane-title' }, meta.label)
+  const nav = orgNav(key)
 
   const compose = (d: ComposeDraft = {}) => { if (mb) openComposer(base, d, onMutate) }
   const composeBtn = btn('btn btn-primary compose-btn', 'Compose', 'pen', { onclick: () => compose() })
@@ -945,7 +1112,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
       logout))
 
   const folderTabs = h('nav', { className: 'folder-tabs', ariaLabel: 'Folders' }, ...FOLDERS.map((f) =>
-    h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)))
+    h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)), nav.tabs)
 
   const idle = () => emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.')
   const ui = mailShell({
@@ -958,12 +1125,14 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         a.classList.add('nav-folder')
         return a
       }),
-      h('a', { href: folderHash(folder), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
+      nav.starred,
+      nav.sidebar,
+      h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
       navItem('#/temp', 'timer', 'Temporary inbox'),
       footerLinks('sidebar-footer'),
     ],
-    listTop: [h('header', { className: 'pane-head' }, h('h2', { className: 'pane-title' }, meta.label), unreadChip, refresh), folderTabs],
+    listTop: [h('header', { className: 'pane-head' }, title, unreadChip, refresh), folderTabs],
     listBottom: fab,
     idle: idle(),
   })
@@ -973,38 +1142,112 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   const loadFolders = async () => {
     if (!mb) return
     try {
-      const { folders } = await api<{ folders: FolderInfo[] }>(`${base}/folders`)
+      const folders = await loadOrg(base)
       for (const f of folders) {
         const n = f.role === 'inbox' ? f.unread : f.role === 'drafts' ? f.total : 0
-        counts.get(f.role)!.textContent = n ? String(n) : ''
-        tabCounts.get(f.role)!.textContent = n ? String(n) : ''
+        const c = counts.get(f.role as FolderRole)
+        if (!c) continue
+        c.textContent = n ? String(n) : ''
+        tabCounts.get(f.role as FolderRole)!.textContent = n ? String(n) : ''
       }
+      nav.draw()
+      if (view.kind === 'folder') { meta = viewMeta(view); title.textContent = meta.label; setPage({ title: meta.label, description: 'Your IRIS folder.', path: '/', noindex: true }) }
     } catch { /* counts are optional */ }
   }
 
   const removeLocal = (id: string) => {
     all = all.filter((m) => m.id !== id)
-    writeListCache(email, mb, folder, all)
+    writeListCache(email, mb, key, all)
     if (current === id) { current = ''; ui.hide(idle()) }
     draw()
   }
+  const keepLocal = () => { writeListCache(email, mb, key, all); draw() }
 
-  const move = async (m: Summary, target: FolderRole) => {
-    removeLocal(m.id)
+  /** Where messages in this view live, for Undo. Starred/label views span folders, so they have none. */
+  const here: MoveTarget | null = view.kind === 'role' ? { folder: view.role } : view.kind === 'folder' ? { folder_id: view.id } : null
+  const targetName = (t: MoveTarget) => 'folder' in t ? folderMeta(t.folder).label : org.folders.find((f) => f.id === t.folder_id)?.name ?? 'folder'
+
+  const move = async (m: Summary, target: MoveTarget) => {
+    const toTrash = 'folder' in target && target.folder === 'trash'
+    // Starred and label views show mail from every folder except Trash.
+    if (here || toTrash) removeLocal(m.id)
     messageCache.delete(url(m.id)) // the body is no longer in this folder; refetch if it comes back (undo)
     try {
-      await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder: target }) })
-      toast(target === 'trash' ? 'Moved to Trash' : `Moved to ${folderMeta(target).label}`, {
+      await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify(target) })
+      toast(toTrash ? 'Moved to Trash' : `Moved to ${targetName(target)}`, here ? {
         label: 'Undo',
         run: async () => {
-          await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify({ folder }) }).catch(() => toast('Could not undo.'))
+          await api(`${url(m.id)}/move`, { method: 'POST', body: JSON.stringify(here) }).catch(() => toast('Could not undo.'))
           load(); loadFolders()
         },
-      })
+      } : undefined)
       loadFolders()
     } catch {
       toast('Could not move the message.'); load()
     }
+  }
+
+  const moveDialog = (m: Summary) => {
+    type Item = { label: string; icon: string; target: MoveTarget }
+    const fixed: Item[] = [
+      { label: 'Inbox', icon: 'inbox', target: { folder: 'inbox' } },
+      { label: 'Archive', icon: 'archive', target: { folder: 'archive' } },
+    ]
+    const items = [
+      ...fixed,
+      ...customFolders().map((f): Item => ({ label: f.name, icon: 'folder', target: { folder_id: f.id } })),
+    ].filter((i) => JSON.stringify(i.target) !== JSON.stringify(here))
+    choiceDialog('Move to', items.map((i) => ({ label: i.label, icon: i.icon, run: () => move(m, i.target) })),
+      { label: 'New folder', run: async () => { if (await newFolderDialog(base)) { nav.draw(); moveDialog(m) } } })
+  }
+
+  const toggleStar = async (m: Summary) => {
+    const on = !m.is_starred
+    m.is_starred = on
+    if (view.kind === 'starred' && !on) removeLocal(m.id)
+    else keepLocal()
+    try {
+      await api(`${url(m.id)}/star`, { method: 'POST', body: JSON.stringify({ starred: on }) })
+    } catch {
+      m.is_starred = !on
+      toast('Could not update the star.')
+      load()
+    }
+  }
+
+  const setLabel = async (m: Summary, label: string, on: boolean) => {
+    try {
+      await api(`${url(m.id)}/labels`, { method: 'POST', body: JSON.stringify({ label, on }) })
+    } catch (err) { toast(orgError(err)); return false }
+    m.labels = on ? uniq([...(m.labels ?? []), label]).sort() : (m.labels ?? []).filter((l) => l !== label)
+    if (view.kind === 'label' && view.name === label && !on) removeLocal(m.id)
+    else keepLocal()
+    return true
+  }
+
+  const labelsDialog = (m: Summary) => {
+    const list = h('div', { className: 'choice-list' })
+    const render = () => list.replaceChildren(...(org.labels.length
+      ? org.labels.map((l) => {
+        const cb = h('input', { type: 'checkbox', checked: !!m.labels?.includes(l) }) as HTMLInputElement
+        cb.onchange = async () => {
+          cb.disabled = true
+          if (!(await setLabel(m, l, cb.checked))) cb.checked = !cb.checked
+          cb.disabled = false
+        }
+        return h('label', { className: 'choice-item choice-check' }, cb, icon('tag', 'icon icon-sm'), h('span', {}, l))
+      })
+      : [h('p', { className: 'muted' }, 'No labels yet. Create one to start sorting mail.')]))
+    render()
+    const done = btn('btn btn-primary', 'Done')
+    const create = btn('btn btn-secondary', 'New label', 'plus')
+    const d = h('dialog', { className: 'confirm' }, h('h2', {}, 'Labels'), list, h('div', { className: 'confirm-actions' }, create, done)) as HTMLDialogElement
+    create.onclick = async () => { if (await newLabelDialog(base)) { render(); nav.draw() } }
+    done.onclick = () => d.close()
+    d.addEventListener('close', () => d.remove())
+    document.body.append(d)
+    d.showModal()
+    done.focus()
   }
 
   const deleteForever = async (m: Summary) => {
@@ -1034,15 +1277,23 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     }
     const icons: HTMLElement[] = []
     const ib = (label: string, ic: string, run: () => void) => btn('btn btn-ghost btn-icon-sm', label, ic, { onclick: run })
-    if (folder === 'inbox') icons.push(ib('Archive', 'archive', () => move(m, 'archive')))
-    if (folder === 'archive') icons.push(ib('Move to Inbox', 'inbox', () => move(m, 'inbox')))
+    const star = (): HTMLElement => {
+      const s = ib(m.is_starred ? 'Unstar' : 'Star', m.is_starred ? 'star-fill' : 'star', () => { void toggleStar(m); s.replaceWith(star()) })
+      s.classList.toggle('is-starred', !!m.is_starred)
+      s.setAttribute('aria-pressed', String(!!m.is_starred))
+      return s
+    }
+    icons.push(star(), ib('Labels', 'tag', () => labelsDialog(m)))
+    if (folder === 'inbox') icons.push(ib('Archive', 'archive', () => move(m, { folder: 'archive' })))
+    if (folder === 'archive' || view.kind === 'folder') icons.push(ib('Move to Inbox', 'inbox', () => move(m, { folder: 'inbox' })))
+    if (folder !== 'trash' && folder !== 'drafts') icons.push(ib('Move to…', 'folder', () => moveDialog(m)))
     if (folder === 'trash') {
-      actions.push(b('Restore to Inbox', 'inbox', () => move(m, 'inbox')))
+      actions.push(b('Restore to Inbox', 'inbox', () => move(m, { folder: 'inbox' })))
       actions.push(b('Delete forever', 'trash', () => deleteForever(m), 'btn btn-danger btn-sm'))
     } else {
-      icons.push(ib('Delete', 'trash', () => move(m, 'trash')))
+      icons.push(ib('Delete', 'trash', () => move(m, { folder: 'trash' })))
     }
-    if (folder === 'inbox' || folder === 'archive') icons.push(ib('Mark as unread', 'mail', () => markUnread(m)))
+    if (folder !== 'trash' && folder !== 'sent' && folder !== 'drafts') icons.push(ib('Mark as unread', 'mail', () => markUnread(m)))
     return h('div', { className: 'reader-toolbar' }, h('div', { className: 'reader-actions' }, ...actions), h('div', { className: 'reader-icons' }, ...icons))
   }
 
@@ -1067,16 +1318,17 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     const unread = all.filter((m) => !m.is_read).length
     unreadChip.textContent = `${unread} unread`
     unreadChip.hidden = folder !== 'inbox' || !unread
-    const [title, text] = meta.empty
+    const [emptyTitle, emptyText] = meta.empty
     fillList(ui.list, shown, {
       current,
       showTo: folder === 'sent' || folder === 'drafts',
-      empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, title, text),
+      empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, emptyTitle, emptyText),
       footer: loadMoreFooter(),
+      onStar: folder === 'drafts' ? undefined : (m) => { void toggleStar(m) },
       onOpen: (m, i, wasUnread) => {
-        if (folder === 'drafts') return void openDraft(m)
+        if (folder === 'drafts' || m.is_draft) return void openDraft(m)
         if (wasUnread) {
-          writeListCache(email, mb, folder, all)
+          writeListCache(email, mb, key, all)
           api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
         }
         current = m.id
@@ -1088,24 +1340,32 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     })
   }
 
+  const params = (extra: Record<string, string> = {}) => {
+    const p = new URLSearchParams({ ...viewParams(view), limit: '50', ...extra })
+    if (query) p.set('q', query)
+    return p
+  }
+
   const load = async () => {
     if (!mb) { ui.list.replaceChildren(emptyState('inbox', 'No mailbox yet', 'Your account has no mailbox. Contact your administrator.')); return }
     if (!all.length) ui.list.replaceChildren(skeleton())
     const restore = busy(refresh, '')
     refresh.classList.add('is-spinning')
     try {
-      const params = new URLSearchParams({ folder, limit: '50' })
-      if (query) params.set('q', query)
-      const { messages: fresh, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
+      const { messages: fresh, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params()}`)
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
       all = fresh.map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) }))
       total = t
       loadedQuery = query
-      writeListCache(email, mb, folder, all)
+      writeListCache(email, mb, key, all)
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
     } catch (err) {
       if ((err as HttpError).status === 401) { signOut(); return renderLogin() }
+      if ((err as HttpError).status === 404 && view.kind === 'folder') {
+        ui.list.replaceChildren(emptyState('folder', 'Folder not found', 'This folder was deleted or renamed elsewhere.'))
+        return
+      }
       if (all.length) { synced.textContent = 'Offline · showing saved list'; return }
       ui.list.replaceChildren(errorState(errorText[(err as HttpError).code] ?? 'Could not load messages.', load))
     } finally { restore(); refresh.classList.remove('is-spinning') }
@@ -1115,9 +1375,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
     loadingMore = true
     draw()
     try {
-      const params = new URLSearchParams({ folder, limit: '50', position: String(all.length) })
-      if (query) params.set('q', query)
-      const { messages, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params}`)
+      const { messages, total: t } = await api<{ messages: Summary[]; total: number }>(`${base}/messages?${params({ position: String(all.length) })}`)
       total = t
       const seen = new Set(all.map((m) => m.id))
       const read = new Set(all.filter((m) => m.is_read).map((m) => m.id))
@@ -1126,7 +1384,7 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
         ...messages.filter((m) => !seen.has(m.id)).map((m) => ({ ...m, is_read: m.is_read || read.has(m.id) })),
       ]
       loadedQuery = query
-      writeListCache(email, mb, folder, all)
+      writeListCache(email, mb, key, all)
     } catch {
       toast('Could not load more messages.')
     } finally {
@@ -1147,6 +1405,160 @@ async function renderMailbox(folder: FolderRole = 'inbox') {
   // New mail shows up on its own while the tab is visible.
   tempTimers.push(window.setInterval(() => { if (!document.hidden) { load(); loadFolders() } }, 30_000))
   if (all.length) { draw(); load() } else await load()
+}
+
+// ----- folders, labels & filters page -----
+const FILTER_FIELDS: [FilterRule['field'], string][] = [['from', 'From'], ['to', 'To or Cc'], ['subject', 'Subject']]
+const FILTER_ACTIONS: [FilterRule['action'], string][] = [['move', 'Move to folder'], ['label', 'Add label'], ['star', 'Star it'], ['read', 'Mark as read']]
+
+function describeFilter(f: FilterRule) {
+  const field = FILTER_FIELDS.find(([k]) => k === f.field)?.[1] ?? f.field
+  const then = f.action === 'move' ? `move to ${org.folders.find((x) => x.id === f.target)?.name ?? 'a deleted folder'}`
+    : f.action === 'label' ? `add label “${f.target}”` : f.action === 'star' ? 'star it' : 'mark as read'
+  return `If ${field} contains “${f.value}”, ${then}`
+}
+
+async function renderOrganize() {
+  const { email, mb } = await ensureAccount()
+  const base = `/api/v1/mailboxes/${mb}`
+  setPage({ title: 'Folders & filters', description: 'Manage your IRIS folders, labels and filters.', path: '/', noindex: true })
+  let filters: FilterRule[] = []
+
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const folderList = h('ul', { className: 'org-list' })
+  const labelList = h('ul', { className: 'org-list' })
+  const filterList = h('ul', { className: 'org-list' })
+  const row = (ic: string, text: string, ...actions: HTMLElement[]) =>
+    h('li', { className: 'org-row' }, icon(ic, 'icon icon-sm'), h('span', { className: 'org-name' }, text), h('span', { className: 'org-actions' }, ...actions))
+  const empty = (text: string) => h('li', { className: 'org-empty muted' }, text)
+
+  const drawFolders = () => {
+    const custom = customFolders()
+    folderList.replaceChildren(...(custom.length ? custom.map((f) => row('folder', `${f.name}${f.total ? ` · ${f.total}` : ''}`,
+      btn('btn btn-ghost btn-sm', 'Rename', 'pen', { onclick: () => renameFolder(f) }),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteFolder(f) })))
+      : [empty('No folders yet. Folders hold messages you move into them.')]))
+  }
+  const drawLabels = () => {
+    labelList.replaceChildren(...(org.labels.length ? org.labels.map((l) => row('tag', l,
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteLabel(l) })))
+      : [empty('No labels yet. A message can have several labels.')]))
+  }
+  const drawFilters = () => {
+    filterList.replaceChildren(...(filters.length ? filters.map((f) => row('filter', describeFilter(f),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteFilter(f) })))
+      : [empty('No filters yet. Add one below to sort new mail automatically.')]))
+    drawForm()
+  }
+
+  const renameFolder = (f: FolderInfo) => promptDialog({
+    title: 'Rename folder', label: 'Folder name', value: f.name, confirm: 'Rename',
+    submit: async (v) => {
+      try {
+        await api(`${base}/folders/${encodeURIComponent(f.id)}`, { method: 'PATCH', body: JSON.stringify({ name: v }) })
+        f.name = v.trim()
+        drawFolders(); drawFilters()
+        return null
+      } catch (err) { return orgError(err) }
+    },
+  })
+  const deleteFolder = async (f: FolderInfo) => {
+    if (!(await confirmDialog(`Delete “${f.name}”?`, 'Only empty folders can be deleted. Messages are never deleted with a folder.', 'Delete folder'))) return
+    try {
+      await api(`${base}/folders/${encodeURIComponent(f.id)}`, { method: 'DELETE' })
+      org.folders = org.folders.filter((x) => x.id !== f.id)
+      drawFolders(); toast('Folder deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+  const deleteLabel = async (l: string) => {
+    if (!(await confirmDialog(`Delete label “${l}”?`, 'The label is removed from every message. The messages themselves stay.', 'Delete label'))) return
+    try {
+      await api(`${base}/labels/${encodeURIComponent(l)}`, { method: 'DELETE' })
+      org.labels = org.labels.filter((x) => x !== l)
+      drawLabels(); drawForm(); toast('Label deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+  const deleteFilter = async (f: FilterRule) => {
+    try {
+      await api(`${base}/filters/${encodeURIComponent(f.id)}`, { method: 'DELETE' })
+      filters = filters.filter((x) => x.id !== f.id)
+      drawFilters(); toast('Filter deleted')
+    } catch (err) { toast(orgError(err)) }
+  }
+
+  // Add-filter form.
+  const select = (id: string, options: [string, string][]) =>
+    h('select', { id, className: 'org-select' }, ...options.map(([v, l]) => h('option', { value: v }, l))) as HTMLSelectElement
+  const field = select('f-field', FILTER_FIELDS)
+  const value = h('input', { id: 'f-value', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'e.g. newsletter@shop.com' }) as HTMLInputElement
+  const action = select('f-action', FILTER_ACTIONS)
+  const target = h('select', { id: 'f-target', className: 'org-select' }) as HTMLSelectElement
+  const targetRow = h('div', { className: 'field' }, h('label', { htmlFor: 'f-target' }, 'Target'), target)
+  const formError = h('div', { className: 'form-error', role: 'alert' })
+  const add = h('button', { type: 'submit', className: 'btn btn-primary' }, icon('plus'), h('span', { className: 'btn-label' }, 'Add filter')) as HTMLButtonElement
+  const drawForm = () => {
+    const kind = action.value
+    const opts: [string, string][] = kind === 'move'
+      ? org.folders.filter((f) => f.role === 'archive' || f.role === 'trash' || f.role === 'custom').map((f) => [f.id, f.name])
+      : kind === 'label' ? org.labels.map((l) => [l, l]) : []
+    const keep = target.value
+    target.replaceChildren(...opts.map(([v, l]) => h('option', { value: v }, l)))
+    if (opts.some(([v]) => v === keep)) target.value = keep
+    targetRow.hidden = kind !== 'move' && kind !== 'label'
+    ;(targetRow.querySelector('label') as HTMLLabelElement).textContent = kind === 'move' ? 'Folder' : 'Label'
+    add.disabled = !targetRow.hidden && !opts.length
+    formError.replaceChildren(...(!targetRow.hidden && !opts.length ? [h('span', {}, kind === 'label' ? 'Create a label first.' : 'Create a folder first.')] : []))
+  }
+  action.onchange = drawForm
+  value.oninput = () => value.removeAttribute('aria-invalid')
+  const form = h('form', { className: 'org-form' },
+    h('div', { className: 'field' }, h('label', { htmlFor: 'f-field' }, 'If'), field),
+    h('div', { className: 'field org-grow' }, h('label', { htmlFor: 'f-value' }, 'Contains'), value),
+    h('div', { className: 'field' }, h('label', { htmlFor: 'f-action' }, 'Then'), action),
+    targetRow,
+    h('div', { className: 'org-submit' }, add),
+    formError)
+  form.onsubmit = async (e) => {
+    e.preventDefault()
+    formError.replaceChildren()
+    if (!value.value.trim()) { value.setAttribute('aria-invalid', 'true'); value.focus(); formError.append(h('span', {}, 'Enter the text to look for.')); return }
+    const restore = busy(add, 'Saving…')
+    try {
+      const body = { field: field.value, value: value.value, action: action.value, target: targetRow.hidden ? null : target.value }
+      const { filter } = await api<{ filter: FilterRule }>(`${base}/filters`, { method: 'POST', body: JSON.stringify(body) })
+      filters = [...filters, filter]
+      value.value = ''
+      restore()
+      drawFilters()
+      toast('Filter added')
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      formError.replaceChildren(icon('alert'), h('span', {}, orgError(err)))
+    }
+  }
+
+  const section = (heading: string, text: string, list: HTMLElement, ...extra: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
+    h('h1', { className: 'pane-title' }, 'Folders & filters'),
+    section('Folders', 'Your own folders, next to Inbox, Archive and Trash.', folderList,
+      btn('btn btn-secondary btn-sm', 'New folder', 'plus', { onclick: async () => { if (await newFolderDialog(base)) drawFolders() } })),
+    section('Labels', 'Tag messages without moving them. Starred is always available.', labelList,
+      btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
+    section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form))))
+  folderList.replaceChildren(skeleton(2))
+  try {
+    const [, f] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`)])
+    filters = f.filters
+    drawFolders(); drawLabels(); drawFilters()
+  } catch (err) {
+    if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+    folderList.replaceChildren(errorState(orgError(err), () => { void renderOrganize() }))
+  }
 }
 
 // ---------- Temp inbox ----------
@@ -1352,9 +1764,20 @@ function route() {
     return renderTempStart()
   }
   if (r === '/signed-out') return renderSignedOut()
-  const folder = r === '/' ? 'inbox' : FOLDERS.find((f) => `/${f.role}` === r)?.role
-  if (!folder) return renderNotFound()
-  renderMailbox(folder).catch((err) => {
+  let view: MailView | undefined
+  try {
+    if (r === '/') view = { kind: 'role', role: 'inbox' }
+    else if (r === '/starred') view = { kind: 'starred' }
+    else if (r.startsWith('/folder/')) view = { kind: 'folder', id: decodeURIComponent(r.slice(8)) }
+    else if (r.startsWith('/label/')) view = { kind: 'label', name: decodeURIComponent(r.slice(7)) }
+    else {
+      const role = FOLDERS.find((f) => `/${f.role}` === r)?.role
+      if (role) view = { kind: 'role', role }
+    }
+  } catch { /* malformed escape in the hash */ }
+  const page = r === '/organize' ? renderOrganize() : view ? renderMailbox(view) : undefined
+  if (!page) return renderNotFound()
+  page.catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     setPage({ title: 'Unavailable', description: 'IRIS is temporarily unavailable.', noindex: true })
     simplePage('auth-main', h('section', { className: 'auth-card center' },

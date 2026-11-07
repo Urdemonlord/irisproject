@@ -17,6 +17,10 @@ commitment to ship it.
   per-hour send limits (100/hour).
 - **Attachments & raw view** — MIME parsing, attachment download and
   preview, raw message view, DMARC XML report preview (zip/gzip).
+- **Stars, labels, custom folders, filters** — star and label messages,
+  make your own folders, and filter new mail (from / to / subject contains
+  → move, label, star, mark read). Filters compile to a Sieve script on
+  the mail server, so they run at delivery.
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
   10 creates/hour per IP, 3 active per browser.
 - **Transactional email API** — scoped API keys for companion apps
@@ -37,7 +41,6 @@ commitment to ship it.
 - **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
 - **Threading** — group messages into conversations.
-- **Labels, stars, custom folders, filters** — beyond the five fixed folders.
 - **Contacts** — address book with autocomplete in compose.
 - **Real-time notifications** — new mail without polling.
 - **DMARC dashboard** — aggregate DMARC reports across domains.
