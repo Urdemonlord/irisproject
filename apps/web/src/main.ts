@@ -705,6 +705,7 @@ const sendErrors: Record<string, string> = {
   invalid_recipient: 'One of the addresses isn’t valid.',
   no_recipients: 'Add at least one recipient.',
   too_many_recipients: 'Too many recipients (50 max).',
+  invalid_attachment: 'One of the attachments isn’t valid — too large, too many, or a bad file name.',
   send_rejected: 'The mail server refused this message.',
   mail_server_error: 'The mail server returned an unexpected response. Try again shortly.',
   database_unavailable: 'IRIS is temporarily unavailable. Try again shortly.',
@@ -796,7 +797,21 @@ function choiceDialog(title: string, items: { label: string; icon: string; run: 
 }
 
 // ----- composer -----
-type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string }
+type ComposeAttachmentIn = { name: string; content_type: string; data: string; size: number }
+type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string; attachments?: ComposeAttachmentIn[] }
+const MAX_COMPOSE_FILES = 5
+const MAX_COMPOSE_FILE_BYTES = 5_000_000
+const MAX_COMPOSE_TOTAL_BYTES = 10_000_000
+
+/// ArrayBuffer to base64, chunked so a 5 MB file never blows the stack
+/// (String.fromCharCode.apply on the whole buffer would).
+function bufToBase64(buf: ArrayBuffer): string {
+  const bytes = new Uint8Array(buf)
+  let s = ''
+  const CHUNK = 0x8000
+  for (let i = 0; i < bytes.length; i += CHUNK) s += String.fromCharCode(...bytes.subarray(i, i + CHUNK))
+  return btoa(s)
+}
 const emailOf = (a: string) => (a.match(/<([^>]+)>/)?.[1] ?? a).trim().toLowerCase()
 const ADDRESS = /^[^\s@<>(),;:"[\]\\]+@[^\s@<>(),;:"[\]\\]+\.[^\s@<>(),;:"[\]\\]+$/
 const splitAddrs = (v: string) => v.split(/[,;\s]+/).map((x) => x.trim()).filter(Boolean)
@@ -864,6 +879,57 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   ccToggle.onclick = () => { cc.row.hidden = bcc.row.hidden = false; ccToggle.hidden = true; cc.el.focus() }
   to.row.append(ccToggle)
 
+  // Attachments: kept in memory as base64 (same shape the API validates),
+  // listed with name + size and a remove button. The file input is hidden
+  // inside its label so the whole button opens the picker.
+  let atts: ComposeAttachmentIn[] = [...(d.attachments ?? [])]
+  const attachList = h('div', { className: 'compose-attach-list' })
+  const fileInput = h('input', { type: 'file', multiple: true, ariaLabel: 'Choose files to attach' }) as HTMLInputElement
+  const attachBtn = h('label', { className: 'btn btn-secondary btn-sm' }, 'Attach files', fileInput)
+  const attachBox = h('div', { className: 'compose-attach' }, attachBtn, attachList)
+  const renderAtts = () => {
+    attachList.replaceChildren(...atts.map((a, i) => h('div', { className: 'attach-row' },
+      h('div', { className: 'attach-meta' }, h('strong', {}, a.name), h('span', {}, `${a.content_type} · ${fmtBytes(a.size)}`)),
+      h('div', { className: 'attach-actions' },
+        btn('btn btn-ghost btn-sm', 'Remove', undefined, { onclick: () => { atts.splice(i, 1); renderAtts(); changed() } })))))
+  }
+  renderAtts()
+  fileInput.onchange = async () => {
+    const files = [...(fileInput.files ?? [])]
+    fileInput.value = ''
+    if (!files.length) return
+    error.replaceChildren()
+    let used = atts.reduce((n, a) => n + a.size, 0)
+    for (const f of files) {
+      if (atts.length >= MAX_COMPOSE_FILES) {
+        error.replaceChildren(icon('alert'), h('span', {}, `At most ${MAX_COMPOSE_FILES} attachments.`))
+        break
+      }
+      if (f.size > MAX_COMPOSE_FILE_BYTES) {
+        error.replaceChildren(icon('alert'), h('span', {}, `“${f.name}” is over the 5 MB limit.`))
+        continue
+      }
+      if (used + f.size > MAX_COMPOSE_TOTAL_BYTES) {
+        error.replaceChildren(icon('alert'), h('span', {}, 'Attachments total over the 10 MB limit.'))
+        continue
+      }
+      const data = await new Promise<string>((resolve) => {
+        const r = new FileReader()
+        r.onload = () => resolve(String(r.result).split(',')[1] ?? '')
+        r.onerror = () => resolve('')
+        r.readAsDataURL(f)
+      })
+      if (!data) {
+        error.replaceChildren(icon('alert'), h('span', {}, `Could not read “${f.name}”.`))
+        continue
+      }
+      atts.push({ name: f.name, content_type: f.type || 'application/octet-stream', data, size: f.size })
+      used += f.size
+    }
+    renderAtts()
+    changed()
+  }
+
   const status = h('span', { className: 'compose-status', 'aria-live': 'polite' })
   const error = h('div', { className: 'form-error', role: 'alert' })
   const send = h('button', { type: 'button', className: 'btn btn-primary' }, icon('send'), h('span', { className: 'btn-label' }, 'Send')) as HTMLButtonElement
@@ -872,6 +938,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   const panel = h('section', { className: 'composer', role: 'dialog', ariaLabel: d.title ?? 'New message' },
     h('header', { className: 'composer-head' }, h('h2', {}, d.title ?? 'New message'), status, closeBtn),
     h('div', { className: 'composer-fields' }, to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
+    attachBox,
     body,
     error,
     h('footer', { className: 'composer-foot' }, send, h('span', { className: 'compose-hint' }, 'Ctrl + Enter to send'), discard))
@@ -880,8 +947,9 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
     to: splitAddrs(to.el.value), cc: splitAddrs(cc.el.value), bcc: splitAddrs(bcc.el.value),
     subject: subject.el.value.replace(/[\r\n]+/g, ' '), text: body.value,
     in_reply_to: d.inReplyTo ?? null, references: d.references ?? [], draft_id: draftId ?? null,
+    attachments: atts.map(({ name, content_type, data }) => ({ name, content_type, data })),
   })
-  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim()
+  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim() && !atts.length
 
   const save = async () => {
     clearTimeout(timer)
@@ -1300,7 +1368,18 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const openDraft = async (m: Summary) => {
     try {
       const { message: d } = await api<{ message: Detail }>(url(m.id))
-      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '' })
+      // A draft's attachments must come along: the next autosave replaces
+      // the draft, so opening it without them would silently drop them.
+      // If a download fails, don't open the draft at all — the files stay
+      // safe in Drafts until the user retries.
+      const attachments: ComposeAttachmentIn[] = []
+      for (const a of d.attachments ?? []) {
+        const res = await fetch(`${url(m.id)}/attachments/${encodeURIComponent(a.part_id)}`, { credentials: 'same-origin' })
+        if (!res.ok) throw new Error('attachment download failed')
+        const buf = await res.arrayBuffer()
+        attachments.push({ name: a.name, content_type: a.content_type, data: bufToBase64(buf), size: buf.byteLength })
+      }
+      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '', attachments })
     } catch { toast('Could not open the draft.') }
   }
 

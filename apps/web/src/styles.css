@@ -569,6 +569,11 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .cc-toggle { flex: none; font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-graphite); }
 .cc-toggle:hover { color: var(--iris-text); }
 .composer-fields .field-error { padding: var(--iris-space-1) 0 0 68px; }
+.compose-attach { display: flex; flex-direction: column; align-items: flex-start; gap: var(--iris-space-1); padding: var(--iris-space-2) var(--iris-space-4); border-top: var(--iris-rule-hair); }
+.compose-attach input[type="file"] { position: absolute; width: 1px; height: 1px; overflow: hidden; clip: rect(0 0 0 0); }
+.compose-attach-list { width: 100%; }
+.compose-attach-list:empty { display: none; }
+.compose-attach-list .attach-row { border-top: 0; padding: var(--iris-space-1) 0; }
 .compose-body { flex: 1; min-height: 120px; resize: none; border: 0; outline: none; padding: var(--iris-space-4); font-family: var(--iris-font-ui); font-size: var(--iris-text-read); line-height: var(--iris-leading-read); color: var(--iris-text); background: none; }
 .composer > .form-error { margin: 0 var(--iris-space-4) var(--iris-space-2); }
 .composer-foot { display: flex; align-items: center; gap: var(--iris-space-3); padding: var(--iris-space-3) var(--iris-space-4); border-top: var(--iris-rule-hair); }

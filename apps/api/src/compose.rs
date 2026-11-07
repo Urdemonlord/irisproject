@@ -10,11 +10,14 @@ use axum::{
     response::IntoResponse,
     Extension, Json,
 };
+use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use iris_auth as auth;
 use iris_config::limits::{
-    MAX_BODY, MAX_HEADER_IDS, MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
+    MAX_ATTACHMENT_NAME_CHARS, MAX_BODY, MAX_COMPOSE_ATTACHMENTS,
+    MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES, MAX_COMPOSE_ATTACHMENT_BYTES, MAX_HEADER_IDS,
+    MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
 };
-use iris_mail::{Compose, FOLDER_ROLES};
+use iris_mail::{Compose, ComposeAttachment, FOLDER_ROLES};
 use serde::Deserialize;
 use serde_json::json;
 
@@ -151,6 +154,21 @@ pub(crate) struct ComposeBody {
     references: Vec<String>,
     /// Existing draft this replaces (deleted on save/send).
     draft_id: Option<String>,
+    /// Files to attach: base64-encoded content, decoded and size-checked in
+    /// `build()`. Kept as JSON (no multipart anywhere in this codebase).
+    #[serde(default)]
+    attachments: Vec<AttachmentBody>,
+}
+
+/// One attachment as the web sends it: base64 content + metadata.
+#[derive(Deserialize)]
+pub(crate) struct AttachmentBody {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    content_type: String,
+    #[serde(default)]
+    data: String,
 }
 
 fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
@@ -178,6 +196,58 @@ fn clean_ids(v: impl IntoIterator<Item = String>) -> Vec<String> {
         .collect()
 }
 
+/// Decodes and bounds-checks the attachments from a compose request.
+/// Filenames are validated as plain names, never paths: no separators,
+/// no `.`/`..`, max 255 chars. A missing content type becomes
+/// `application/octet-stream`; anything else must be a control-char-free
+/// token (it lands in an upload `Content-Type` header, so CR/LF would be
+/// header injection). All failures are one `invalid_attachment` error: the
+/// client only needs to know the attachments were refused.
+fn clean_attachments(v: &[AttachmentBody]) -> Result<Vec<ComposeAttachment>, ApiError> {
+    let bad = || ApiError(StatusCode::BAD_REQUEST, "invalid_attachment");
+    if v.len() > MAX_COMPOSE_ATTACHMENTS {
+        return Err(bad());
+    }
+    let mut total = 0usize;
+    let mut out = Vec::with_capacity(v.len());
+    for a in v {
+        let name = a.name.as_str();
+        if name.is_empty()
+            || name.chars().count() > MAX_ATTACHMENT_NAME_CHARS
+            || name.contains(['/', '\\', '\0'])
+            || name == "."
+            || name == ".."
+        {
+            return Err(bad());
+        }
+        let content_type = if a.content_type.trim().is_empty() {
+            "application/octet-stream".to_string()
+        } else if a
+            .content_type
+            .chars()
+            .any(|ch| (ch as u32) < 0x20 || (ch as u32) == 0x7f)
+        {
+            return Err(bad());
+        } else {
+            a.content_type.clone()
+        };
+        let bytes = BASE64.decode(&a.data).map_err(|_| bad())?;
+        if bytes.len() > MAX_COMPOSE_ATTACHMENT_BYTES {
+            return Err(bad());
+        }
+        total += bytes.len();
+        if total > MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES {
+            return Err(bad());
+        }
+        out.push(ComposeAttachment {
+            name: name.to_string(),
+            content_type,
+            bytes,
+        });
+    }
+    Ok(out)
+}
+
 fn build(u: &CurrentUser, b: ComposeBody) -> Result<(Compose, Option<String>), ApiError> {
     if b.subject.len() > MAX_SUBJECT || b.text.len() > MAX_BODY || b.subject.contains(['\r', '\n'])
     {
@@ -199,6 +269,7 @@ fn build(u: &CurrentUser, b: ComposeBody) -> Result<(Compose, Option<String>), A
         text: b.text,
         in_reply_to: clean_ids(b.in_reply_to).into_iter().next(),
         references: clean_ids(b.references),
+        attachments: clean_attachments(&b.attachments)?,
     };
     Ok((c, b.draft_id))
 }
@@ -346,5 +417,107 @@ mod tests {
             clean_ids(vec!["<a@b>".into(), " ".into(), "x y".into()]),
             vec!["a@b".to_string()]
         );
+    }
+
+    fn test_user() -> CurrentUser {
+        CurrentUser {
+            user_id: "u1".into(),
+            email: "me@x.id".into(),
+            creds: crate::Creds {
+                user: "me@x.id".into(),
+                pass: "secret".into(),
+            },
+        }
+    }
+
+    fn att(name: &str, content_type: &str, bytes: &[u8]) -> AttachmentBody {
+        AttachmentBody {
+            name: name.into(),
+            content_type: content_type.into(),
+            data: BASE64.encode(bytes),
+        }
+    }
+
+    fn body_with(attachments: Vec<AttachmentBody>) -> ComposeBody {
+        ComposeBody {
+            to: vec!["b@x.id".into()],
+            attachments,
+            ..Default::default()
+        }
+    }
+
+    fn invalid(b: ComposeBody) {
+        let err = build(&test_user(), b).expect_err("must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid_attachment");
+    }
+
+    #[test]
+    fn attachments_happy_path() {
+        let (c, _) = build(
+            &test_user(),
+            body_with(vec![
+                att("notes.txt", "text/plain", b"hello"),
+                att("blob.bin", "", b"\x00\x01"),
+            ]),
+        )
+        .expect("valid attachments");
+        assert_eq!(c.attachments.len(), 2);
+        assert_eq!(c.attachments[0].name, "notes.txt");
+        assert_eq!(c.attachments[0].content_type, "text/plain");
+        assert_eq!(c.attachments[0].bytes, b"hello");
+        // Empty content type defaults; it is never sent as an empty header.
+        assert_eq!(c.attachments[1].content_type, "application/octet-stream");
+    }
+
+    #[test]
+    fn attachments_reject_bad_base64() {
+        let mut b = body_with(vec![att("a.txt", "text/plain", b"x")]);
+        b.attachments[0].data = "!!!not base64!!!".into();
+        invalid(b);
+    }
+
+    #[test]
+    fn attachments_reject_oversize_file() {
+        invalid(body_with(vec![att(
+            "big.bin",
+            "application/octet-stream",
+            &vec![0u8; MAX_COMPOSE_ATTACHMENT_BYTES + 1],
+        )]));
+    }
+
+    #[test]
+    fn attachments_reject_oversize_total() {
+        // Each file is under its own cap; the sum passes the total cap.
+        let each = vec![0u8; 4_000_000];
+        invalid(body_with(vec![
+            att("a.bin", "application/octet-stream", &each),
+            att("b.bin", "application/octet-stream", &each),
+            att("c.bin", "application/octet-stream", &each),
+        ]));
+    }
+
+    #[test]
+    fn attachments_reject_bad_filename() {
+        for name in ["", "a/b.txt", "a\\b.txt", ".", "..", &"x".repeat(256)] {
+            invalid(body_with(vec![att(name, "text/plain", b"x")]));
+        }
+    }
+
+    #[test]
+    fn attachments_reject_bad_content_type() {
+        invalid(body_with(vec![att(
+            "a.txt",
+            "text/plain\r\nInjected: yes",
+            b"x",
+        )]));
+    }
+
+    #[test]
+    fn attachments_reject_too_many() {
+        let many = (0..MAX_COMPOSE_ATTACHMENTS + 1)
+            .map(|i| att(&format!("f{i}.txt"), "text/plain", b"x"))
+            .collect();
+        invalid(body_with(many));
     }
 }
