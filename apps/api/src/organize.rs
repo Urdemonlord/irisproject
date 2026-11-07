@@ -197,6 +197,10 @@ pub(crate) async fn set_message_label(
     let account = owned_account(&s, &u, &mailbox_id).await?;
     message_id(&id)?;
     let name = clean_label(&b.label)?;
+    // Serialized with `delete_label` (see `organize_lock`): adding a label
+    // between its keyword clear and row delete would otherwise leave an
+    // orphaned keyword on the message.
+    let _guard = s.organize_lock.lock().await;
     // Removing is always allowed (it cleans up a label deleted elsewhere);
     // adding needs a defined label.
     if b.on && !label_exists(&s, &mailbox_id, &name).await? {

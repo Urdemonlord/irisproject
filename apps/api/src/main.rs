@@ -3260,6 +3260,50 @@ mod handler_integration_tests {
         assert_eq!(filter_count(&s).await, 1);
     }
 
+    /// A label assign waits on the organize lock, like filter creates do:
+    /// while the lock is held it cannot check the label or set the keyword,
+    /// so it can never slip in between a label delete's keyword clear and
+    /// row delete and leave an orphaned keyword behind.
+    #[tokio::test]
+    async fn label_assign_waits_for_the_organize_lock() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let new: organize::LabelBody = serde_json::from_value(json!({"name": "work"})).unwrap();
+        organize::create_label(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            Json(new),
+        )
+        .await
+        .unwrap();
+        let guard = s.organize_lock.lock().await;
+        let s2 = s.clone();
+        let mut assign = tokio::spawn(async move {
+            organize::set_message_label(
+                State(s2),
+                Extension(user()),
+                Path(("mbx-1".into(), "m1".into())),
+                Json(
+                    serde_json::from_value::<organize::MessageLabelBody>(
+                        json!({"label": "work", "on": true}),
+                    )
+                    .unwrap(),
+                ),
+            )
+            .await
+        });
+        assert!(
+            timeout(Duration::from_millis(200), &mut assign)
+                .await
+                .is_err(),
+            "label assign finished while the organize lock was held"
+        );
+        drop(guard);
+        let resp = assign.await.unwrap().unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
     /// Handler-side clamps: a huge page is capped at MAX_LIST_LIMIT and a
     /// huge search term is truncated to MAX_SEARCH_QUERY_CHARS before JMAP.
     #[tokio::test]
