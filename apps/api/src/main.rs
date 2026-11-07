@@ -3008,6 +3008,42 @@ mod handler_integration_tests {
             set["methodCalls"][0][1]["update"]["m1"]["mailboxIds"],
             json!({"c-1": true})
         );
+        drop(reqs);
+        jmap.requests.lock().unwrap().clear();
+
+        // Moving back into Sent works: Undo restores a message to the
+        // folder it came from, including Sent.
+        let role = |r: &str| {
+            Json(serde_json::from_value::<compose::MoveBody>(json!({"folder": r})).unwrap())
+        };
+        compose::move_message(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            role("sent"),
+        )
+        .await
+        .unwrap();
+        let set = jmap
+            .requests
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|r| r["methodCalls"][0][0] == "Email/set")
+            .unwrap()["methodCalls"][0][1]["update"]["m1"]["mailboxIds"]
+            .clone();
+        assert_eq!(set, json!({"f-sent": true}));
+        // Drafts stays closed: a draft is an unsent composition, not a
+        // folder to file mail into.
+        let e = compose::move_message(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "m1".into())),
+            role("drafts"),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(e.1, "invalid_folder");
     }
 
     async fn filter_count(s: &AppState) -> i64 {

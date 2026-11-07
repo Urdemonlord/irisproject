@@ -82,8 +82,10 @@ pub(crate) async fn move_message(
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
     let role = folder_role(b.folder.as_deref().unwrap_or_default())?;
-    if role == "drafts" || role == "sent" {
-        // Drafts/Sent are filled by composing and sending, not by moving mail in.
+    if role == "drafts" {
+        // Drafts are filled by composing, not by moving mail in. Sent is
+        // allowed: Undo moves a message back to where it was, and a message
+        // that was in Sent is a sent message.
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
     }
     s.jmap
