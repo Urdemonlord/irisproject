@@ -2270,6 +2270,9 @@ mod handler_integration_tests {
         /// Total for Email/query; the list is returned verbatim by Email/get.
         query_total: u64,
         query_list: Vec<Value>,
+        /// Email/query answers the list once, then nothing: like a server
+        /// whose matches disappear once cleared.
+        query_drain: bool,
         /// Email/get answer for get_message (None = empty list -> NotFound).
         message: Option<Value>,
         /// Bytes served by GET /jmap/download/... for any blob id.
@@ -2291,6 +2294,7 @@ mod handler_integration_tests {
                 email_set: EmailSet::Created,
                 query_total: 0,
                 query_list: vec![],
+                query_drain: false,
                 message: None,
                 blob: vec![],
                 custom: vec![],
@@ -2317,7 +2321,8 @@ mod handler_integration_tests {
     }
 
     /// One JMAP `methodResponses` body for the request the client posted.
-    fn jmap_response(script: &JmapScript, body: &Value) -> String {
+    /// `query_calls` counts the Email/query calls before this one.
+    fn jmap_response(script: &JmapScript, body: &Value, query_calls: usize) -> String {
         let calls = body["methodCalls"].as_array().cloned().unwrap_or_default();
         let first = calls
             .first()
@@ -2367,10 +2372,19 @@ mod handler_integration_tests {
             "Identity/set" => vec![
                 json!(["Identity/set", {"created": {"i": {"id": "ident-1"}}, "notCreated": {}}, "s"]),
             ],
-            "Email/query" => vec![
-                json!(["Email/query", {"total": script.query_total, "ids": script.query_list.iter().map(|m| m["id"].clone()).collect::<Vec<_>>()}, "q"]),
-                json!(["Email/get", {"list": script.query_list}, "g"]),
-            ],
+            "Email/query" => {
+                let drained = script.query_drain && query_calls > 0;
+                let list: Vec<Value> = if drained {
+                    vec![]
+                } else {
+                    script.query_list.clone()
+                };
+                let total = if drained { 0 } else { script.query_total };
+                vec![
+                    json!(["Email/query", {"total": total, "ids": list.iter().map(|m| m["id"].clone()).collect::<Vec<_>>()}, "q"]),
+                    json!(["Email/get", {"list": list}, "g"]),
+                ]
+            }
             "Email/get" => {
                 let list = script.message.clone().map(|m| vec![m]).unwrap_or_default();
                 vec![json!(["Email/get", {"list": list}, "g"])]
@@ -2418,6 +2432,7 @@ mod handler_integration_tests {
         let task_relay = relay_calls.clone();
         let task_session = session_calls.clone();
         drop(tokio::spawn(async move {
+            let mut query_calls = 0usize;
             loop {
                 let Ok(Ok((mut stream, _))) =
                     timeout(Duration::from_secs(5), listener.accept()).await
@@ -2471,10 +2486,15 @@ mod handler_integration_tests {
                     if method == "POST" && path == "/jmap/" {
                         let v: Value = serde_json::from_slice(&body).unwrap_or(Value::Null);
                         task_requests.lock().unwrap().push(v.clone());
+                        let first = v["methodCalls"][0][0].as_str().unwrap_or_default();
+                        let calls = query_calls;
+                        if first == "Email/query" {
+                            query_calls += 1;
+                        }
                         (
                             "200 OK",
                             "application/json",
-                            jmap_response(&script, &v).into_bytes(),
+                            jmap_response(&script, &v, calls).into_bytes(),
                         )
                     } else if method == "POST" && path == "/emails" {
                         task_relay.fetch_add(1, Ordering::SeqCst);
@@ -3117,6 +3137,50 @@ mod handler_integration_tests {
                 .any(|r| r["methodCalls"][0][1]["onSuccessActivateScript"] == "sieve-1"),
             "expected a reactivation call, got: {reqs:?}"
         );
+    }
+
+    /// Deleting a label clears the keyword from every message, not just
+    /// the first query page: the mock answers the messages once, then
+    /// nothing, like a server whose matches disappear once cleared.
+    #[tokio::test]
+    async fn delete_label_clears_the_keyword_from_every_message() {
+        let jmap = fake_jmap(JmapScript {
+            query_drain: true,
+            query_total: 2,
+            query_list: vec![json!({"id": "m1"}), json!({"id": "m2"})],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        sqlx::query(
+            "INSERT INTO mailbox_labels (mailbox_id, name, created_at) VALUES ('mbx-1', 'work', '2026-01-01T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        organize::delete_label(
+            State(s.clone()),
+            Extension(user()),
+            Path(("mbx-1".into(), "work".into())),
+        )
+        .await
+        .unwrap();
+        assert!(!organize::label_exists(&s, "mbx-1", "work").await.unwrap());
+        let reqs = jmap.requests.lock().unwrap();
+        // Two queries: one found the messages, the second came back empty.
+        assert_eq!(
+            reqs.iter()
+                .filter(|r| r["methodCalls"][0][0] == "Email/query")
+                .count(),
+            2
+        );
+        let updates: Vec<&Value> = reqs
+            .iter()
+            .filter(|r| r["methodCalls"][0][0] == "Email/set")
+            .collect();
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0]["methodCalls"][0][1]["update"]["m1"]["keywords/work"].is_null());
+        assert!(updates[0]["methodCalls"][0][1]["update"]["m2"]["keywords/work"].is_null());
     }
 
     /// A filter create waits on the organize lock: while the lock is held

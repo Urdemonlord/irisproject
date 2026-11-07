@@ -1,6 +1,6 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
-use iris_config::limits::{MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
+use iris_config::limits::{MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -777,8 +777,13 @@ impl JmapClient {
         updated(&r[0], id)
     }
 
-    /// Removes a label keyword from up to 500 messages that carry it.
-    /// Returns how many were updated.
+    /// Removes a label keyword from every message that carries it.
+    /// `Email/query` returns at most `MAX_DESTROY_PER_CALL` ids, so a label
+    /// on more messages is cleared in passes: each pass removes the keyword
+    /// from the messages it found, so the next query finds the rest.
+    /// Returns how many were updated. Fails past `MAX_CLEAR_KEYWORD_BATCHES`
+    /// passes instead of looping forever; the caller then keeps the label,
+    /// so no message is left carrying a keyword whose label row is gone.
     pub async fn clear_keyword(
         &self,
         user: &str,
@@ -786,38 +791,44 @@ impl JmapClient {
         account: &str,
         keyword: &str,
     ) -> Result<usize, MailError> {
-        let r = self
-            .call(
-                user,
-                pass,
-                json!([["Email/query", {"accountId": account,
-                "filter": {"hasKeyword": keyword}, "limit": MAX_DESTROY_PER_CALL}, "q"]]),
-            )
-            .await?;
-        let ids: Vec<&str> = r[0]["ids"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(Value::as_str)
-            .collect();
-        if ids.is_empty() {
-            return Ok(0);
+        let mut total = 0;
+        for _ in 0..MAX_CLEAR_KEYWORD_BATCHES {
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/query", {"accountId": account,
+                    "filter": {"hasKeyword": keyword}, "limit": MAX_DESTROY_PER_CALL}, "q"]]),
+                )
+                .await?;
+            let ids: Vec<&str> = r[0]["ids"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(Value::as_str)
+                .collect();
+            if ids.is_empty() {
+                return Ok(total);
+            }
+            let mut update = serde_json::Map::new();
+            for id in &ids {
+                update.insert(
+                    id.to_string(),
+                    json!({ format!("keywords/{keyword}"): null }),
+                );
+            }
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/set", {"accountId": account, "update": update}, "u"]]),
+                )
+                .await?;
+            total += r[0]["updated"].as_object().map_or(0, |o| o.len());
         }
-        let mut update = serde_json::Map::new();
-        for id in &ids {
-            update.insert(
-                id.to_string(),
-                json!({ format!("keywords/{keyword}"): null }),
-            );
-        }
-        let r = self
-            .call(
-                user,
-                pass,
-                json!([["Email/set", {"accountId": account, "update": update}, "u"]]),
-            )
-            .await?;
-        Ok(r[0]["updated"].as_object().map_or(0, |o| o.len()))
+        Err(MailError::Protocol(format!(
+            "clear_keyword: {keyword} still on messages after {MAX_CLEAR_KEYWORD_BATCHES} passes"
+        )))
     }
 
     /// Installs (or with `None`, removes) the IRIS filter Sieve script and
