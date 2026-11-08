@@ -19,8 +19,10 @@
 //! `app_users` / `permanent_mailboxes` / `auth_sessions`
 //! for users, `integration_email_requests` / `integration_keys` for
 //! transactional delivery, `rate_limit_events` for aggregate user
-//! sends, and `temporary_inboxes` for temp-inbox counts. No new
-//! table, no migration. Recipients of transactional mail are stored
+//! sends, and `temporary_inboxes` for temp-inbox counts. Migration
+//! 008 added `integration_email_requests.error_message`, the relay
+//! rejection reason, so a `failed` request shows its cause.
+//! Recipients of transactional mail are stored
 //! only as hashes (`recipient_hash`), so the dashboard can never
 //! show them; the recent-requests list carries no recipient field.
 //! Integration keys expose their `key_id` (the public identifier the
@@ -41,12 +43,21 @@ use iris_config::limits::{
     MAX_FILTERS, MAX_LABELS, MAX_READS_PER_WINDOW, MAX_RECIPIENTS, READ_WINDOW_MINUTES,
     SENDS_PER_HOUR, TEMP_INBOX_MESSAGE_LIMIT,
 };
+use serde::Deserialize;
 use serde_json::json;
 use std::collections::HashMap;
 
 /// One row of the recent transactional-requests list: id, app, template,
-/// status, provider message id, created time.
-type RecentRequestRow = (String, String, String, String, Option<String>, String);
+/// status, provider message id, rejection reason, created time.
+type RecentRequestRow = (
+    String,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    String,
+);
 /// One row of the integration-keys list: id, app, status, daily limit,
 /// last used, expiry.
 type IntegrationKeyRow = (String, String, String, i64, Option<String>, Option<String>);
@@ -158,24 +169,37 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
     }
     let recent_rows: Vec<RecentRequestRow> =
         sqlx::query_as(
-            "SELECT r.id, k.app_id, r.template_id, r.status, r.provider_message_id, r.created_at FROM integration_email_requests r JOIN integration_keys k ON k.key_id=r.key_id ORDER BY r.created_at DESC LIMIT 20",
+            "SELECT r.id, k.app_id, r.template_id, r.status, r.provider_message_id, r.error_message, r.created_at FROM integration_email_requests r JOIN integration_keys k ON k.key_id=r.key_id ORDER BY r.created_at DESC LIMIT 20",
         )
         .fetch_all(&s.pool)
         .await?;
     let recent: Vec<_> = recent_rows
         .into_iter()
         .map(
-            |(id, app_id, template_id, status, provider_message_id, created_at)| {
+            |(id, app_id, template_id, status, provider_message_id, error_message, created_at)| {
                 json!({
                     "id": id,
                     "app_id": app_id,
                     "template_id": template_id,
                     "status": status,
                     "provider_message_id": provider_message_id,
+                    "error_message": error_message,
                     "created_at": created_at,
                 })
             },
         )
+        .collect();
+    // The registered integration apps, so the dashboard can offer them
+    // in the create-key form with the scopes each one may hold.
+    let registry_apps: Vec<_> = crate::integration_apps::apps()
+        .iter()
+        .map(|app| {
+            json!({
+                "id": app.id,
+                "host": app.host,
+                "templates": app.templates.iter().map(|t| &t.id).collect::<Vec<_>>(),
+            })
+        })
         .collect();
     let key_rows: Vec<IntegrationKeyRow> = sqlx::query_as(
         "SELECT key_id, app_id, status, daily_send_limit, last_used_at, expires_at FROM integration_keys ORDER BY created_at DESC LIMIT 100",
@@ -287,6 +311,7 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
             "transactional_per_app_last_7d": per_app,
             "transactional_recent": recent,
             "integration_keys": keys,
+            "integration_apps": registry_apps,
             "user_sends_last_24h": user_sends_last_24h,
         },
         "temp_inboxes": {
@@ -422,6 +447,117 @@ pub(crate) async fn revoke_integration_key(
             _ => ApiError(StatusCode::CONFLICT, "key_not_active"),
         })?;
     Ok(Json(json!({ "key_id": key_id, "app_id": app_id, "status": "revoked" })).into_response())
+}
+
+/// Body for creating an integration key from the dashboard. `scopes`
+/// is optional: omitted means every scope the app may hold (its
+/// template scopes plus `email:status`). `expires_days` and
+/// `daily_limit` are required and share the CLI limits (1..=365 days,
+/// 1..=10000 sends per day) because creation reuses the CLI minting
+/// logic; the database also enforces the daily-limit cap.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateIntegrationKeyBody {
+    app: String,
+    expires_days: u32,
+    daily_limit: u32,
+    #[serde(default)]
+    scopes: Option<Vec<String>>,
+}
+
+/// App ids are lowercase slugs: a lowercase letter first, then
+/// lowercase letters, digits and hyphens, at most 64 chars. The
+/// registry lookup is the real gate; this only rejects obvious junk
+/// before it.
+fn valid_app_slug(app: &str) -> bool {
+    !app.is_empty()
+        && app.len() <= 64
+        && app.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
+        && app
+            .bytes()
+            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
+}
+
+/// Mint an integration key for an app. Reuses the CLI minting logic
+/// (`integration_keys::issue`), so dashboard keys and CLI keys are
+/// identical: the plaintext secret is hashed before storage and is
+/// returned only in this one response, never stored or shown again.
+/// The CLI allows several active keys per app, so this does too; a
+/// duplicate app is not an error. Revoke the key with the existing
+/// revoke endpoint when it is no longer needed.
+pub(crate) async fn create_integration_key(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Json(body): Json<CreateIntegrationKeyBody>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    if !valid_app_slug(&body.app) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_app"));
+    }
+    if !(1..=365).contains(&body.expires_days) || !(1..=10_000).contains(&body.daily_limit) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_limits"));
+    }
+    let Some(app) = crate::integration_apps::app(&body.app) else {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "unsupported_app"));
+    };
+    let scopes = match body.scopes {
+        Some(scopes) => {
+            if scopes.is_empty() {
+                return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_scopes"));
+            }
+            scopes
+        }
+        None => app.all_scopes(),
+    };
+    // Validate before minting so a bad scope answers 400 with a clear
+    // code; `issue` re-checks everything, so the rules live in one place.
+    let mut seen = std::collections::HashSet::new();
+    if scopes.len() > 4
+        || scopes.iter().any(|scope| {
+            !seen.insert(scope) || !crate::integration_apps::scope_allowed(&body.app, scope)
+        })
+        || !scopes
+            .iter()
+            .any(|scope| scope.starts_with("email:template:"))
+    {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_scopes"));
+    }
+    let generated = crate::integration_keys::issue(
+        &s.pool,
+        &body.app,
+        &scopes.join(","),
+        body.expires_days,
+        body.daily_limit,
+    )
+    .await
+    .map_err(|err| match err {
+        "unsupported_app" => ApiError(StatusCode::BAD_REQUEST, "unsupported_app"),
+        "invalid_limits" => ApiError(StatusCode::BAD_REQUEST, "invalid_limits"),
+        "invalid_scopes" => ApiError(StatusCode::BAD_REQUEST, "invalid_scopes"),
+        _ => ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"),
+    })?;
+    // Read the stored row back so the response carries exactly what was
+    // stored (expiry and scopes), never a recomputed copy.
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT expires_at, scopes_json FROM integration_keys WHERE key_id=?")
+            .bind(&generated.key_id)
+            .fetch_optional(&s.pool)
+            .await?;
+    let (expires_at, scopes_json) = row.ok_or(ApiError(
+        StatusCode::INTERNAL_SERVER_ERROR,
+        "internal_error",
+    ))?;
+    let stored_scopes: Vec<String> = serde_json::from_str(&scopes_json)
+        .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    Ok(Json(json!({
+        "key_id": generated.key_id,
+        "app": body.app,
+        "secret": generated.token,
+        "expires_at": expires_at,
+        "daily_limit": body.daily_limit,
+        "scopes": stored_scopes,
+    }))
+    .into_response())
 }
 
 /// Delete an active temp inbox early. Same write as the user-facing
@@ -561,15 +697,21 @@ mod tests {
                 .execute(pool).await.unwrap();
         }
         // Transactional requests: two recent (accepted + failed), one
-        // older than 7 days (counts in neither window).
+        // older than 7 days (counts in neither window). The failed one
+        // carries a relay rejection reason.
         for (id, key_id, template, status, created) in [
             ("req-1", "key-alpha", "auth.verify", "accepted", now.clone()),
             ("req-2", "key-alpha", "auth.recovery", "failed", now.clone()),
             ("req-3", "key-alpha", "auth.verify", "accepted", old.clone()),
         ] {
-            sqlx::query("INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?)")
+            let error: Option<&str> = if id == "req-2" {
+                Some("recipient address rejected")
+            } else {
+                None
+            };
+            sqlx::query("INSERT INTO integration_email_requests (id,key_id,idempotency_key,template_id,recipient_hash,request_hash,status,error_message,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?)")
                 .bind(id).bind(key_id).bind(format!("idem-{id}")).bind(template)
-                .bind("b".repeat(64)).bind("c".repeat(64)).bind(status).bind(&created).bind(&created)
+                .bind("b".repeat(64)).bind("c".repeat(64)).bind(status).bind(error).bind(&created).bind(&created)
                 .execute(pool).await.unwrap();
         }
         // Two allowed user sends in the last 24h.
@@ -641,6 +783,33 @@ mod tests {
         assert!(v["delivery"]["transactional_recent"][0]
             .get("recipient")
             .is_none());
+        // The failed request carries its relay rejection reason; an
+        // accepted one has no reason.
+        let failed = v["delivery"]["transactional_recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["status"] == "failed")
+            .expect("a failed request must be listed");
+        assert_eq!(failed["error_message"], "recipient address rejected");
+        let accepted = v["delivery"]["transactional_recent"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|r| r["status"] == "accepted")
+            .expect("an accepted request must be listed");
+        assert!(accepted["error_message"].is_null());
+        // The registry is exposed so the dashboard can offer the apps
+        // and their scopes in the create-key form.
+        let apps = v["delivery"]["integration_apps"].as_array().unwrap();
+        assert!(apps.iter().any(|a| a["id"] == "alpha"));
+        let alpha = apps.iter().find(|a| a["id"] == "alpha").unwrap();
+        assert_eq!(alpha["host"], "alpha.example.com");
+        assert!(alpha["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "auth.verify"));
         assert_eq!(v["delivery"]["user_sends_last_24h"], 2);
         assert_eq!(
             v["delivery"]["integration_keys"].as_array().unwrap().len(),
@@ -931,6 +1100,10 @@ mod tests {
                 post(revoke_integration_key),
             )
             .route(
+                "/api/v1/admin/integration-keys",
+                post(create_integration_key),
+            )
+            .route(
                 "/api/v1/admin/temp-inboxes/:id/delete",
                 post(delete_temp_inbox),
             )
@@ -954,5 +1127,176 @@ mod tests {
             let resp = app.clone().oneshot(req).await.unwrap();
             assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri} must be 401");
         }
+        // The create-key route takes a JSON body, so it needs a body
+        // on the request; without a session it must still be 401.
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/v1/admin/integration-keys")
+            .header("content-type", "application/json")
+            .body(Body::from(
+                r#"{"app":"alpha","expires_days":30,"daily_limit":100}"#,
+            ))
+            .unwrap();
+        let resp = app.oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    fn key_body(
+        app: &str,
+        expires_days: u32,
+        daily_limit: u32,
+        scopes: Option<Vec<String>>,
+    ) -> CreateIntegrationKeyBody {
+        CreateIntegrationKeyBody {
+            app: app.into(),
+            expires_days,
+            daily_limit,
+            scopes,
+        }
+    }
+
+    #[tokio::test]
+    async fn admin_creates_a_key_and_the_secret_is_shown_once_only() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        let resp = create_integration_key(
+            State(s.clone()),
+            Extension(admin()),
+            Json(key_body("alpha", 30, 100, None)),
+        )
+        .await
+        .expect("admin must be able to create a key");
+        let v = body_json(resp).await;
+        // Omitted scopes default to every scope the app may hold.
+        assert_eq!(
+            v["scopes"],
+            json!([
+                "email:template:auth.verify",
+                "email:template:auth.recovery",
+                "email:status"
+            ])
+        );
+        assert_eq!(v["app"], "alpha");
+        assert_eq!(v["daily_limit"], 100);
+        assert!(v["expires_at"].is_string());
+        let key_id = v["key_id"].as_str().unwrap().to_string();
+        assert_eq!(key_id.len(), 32);
+        let secret = v["secret"].as_str().unwrap().to_string();
+        assert!(secret.starts_with("iris1_"));
+        // Only the hash is stored, never the plaintext secret.
+        let stored_hash: String =
+            sqlx::query_scalar("SELECT token_hash FROM integration_keys WHERE key_id=?")
+                .bind(&key_id)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(stored_hash, auth::hash_token(&secret));
+        assert_ne!(stored_hash, secret);
+        // The summary never exposes the secret afterwards.
+        let summary_resp = summary(State(s.clone()), Extension(admin())).await.unwrap();
+        let summary_json = body_json(summary_resp).await;
+        let listed = summary_json["delivery"]["integration_keys"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|k| k["key_id"] == key_id)
+            .expect("the new key must be listed");
+        assert!(listed.get("secret").is_none());
+        assert!(listed.get("token").is_none());
+        assert!(listed.get("token_hash").is_none());
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_create_a_key() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        let err = create_integration_key(
+            State(s),
+            Extension(user("alice@example.test")),
+            Json(key_body("alpha", 30, 100, None)),
+        )
+        .await
+        .expect_err("a non-admin must be refused");
+        assert_eq!(err.0, StatusCode::FORBIDDEN);
+        assert_eq!(err.1, "forbidden");
+    }
+
+    #[tokio::test]
+    async fn create_key_validates_input() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        let cases: Vec<(CreateIntegrationKeyBody, &str)> = vec![
+            (key_body("", 30, 100, None), "invalid_app"),
+            (key_body("Bad App!", 30, 100, None), "invalid_app"),
+            (
+                key_body("a".repeat(65).as_str(), 30, 100, None),
+                "invalid_app",
+            ),
+            (key_body("unknownapp", 30, 100, None), "unsupported_app"),
+            (key_body("alpha", 0, 100, None), "invalid_limits"),
+            (key_body("alpha", 366, 100, None), "invalid_limits"),
+            (key_body("alpha", 30, 0, None), "invalid_limits"),
+            (key_body("alpha", 30, 10_001, None), "invalid_limits"),
+            (
+                key_body(
+                    "alpha",
+                    30,
+                    100,
+                    Some(vec!["email:template:auth.login_link".into()]),
+                ),
+                "invalid_scopes",
+            ),
+            (
+                key_body("alpha", 30, 100, Some(vec!["email:status".into()])),
+                "invalid_scopes",
+            ),
+            (key_body("alpha", 30, 100, Some(vec![])), "invalid_scopes"),
+            (
+                key_body(
+                    "alpha",
+                    30,
+                    100,
+                    Some(vec![
+                        "email:template:auth.verify".into(),
+                        "email:template:auth.verify".into(),
+                    ]),
+                ),
+                "invalid_scopes",
+            ),
+        ];
+        for (body, code) in cases {
+            let err = create_integration_key(State(s.clone()), Extension(admin()), Json(body))
+                .await
+                .expect_err("bad input must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "expected 400 for {code}");
+            assert_eq!(err.1, code);
+        }
+        let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(rows, 0, "no key may be minted for refused input");
+    }
+
+    #[tokio::test]
+    async fn same_app_may_hold_several_active_keys() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        let mut ids = Vec::new();
+        for _ in 0..2 {
+            let resp = create_integration_key(
+                State(s.clone()),
+                Extension(admin()),
+                Json(key_body("alpha", 30, 100, None)),
+            )
+            .await
+            .expect("a second key for the same app must be allowed, like the CLI");
+            let v = body_json(resp).await;
+            ids.push(v["key_id"].as_str().unwrap().to_string());
+        }
+        assert_ne!(ids[0], ids[1]);
+        let active: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_keys WHERE app_id='alpha' AND status='active'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(active, 2);
     }
 }

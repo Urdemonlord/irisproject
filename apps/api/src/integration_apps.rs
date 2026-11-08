@@ -124,12 +124,30 @@ pub(crate) fn app(app_id: &str) -> Option<&'static IntegrationApp> {
     REGISTRY.iter().find(|app| app.id == app_id)
 }
 
+/// All registered apps, for the admin dashboard and key creation.
+pub(crate) fn apps() -> &'static [IntegrationApp] {
+    &REGISTRY
+}
+
 impl IntegrationApp {
     /// Look up one of this app's templates by id.
     pub(crate) fn template(&self, template_id: &str) -> Option<&Template> {
         self.templates
             .iter()
             .find(|template| template.id == template_id)
+    }
+
+    /// Every scope a key for this app may hold: one per owned template,
+    /// plus `email:status`. Used as the default when the admin creates
+    /// a key without picking scopes.
+    pub(crate) fn all_scopes(&self) -> Vec<String> {
+        let mut scopes: Vec<String> = self
+            .templates
+            .iter()
+            .map(|template| format!("email:template:{}", template.id))
+            .collect();
+        scopes.push("email:status".to_string());
+        scopes
     }
 }
 
