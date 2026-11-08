@@ -1,0 +1,146 @@
+#!/usr/bin/env python3
+"""iris-cert-sync - copy Caddy's TLS certificate into Stalwart and reload it.
+
+Caddy stores the certificate it issued for the mail host under
+/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory/<host>/.
+Stalwart reads its certificate from /etc/stalwart/tls/ through the
+Certificate object the installer created, so replacing the files and
+firing the ReloadTlsCertificates action is enough. Runs daily via the
+iris-cert-sync timer; exits 0 silently when there is no certificate yet.
+Standard library only.
+"""
+import base64
+import json
+import os
+import shutil
+import sys
+import urllib.error
+import urllib.request
+
+JMAP = "http://127.0.0.1:8080/jmap"
+USING = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"]
+TLS_DIR = "/etc/stalwart/tls"
+# Caddy's certificate store. The packaged Caddy unit sets
+# XDG_DATA_HOME=/var/lib/caddy, and Caddy appends /caddy to it, so the
+# store is /var/lib/caddy/caddy/certificates/... (the local CA proves
+# it: /var/lib/caddy/caddy/pki/authorities/local/root.crt). The plain
+# ~/.local/share/caddy path is kept as a fallback for a Caddy that was
+# started without the unit's environment.
+CADDY_CERTS_DIRS = [
+    "/var/lib/caddy/caddy/certificates/acme-v02.api.letsencrypt.org-directory",
+    "/var/lib/caddy/.local/share/caddy/certificates/acme-v02.api.letsencrypt.org-directory",
+]
+
+
+def log(msg):
+    print(f"iris-cert-sync: {msg}", file=sys.stderr)
+
+
+def main():
+    env = {}
+    try:
+        with open("/etc/iris/iris.env") as f:
+            for line in f:
+                if "=" in line and not line.startswith("#"):
+                    k, v = line.strip().split("=", 1)
+                    env[k] = v
+    except OSError as e:
+        log(f"cannot read /etc/iris/iris.env: {e}")
+        return 0
+    mail_host = env.get("MAIL_CONTENT_ORIGIN", "").replace("https://mail-content.", "mail.")
+    if not mail_host:
+        # Fall back to the first host in the Caddyfile.
+        try:
+            with open("/etc/caddy/Caddyfile") as f:
+                for line in f:
+                    line = line.strip()
+                    if line.endswith("{") and "." in line:
+                        mail_host = line[:-1].strip()
+                        break
+        except OSError:
+            pass
+    if not mail_host:
+        log("no mail host found, nothing to sync")
+        return 0
+
+    src_crt = src_key = None
+    for certs_dir in CADDY_CERTS_DIRS:
+        crt = os.path.join(certs_dir, mail_host, mail_host + ".crt")
+        key = os.path.join(certs_dir, mail_host, mail_host + ".key")
+        if os.path.exists(crt) and os.path.exists(key):
+            src_crt, src_key = crt, key
+            break
+    if src_crt is None:
+        log(f"no Caddy certificate for {mail_host} yet, skipping")
+        return 0
+
+    dst_crt = os.path.join(TLS_DIR, "fullchain.pem")
+    dst_key = os.path.join(TLS_DIR, "privkey.pem")
+    # Marker: if the files were copied but the reload failed, the next
+    # run must retry the reload even though the files did not change.
+    # Without it, a failed reload would leave Stalwart serving the old
+    # certificate from memory forever (the files already match).
+    marker = os.path.join(TLS_DIR, ".reload-pending")
+    changed = os.path.exists(marker)
+    for src, dst in ((src_crt, dst_crt), (src_key, dst_key)):
+        with open(src, "rb") as f:
+            new = f.read()
+        old = b""
+        if os.path.exists(dst):
+            with open(dst, "rb") as f:
+                old = f.read()
+        if new != old:
+            with open(dst, "wb") as f:
+                f.write(new)
+            changed = True
+    if not changed:
+        return 0
+    # The key must be group-readable: Stalwart runs as user stalwart
+    # and reads it through the Certificate object. 0600 root:stalwart
+    # would leave only root able to read it, and the reload would fail
+    # with permission denied.
+    os.chmod(dst_crt, 0o640)
+    os.chmod(dst_key, 0o640)
+    try:
+        shutil.chown(dst_crt, "root", "stalwart")
+        shutil.chown(dst_key, "root", "stalwart")
+    except Exception:
+        pass
+
+    # Reload the TLS certificates in the running Stalwart.
+    try:
+        admin_email = env["IRIS_ADMIN_EMAILS"].split(",")[0].strip()
+        with open("/etc/iris/.admin_credentials") as f:
+            admin_pw = f.read().strip()
+    except (KeyError, OSError) as e:
+        log(f"cannot read admin credentials, certificate files updated but not reloaded: {e}")
+        open(marker, "w").close()
+        return 1
+    auth = "Basic " + base64.b64encode(f"{admin_email}:{admin_pw}".encode()).decode()
+    body = json.dumps({"using": USING, "methodCalls": [
+        ["x:Action/set", {"create": {"a1": {"@type": "ReloadTlsCertificates"}}}, "0"],
+    ]}).encode()
+    req = urllib.request.Request(
+        JMAP + "/", data=body, method="POST",
+        headers={"Authorization": auth, "Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            json.load(resp)
+    except urllib.error.HTTPError as e:
+        log(f"ReloadTlsCertificates failed: HTTP {e.code}")
+        open(marker, "w").close()
+        return 1
+    except (urllib.error.URLError, OSError) as e:
+        # Stalwart is down or unreachable: leave the marker so the next
+        # run retries the reload instead of crashing on a traceback.
+        log(f"ReloadTlsCertificates failed: cannot reach Stalwart ({e})")
+        open(marker, "w").close()
+        return 1
+    if os.path.exists(marker):
+        os.remove(marker)
+    log(f"installed renewed certificate for {mail_host} and reloaded Stalwart TLS")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

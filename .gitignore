@@ -30,6 +30,9 @@ logs/
 *.db-shm
 *.db-wal
 
+# One-package install (Debian/Ubuntu) build outputs
+packaging/build/
+
 # Secrets
 .env*
 !.env.example

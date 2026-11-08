@@ -1,0 +1,24 @@
+[Unit]
+Description=IRIS webmail API
+After=network-online.target iris-stalwart.service
+Wants=network-online.target
+Requires=iris-stalwart.service
+
+[Service]
+Type=simple
+User=iris
+Group=iris
+WorkingDirectory=/var/lib/iris
+EnvironmentFile=/etc/iris/iris.env
+ExecStart=/usr/local/bin/iris-api
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/iris
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target

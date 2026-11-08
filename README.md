@@ -79,6 +79,14 @@ What it does NOT do: install a mail server, touch DNS, enable systemd
 units, issue TLS certificates, or send any mail. Those need your domain
 and are covered in [Deployment](#deployment).
 
+## One-package install (Debian/Ubuntu)
+
+Prefer a single install step over the agent flow above? The official
+`.deb` bundles IRIS, Stalwart and Caddy with automatic TLS: see
+[`packaging/README.md`](packaging/README.md). Its version follows the
+IRIS release, and the `.deb`, tarball and `install.sh` are attached
+to each GitHub release.
+
 ## Quick start (local dev)
 
 ```bash

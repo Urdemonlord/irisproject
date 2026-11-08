@@ -1,0 +1,17 @@
+#!/bin/sh
+# iris-mail-stack postinst. All real work lives in /usr/lib/iris/iris-install.sh
+# so the tarball installer can run the same steps.
+set -e
+case "$1" in
+  configure)
+    /usr/lib/iris/iris-install.sh configure
+    ;;
+  abort-upgrade|abort-remove|abort-deconfigure)
+    ;;
+  *)
+    echo "postinst called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+#DEBHELPER#
+exit 0

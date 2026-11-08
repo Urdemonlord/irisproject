@@ -1,0 +1,15 @@
+[Unit]
+Description=Sync Caddy TLS certificates into Stalwart (IRIS stack)
+
+[Service]
+Type=oneshot
+User=root
+ExecStart=/usr/local/sbin/iris-cert-sync
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/etc/stalwart/tls
+
+[Install]
+WantedBy=multi-user.target

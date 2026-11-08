@@ -1,0 +1,18 @@
+#!/bin/sh
+# iris-mail-stack prerm. Stop the services on remove; data, users and
+# config stay in place (purge removes them, see postrm).
+set -e
+case "$1" in
+  remove|deconfigure)
+    systemctl disable --now iris-api.service iris-stalwart.service iris-caddy.service 2>/dev/null || true
+    systemctl disable --now iris-cleanup.timer iris-cert-sync.timer 2>/dev/null || true
+    ;;
+  upgrade|failed-upgrade)
+    ;;
+  *)
+    echo "prerm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+#DEBHELPER#
+exit 0

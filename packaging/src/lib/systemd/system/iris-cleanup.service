@@ -1,0 +1,21 @@
+# Out-of-process IRIS retention safety net. The API also runs the same
+# cleanup in-process every 60 s; this timer covers the case where the
+# API is down, so temp-inbox mail does not pile up on Stalwart.
+[Unit]
+Description=IRIS one-shot retention cleanup
+
+[Service]
+Type=oneshot
+User=iris
+Group=iris
+WorkingDirectory=/var/lib/iris
+EnvironmentFile=/etc/iris/iris.env
+ExecStart=/usr/local/bin/iris-api cleanup-once
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/iris
+
+[Install]
+WantedBy=multi-user.target
