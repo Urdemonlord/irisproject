@@ -5,6 +5,7 @@ type Attachment = { part_id: string; blob_id: string; name: string; content_type
 type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
 type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
 type TempInbox = { id: string; address: string; access_token: string; expires_at: string }
+type Contact = { id: string; name: string; email: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
@@ -941,6 +942,86 @@ function replyDraft(d: Detail, kind: 'reply' | 'all' | 'forward', me: string): C
 
 let closeComposer: (() => Promise<void>) | null = null
 
+/** Contact autocomplete for one recipient field. Typing suggests matching
+ * contacts below the field; Arrow keys move, Enter or Tab picks, Escape
+ * closes. Picking replaces the address being typed, never the whole field. */
+function attachContactSuggest(f: { el: HTMLInputElement; row: HTMLDivElement }, onPick: () => void) {
+  // The browser's own email completion would fight this dropdown.
+  f.el.setAttribute('autocomplete', 'off')
+  const box = h('div', { className: 'compose-suggest', role: 'listbox', hidden: true })
+  f.row.append(box)
+  let items: Contact[] = []
+  let active = -1
+  let seq = 0
+  let timer = 0
+  const close = () => { box.hidden = true; items = []; active = -1 }
+  // The address being typed: the comma/semicolon-separated token around the caret.
+  const token = () => {
+    const v = f.el.value
+    const pos = f.el.selectionStart ?? v.length
+    const before = v.slice(0, pos)
+    const raw = Math.max(before.lastIndexOf(','), before.lastIndexOf(';')) + 1
+    const leading = v.slice(raw, pos).match(/^\s*/)?.[0].length ?? 0
+    const start = raw + leading
+    const after = v.slice(pos)
+    const next = after.search(/[,;]/)
+    const end = next === -1 ? v.length : pos + next
+    return { text: v.slice(start, end).trim(), start, end }
+  }
+  const render = () => {
+    box.replaceChildren(...items.map((c, i) => {
+      const b = h('button', { type: 'button', className: 'suggest-item', role: 'option', 'aria-selected': String(i === active) },
+        h('span', { className: 'suggest-name' }, c.name),
+        h('span', { className: 'suggest-email' }, c.email))
+      // mousedown (not click) so the input never blurs before the pick lands.
+      b.addEventListener('mousedown', (e) => { e.preventDefault(); pick(i) })
+      return b
+    }))
+    box.hidden = !items.length
+  }
+  const pick = (i: number) => {
+    const c = items[i]
+    if (!c) return
+    const { start, end } = token()
+    const v = f.el.value
+    const rest = v.slice(end).replace(/^[,;\s]*/, '')
+    f.el.value = v.slice(0, start) + c.email + ', ' + rest
+    const caret = start + c.email.length + 2
+    f.el.setSelectionRange(caret, caret)
+    close()
+    f.el.focus()
+    onPick()
+  }
+  f.el.addEventListener('input', () => {
+    clearTimeout(timer)
+    if (token().text.length < 2) { close(); return }
+    const my = ++seq
+    timer = window.setTimeout(async () => {
+      try {
+        const { contacts } = await api<{ contacts: Contact[] }>(`/api/v1/contacts?q=${encodeURIComponent(token().text)}&limit=8`)
+        if (my !== seq) return
+        items = contacts
+        active = -1
+        render()
+      } catch { if (my === seq) close() }
+    }, 200)
+  })
+  f.el.addEventListener('keydown', (e) => {
+    if (box.hidden) return
+    if (e.key === 'ArrowDown' || e.key === 'ArrowUp') {
+      e.preventDefault()
+      active = e.key === 'ArrowDown' ? (active + 1) % items.length : (active - 1 + items.length) % items.length
+      render()
+    } else if (e.key === 'Enter' || e.key === 'Tab') {
+      if (active >= 0) { e.preventDefault(); pick(active) }
+    } else if (e.key === 'Escape') {
+      // Stop here so the composer's own Escape handler does not close the panel.
+      e.preventDefault(); e.stopPropagation(); close()
+    }
+  })
+  f.el.addEventListener('blur', close)
+}
+
 async function openComposer(base: string, d: ComposeDraft, onChange: () => void) {
   if (closeComposer) await closeComposer()
   let draftId = d.draftId
@@ -1058,6 +1139,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   const changed = () => { dirty = true; status.textContent = ''; clearTimeout(timer); timer = window.setTimeout(save, 2500) }
   ;[to.el, cc.el, bcc.el, subject.el, body].forEach((el) => el.addEventListener('input', changed))
   ;[to, cc, bcc].forEach((f) => f.el.addEventListener('input', () => f.set('')))
+  ;[to, cc, bcc].forEach((f) => attachContactSuggest(f, changed))
 
   const close = async () => {
     if (closed) return
@@ -1170,12 +1252,12 @@ function orgNav(current: string) {
       ...custom.map((f) => link(viewHash({ kind: 'folder', id: f.id }), 'folder', f.name, `folder:${f.id}`, f.unread)),
       ...(org.labels.length ? [navSection('Labels')] : []),
       ...org.labels.map((l) => link(viewHash({ kind: 'label', name: l }), 'tag', l, `label:${l}`)),
-      link('#/organize', 'filter', 'Folders & filters', 'organize'))
+      link('#/organize', 'filter', 'Organize', 'organize'))
     tabs.replaceChildren(
       tab('#/starred', 'Starred', 'starred'),
       ...custom.map((f) => tab(viewHash({ kind: 'folder', id: f.id }), f.name, `folder:${f.id}`)),
       ...org.labels.map((l) => tab(viewHash({ kind: 'label', name: l }), `# ${l}`, `label:${l}`)),
-      tab('#/organize', 'Folders & filters', 'organize'))
+      tab('#/organize', 'Organize', 'organize'))
   }
   draw()
   return { starred: link('#/starred', 'star', 'Starred', 'starred'), sidebar, tabs, draw }
@@ -1194,6 +1276,10 @@ const orgErrors: Record<string, string> = {
   too_many_filters: 'You’ve reached the limit of 50 filters.',
   unknown_label: 'That label no longer exists. Reload the page and try again.',
   invalid_folder: 'That folder can’t be used here.',
+  invalid_contact_name: 'Use a name of 1–100 characters.',
+  invalid_contact_email: 'Enter a valid email address.',
+  contact_exists: 'A contact with this email already exists.',
+  too_many_contacts: 'You’ve reached the limit of 500 contacts.',
   not_found: 'It no longer exists. Reload the page and try again.',
   mail_server_unavailable: errorText.mail_server_unavailable,
   mail_server_error: errorText.mail_server_error,
@@ -1623,7 +1709,7 @@ function describeFilter(f: FilterRule) {
 async function renderOrganize() {
   const { email, mb } = await ensureAccount()
   const base = `/api/v1/mailboxes/${mb}`
-  setPage({ title: 'Folders & filters', description: 'Manage your IRIS folders, labels and filters.', path: '/', noindex: true })
+  setPage({ title: 'Organize', description: 'Manage your IRIS folders, labels, filters and contacts.', path: '/', noindex: true })
   let filters: FilterRule[] = []
 
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
@@ -1653,6 +1739,83 @@ async function renderOrganize() {
       btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteFilter(f) })))
       : [empty('No filters yet. Add one below to sort new mail automatically.')]))
     drawForm()
+  }
+
+  // Contacts: the address book behind compose autocomplete. The add form
+  // doubles as the edit form: Edit fills it and switches the button.
+  const contactList = h('ul', { className: 'org-list' })
+  let contacts: Contact[] = []
+  let editing: Contact | null = null
+  const drawContacts = () => {
+    const sorted = [...contacts].sort((a, b) => a.name.localeCompare(b.name) || a.email.localeCompare(b.email))
+    contactList.replaceChildren(...(sorted.length ? sorted.map((c) => row('account', `${c.name} · ${c.email}`,
+      btn('btn btn-ghost btn-sm', 'Edit', 'pen', { onclick: () => editContact(c) }),
+      btn('btn btn-ghost btn-sm', 'Delete', 'trash', { onclick: () => deleteContact(c) })))
+      : [empty('No contacts yet. Add people you email often and they will show up as suggestions in To, Cc and Bcc.')]))
+    if (contacts.length >= 100) contactList.append(h('li', { className: 'org-empty muted' }, 'Showing the first 100 contacts.'))
+  }
+  const contactName = h('input', { id: 'ct-name', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'Ada Lovelace' }) as HTMLInputElement
+  const contactEmail = h('input', { id: 'ct-email', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'ada@example.com' }) as HTMLInputElement
+  const contactError = h('div', { className: 'form-error', role: 'alert' })
+  const contactSave = h('button', { type: 'submit', className: 'btn btn-primary' }, icon('plus'), h('span', { className: 'btn-label' }, 'Add contact')) as HTMLButtonElement
+  const contactCancel = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', hidden: true }, 'Cancel editing')
+  const contactForm = h('form', { className: 'org-form' },
+    h('div', { className: 'field' }, h('label', { htmlFor: 'ct-name' }, 'Name'), contactName),
+    h('div', { className: 'field org-grow org-span-2' }, h('label', { htmlFor: 'ct-email' }, 'Email'), contactEmail),
+    h('div', { className: 'org-submit' }, contactSave, contactCancel),
+    contactError)
+  const resetContactForm = () => {
+    editing = null
+    contactName.value = ''
+    contactEmail.value = ''
+    ;(contactSave.querySelector('.btn-label') as HTMLElement).textContent = 'Add contact'
+    contactCancel.hidden = true
+    contactError.replaceChildren()
+  }
+  const editContact = (c: Contact) => {
+    editing = c
+    contactName.value = c.name
+    contactEmail.value = c.email
+    ;(contactSave.querySelector('.btn-label') as HTMLElement).textContent = 'Save changes'
+    contactCancel.hidden = false
+    contactError.replaceChildren()
+    contactName.focus()
+  }
+  contactCancel.onclick = resetContactForm
+  contactForm.onsubmit = async (e) => {
+    e.preventDefault()
+    contactError.replaceChildren()
+    const name = contactName.value.trim()
+    const email = contactEmail.value.trim()
+    if (!name || !email) { contactError.append(h('span', {}, 'Enter a name and an email address.')); return }
+    const restore = busy(contactSave, 'Saving…')
+    try {
+      if (editing) {
+        const { contact } = await api<{ contact: Contact }>(`/api/v1/contacts/${encodeURIComponent(editing.id)}`, { method: 'PATCH', body: JSON.stringify({ name, email }) })
+        contacts = contacts.map((x) => x.id === contact.id ? contact : x)
+        toast('Contact saved')
+      } else {
+        const { contact } = await api<{ contact: Contact }>('/api/v1/contacts', { method: 'POST', body: JSON.stringify({ name, email }) })
+        contacts = [...contacts, contact]
+        toast('Contact added')
+      }
+      restore()
+      resetContactForm()
+      drawContacts()
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      contactError.replaceChildren(icon('alert'), h('span', {}, orgError(err)))
+    }
+  }
+  const deleteContact = async (c: Contact) => {
+    if (!(await confirmDialog(`Delete “${c.name}”?`, 'The contact is removed from your address book.', 'Delete contact'))) return
+    try {
+      await api(`/api/v1/contacts/${encodeURIComponent(c.id)}`, { method: 'DELETE' })
+      contacts = contacts.filter((x) => x.id !== c.id)
+      if (editing?.id === c.id) resetContactForm()
+      drawContacts(); toast('Contact deleted')
+    } catch (err) { toast(orgError(err)) }
   }
 
   const renameFolder = (f: FolderInfo) => promptDialog({
@@ -1746,17 +1909,19 @@ async function renderOrganize() {
     h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
   app.className = 'app-shell'
   app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
-    h('h1', { className: 'pane-title' }, 'Folders & filters'),
+    h('h1', { className: 'pane-title' }, 'Organize'),
     section('Folders', 'Your own folders, next to Inbox, Archive and Trash.', folderList,
       btn('btn btn-secondary btn-sm', 'New folder', 'plus', { onclick: async () => { if (await newFolderDialog(base)) drawFolders() } })),
     section('Labels', 'Tag messages without moving them. Starred is always available.', labelList,
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
-    section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form))))
+    section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
+    section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm))))
   folderList.replaceChildren(skeleton(2))
   try {
-    const [, f] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`)])
+    const [, f, ct] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`), api<{ contacts: Contact[] }>('/api/v1/contacts?limit=100')])
     filters = f.filters
-    drawFolders(); drawLabels(); drawFilters()
+    contacts = ct.contacts
+    drawFolders(); drawLabels(); drawFilters(); drawContacts()
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     folderList.replaceChildren(errorState(orgError(err), () => { void renderOrganize() }))

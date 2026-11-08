@@ -128,6 +128,21 @@ pub const HTML_BODY_TOKEN_TTL_SECS: u64 = 120;
 /// so a runaway client cannot grow the in-memory store without bound.
 pub const MAX_PENDING_HTML_BODIES: usize = 512;
 
+// --- Contacts ---------------------------------------------------------------
+// The address book is per user, not per mailbox: one list shared across
+// every mailbox they own, so a single cap covers all of them.
+
+/// Max contacts one user can store.
+pub const MAX_CONTACTS_PER_USER: i64 = 500;
+/// Max length of a contact name, in characters.
+pub const MAX_CONTACT_NAME_CHARS: usize = 100;
+/// Search terms are truncated to this many characters before going to SQL.
+pub const MAX_CONTACT_SEARCH_CHARS: usize = 100;
+/// Default page size for contact listing.
+pub const DEFAULT_CONTACTS_LIMIT: u32 = 50;
+/// Max page size a client may request for contact listing.
+pub const MAX_CONTACTS_LIMIT: u32 = 100;
+
 // --- Labels, custom folders and filters ------------------------------------
 
 /// Max labels one mailbox can define.

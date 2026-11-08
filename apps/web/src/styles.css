@@ -582,7 +582,7 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .composer-head .btn-ghost:hover { background: var(--iris-ink-raised); color: var(--iris-cream); }
 .compose-status { font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: #C9C9C0; }
 .composer-fields { display: flex; flex-direction: column; padding: 0 var(--iris-space-4); }
-.compose-row { display: flex; align-items: center; gap: var(--iris-space-3); border-bottom: var(--iris-rule-hair); min-height: 44px; }
+.compose-row { display: flex; align-items: center; gap: var(--iris-space-3); border-bottom: var(--iris-rule-hair); min-height: 44px; position: relative; }
 .compose-row[hidden] { display: none; }
 .compose-row label { flex: none; width: 56px; font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-graphite); }
 .compose-row input { flex: 1; min-width: 0; height: 42px; border: 0; background: none; outline: none; font-size: var(--iris-text-base); color: var(--iris-text); }
@@ -598,6 +598,14 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .compose-attach-list .attach-row { border-top: 0; padding: var(--iris-space-1) 0; }
 .compose-body { flex: 1; min-height: 120px; resize: none; border: 0; outline: none; padding: var(--iris-space-4); font-family: var(--iris-font-ui); font-size: var(--iris-text-read); line-height: var(--iris-leading-read); color: var(--iris-text); background: none; }
 .composer > .form-error { margin: 0 var(--iris-space-4) var(--iris-space-2); }
+/* Contact autocomplete under a recipient field. Anchored to the row so it
+ * lines up with the input, past the 56px label. */
+.compose-suggest { position: absolute; left: 68px; right: 0; top: 100%; z-index: 30; max-height: 220px; overflow-y: auto; background: var(--iris-surface); border: 1.5px solid var(--iris-ink); border-radius: var(--iris-radius-1); box-shadow: var(--iris-shadow-plate); }
+.compose-suggest[hidden] { display: none; }
+.suggest-item { display: flex; align-items: baseline; gap: var(--iris-space-3); width: 100%; min-height: 40px; padding: var(--iris-space-2) var(--iris-space-3); border: 0; background: none; color: var(--iris-text); font: inherit; font-size: var(--iris-text-sm); text-align: left; cursor: pointer; }
+.suggest-item:hover, .suggest-item[aria-selected="true"] { background: var(--iris-cream-sunk); }
+.suggest-name { font-weight: 600; white-space: nowrap; }
+.suggest-email { color: var(--iris-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .composer-foot { display: flex; align-items: center; gap: var(--iris-space-3); padding: var(--iris-space-3) var(--iris-space-4); border-top: var(--iris-rule-hair); }
 .composer-foot .btn-primary { height: 40px; padding: 0 var(--iris-space-5); }
 .compose-hint { font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-stone); }
@@ -728,6 +736,7 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .org-empty { padding: var(--iris-space-3) 0; font-size: var(--iris-text-sm); }
 .org-form { width: 100%; display: grid; grid-template-columns: 150px minmax(0, 1fr) 170px; gap: var(--iris-space-3); align-items: end; }
 .org-form .org-grow { min-width: 0; }
+.org-form .org-span-2 { grid-column: span 2; }
 .org-form .org-submit { grid-column: 1 / -1; }
 .org-form .form-error { grid-column: 1 / -1; }
 .org-form [hidden] { display: none; }
