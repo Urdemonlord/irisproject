@@ -4,7 +4,7 @@ type Summary = { id: string; from: string; to: string[]; subject: string; previe
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
 type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
 type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
-type TempInbox = { id: string; address: string; access_token: string; expires_at: string }
+type TempInbox = { id: string; address: string; access_token: string; expires_at: string; extensions_left?: number }
 type Contact = { id: string; name: string; email: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
@@ -108,6 +108,7 @@ const errorText: Record<string, string> = {
 const tempErrors: Record<string, string> = {
   rate_limited: 'Too many addresses created from your network. Try again later.',
   quota_exceeded: 'You already have 3 active temporary addresses. Wait for one to expire.',
+  extension_limit_reached: 'This address cannot be extended any more.',
   network: errorText.network,
 }
 
@@ -2180,6 +2181,22 @@ function renderTempExpired(inbox: TempInbox) {
   create.focus()
 }
 
+function renderTempDeleted(inbox: TempInbox) {
+  stopTemp()
+  saveTemp(null)
+  setPage({ title: 'Address deleted', description: 'This temporary address was deleted.', path: '/#/temp', noindex: true })
+  const create = btn('btn btn-primary btn-block', 'Create new address', 'pen')
+  create.onclick = () => renderTempStart()
+  simplePage('auth-main',
+    h('section', { className: 'auth-card expired' },
+      mascot('cat-sleep', 'mascot expired-cat'),
+      h('h1', {}, 'This address is deleted.'),
+      h('code', { className: 'temp-address strikethrough' }, inbox.address),
+      h('p', { className: 'muted' }, 'Its messages were deleted and can’t be recovered.'),
+      create))
+  create.focus()
+}
+
 async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   stopTemp()
   setPage({ title: 'Your temporary inbox', description: 'Your disposable IRIS address.', path: '/#/temp', noindex: true })
@@ -2198,12 +2215,14 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   const countdownEl = h('span', { className: 'countdown', role: 'timer' })
   const stickyCount = h('span', { className: 'sticky-count', role: 'timer' })
   const expiryChip = h('span', { className: 'expiry-chip' })
+  const expiryTime = h('div', { className: 'expiry-time' })
   const tickBar = h('div', { className: 'tick-bar', 'aria-hidden': 'true' }, ...Array.from({ length: 60 }, () => h('span', { className: 'tick' })))
   const tick = () => {
     const s = Math.max(0, Math.floor((Date.parse(inbox.expires_at) - Date.now()) / 1000))
     const t = [Math.floor(s / 3600), Math.floor((s % 3600) / 60), s % 60].map((n) => String(n).padStart(2, '0')).join(':')
     countdownEl.textContent = t
     stickyCount.textContent = `Expires in ${t.replace(/^00:/, '')}`
+    expiryTime.textContent = `at ${fmtTime(new Date(inbox.expires_at))}`
     ;[countdownEl, stickyCount].forEach((el) => { el.classList.toggle('urgent', s <= 600); el.classList.toggle('danger', s <= 60) })
     expiryChip.classList.toggle('urgent', s <= 600)
     expiryChip.replaceChildren(icon('timer', 'icon icon-sm'), s <= 60 ? 'Under a minute' : s <= 600 ? `${Math.ceil(s / 60)} min left · expiring` : `${Math.ceil(s / 60)} min left`)
@@ -2225,9 +2244,51 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
     h('span', { className: 'live-status' }, h('span', { className: 'live-dot' }), 'Live'))
 
   const newBtn = () => btn('btn btn-secondary btn-block', 'New address', 'pen', { onclick: discard })
+  // Extend / delete: same Bearer token as every other temp call, so one
+  // browser can only touch its own inbox.
+  let extensionsLeft = inbox.extensions_left
+  const extNote = h('p', { className: 'rail-note' })
+  const extendBtn = btn('btn btn-secondary btn-block', 'Extend by 1 hour', 'clock', { onclick: () => { void doExtend() } }) as HTMLButtonElement
+  const deleteBtn = btn('btn btn-ghost btn-block', 'Delete address', 'trash', { onclick: () => { void doDelete() } }) as HTMLButtonElement
+  const updateExt = () => {
+    extendBtn.disabled = extensionsLeft !== undefined && extensionsLeft <= 0
+    extendBtn.title = extensionsLeft !== undefined && extensionsLeft <= 0 ? 'No extensions left for this address.' : 'Add 1 hour to this address.'
+    extNote.textContent = extensionsLeft === undefined ? '' : extensionsLeft <= 0 ? 'No extensions left for this address.' : `${extensionsLeft} extension${extensionsLeft === 1 ? '' : 's'} left, 1 hour each.`
+  }
+  const doExtend = async () => {
+    const restore = busy(extendBtn, 'Extending…')
+    try {
+      const updated = await api<TempInbox>(`${base}/extend`, { ...auth, method: 'POST' })
+      inbox.expires_at = updated.expires_at
+      inbox.extensions_left = updated.extensions_left
+      extensionsLeft = updated.extensions_left
+      saveTemp(inbox)
+      updateExt()
+      tick()
+      toast('Address extended by 1 hour.')
+    } catch (err) {
+      if ([401, 404, 410].includes((err as HttpError).status)) return expired()
+      if ((err as HttpError).code === 'extension_limit_reached') { extensionsLeft = 0; updateExt() }
+      toast(tempErrors[(err as HttpError).code] ?? 'Could not extend this address.')
+    } finally { restore() }
+  }
+  const doDelete = async () => {
+    const ok = await confirmDialog('Delete this address?', 'The address stops working right away and its messages will be deleted. You cannot undo this.', 'Delete address')
+    if (!ok) return
+    const restore = busy(deleteBtn, 'Deleting…')
+    try {
+      await api(`${base}/delete`, { ...auth, method: 'POST' })
+      renderTempDeleted(inbox)
+    } catch (err) {
+      if ([401, 404, 410].includes((err as HttpError).status)) return expired()
+      toast('Could not delete this address. Please try again.')
+    } finally { restore() }
+  }
+  updateExt()
   const rail = h('aside', { className: 'expiry-rail', ariaLabel: 'Expiry' },
     h('div', { className: 'expiry-label' }, 'Expires in'), countdownEl,
-    h('div', { className: 'expiry-time' }, `at ${fmtTime(new Date(inbox.expires_at))}`), tickBar,
+    expiryTime, tickBar,
+    extendBtn, extNote, deleteBtn,
     newBtn(),
     h('p', { className: 'rail-note' }, 'Starting a new address forgets this one in this browser. Mail still arrives until it expires.'))
   const stickyBar = h('div', { className: 'temp-sticky' }, stickyCount, copyButton(inbox.address, 'Copy address', 'btn btn-primary btn-sm', 'Copy'))
@@ -2277,6 +2338,18 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
       if (!loaded) ui.list.replaceChildren(errorState(tempErrors[(err as HttpError).code] ?? 'Could not load messages.', load))
     }
   }
+  // Sync the expiry and remaining extensions with the server once, so a
+  // restored tab shows the truth instead of the saved snapshot.
+  api<{ expires_at: string; extensions_left: number }>(base, auth)
+    .then((st) => {
+      inbox.expires_at = st.expires_at
+      inbox.extensions_left = st.extensions_left
+      extensionsLeft = st.extensions_left
+      saveTemp(inbox)
+      updateExt()
+      tick()
+    })
+    .catch((err) => { if ([401, 404, 410].includes((err as HttpError).status)) expired() })
   tick(); load()
   tempTimers = [window.setInterval(tick, 1000), window.setInterval(() => { if (!document.hidden) load() }, 5_000)]
   onVisible = () => { if (!document.hidden) { tick(); load() } }

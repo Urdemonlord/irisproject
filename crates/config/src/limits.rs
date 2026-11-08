@@ -88,6 +88,15 @@ pub const IP_CREATES_PER_HOUR: i64 = 10;
 pub const ACTIVE_PER_CLIENT: i64 = 3;
 /// Max messages listed for one temp inbox per request.
 pub const TEMP_INBOX_MESSAGE_LIMIT: u32 = 50;
+/// Hours added by one temp-inbox extension.
+pub const TEMP_EXTEND_HOURS: i64 = 1;
+/// Max extensions per temp inbox. Five 1-hour extensions on top of the
+/// default 1-hour life is 6 hours; the lifetime cap below is the backstop
+/// for a large configured default lifetime.
+pub const MAX_TEMP_EXTENSIONS: i64 = 5;
+/// Max total lifetime of a temp inbox from creation, in hours, no matter
+/// how many extensions were used.
+pub const MAX_TEMP_INBOX_LIFETIME_HOURS: i64 = 24;
 
 // --- Login throttling (were `apps/api/src/main.rs`) ------------------------
 

@@ -33,7 +33,10 @@ commitment to ship it.
   per-report totals and per-source rows, and show totals per domain,
   per-domain detail, and the worst failing sources.
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
-  10 creates/hour per IP, 3 active per browser.
+  10 creates/hour per IP, 3 active per browser. Extendable by 1 hour,
+  up to 5 times and 24 hours total life, or deleted early from the
+  temp view (the address stops at once; the retention job purges its
+  mail and flips the row to `deleted`).
 - **Real-time notifications** — new mail arrives over a server-sent
   event stream: one shared watcher per mailbox polls the inbox
   snapshot (size + newest message) every 15 s and pushes a notice
@@ -56,8 +59,6 @@ commitment to ship it.
 
 - **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
-- **Temp inbox extend/delete** — extend an address past 1 hour, or delete
-  it early.
 - **HTML compose + signatures** — rich-text mail and per-mailbox
   signatures (compose attachments shipped in PR #16).
 - **Multi-mailbox UI** — manage several permanent mailboxes from one login.
