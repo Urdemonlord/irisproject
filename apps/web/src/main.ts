@@ -2393,6 +2393,13 @@ type AdminUser = {
   mailboxes: { email_address: string; quota_bytes: number; status: string }[]
   active_sessions: number; last_seen_at: string | null
 }
+type IntegrationAppFull = {
+  id: string
+  host: string
+  created_at: string
+  templates: { id: string; subject: string; intro: string; closing: string }[]
+}
+
 type AdminSummary = {
   users: { total: number; active: number; disabled: number; truncated: boolean; list: AdminUser[] }
   quotas: {
@@ -2457,8 +2464,14 @@ async function renderAdmin() {
     key_not_active: 'That key is already revoked.',
     temp_inbox_not_active: 'That inbox is already gone.',
     not_found: 'That item no longer exists. Reload the page to see the latest state.',
+    unknown_app: 'That app no longer exists. Reload the page to see the latest state.',
     invalid_app: 'App names use lowercase letters, digits and hyphens.',
     unsupported_app: 'That app is not registered. Check the app name.',
+    invalid_host: 'The host must be a bare hostname, no scheme or port.',
+    invalid_templates: 'Each app needs 1 to 4 templates with an id, subject, intro and closing.',
+    duplicate_app: 'An app with that id is already registered.',
+    duplicate_host: 'Another app already uses that host.',
+    app_has_active_keys: 'That app still has active keys. Revoke them first, then delete the app.',
     invalid_limits: 'Expiry must be 1 to 365 days and the daily limit 1 to 10000.',
     invalid_scopes: 'Those scopes are not allowed for this app.',
   }[(err as HttpError).code] ?? 'Something went wrong. Try again.')
@@ -2559,6 +2572,123 @@ async function renderAdmin() {
           btn('btn btn-ghost btn-sm', 'Done', undefined, { onclick: () => { void renderAdmin() } }))
       } catch (err) { keyFormError.replaceChildren(h('span', {}, adminError(err))) }
     }
+    // Integration apps. The table reads the dedicated list endpoint
+    // (full template text); the key form above reads the summary's
+    // id-only list. Both refresh together when the page reloads.
+    const appsList = await api<{ apps: IntegrationAppFull[] }>('/api/v1/admin/integration-apps')
+    const appFormError = h('div', { className: 'form-error', role: 'alert' })
+    const appId = h('input', { id: 'app-id', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'myapp' }) as HTMLInputElement
+    const appHost = h('input', { id: 'app-host', type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'myapp.example.com' }) as HTMLInputElement
+    const templateRows = h('div', { className: 'admin-templates' })
+    const appSubmit = h('button', { type: 'submit', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, 'Register app'))
+    const appCancel = h('button', { type: 'button', className: 'btn btn-ghost', hidden: true }, h('span', { className: 'btn-label' }, 'Cancel'))
+    const appFormTitle = h('p', {}, 'Register a new app. It can send and take keys at once, no restart needed.')
+    type TemplateRow = { row: HTMLElement; id: HTMLInputElement; subject: HTMLInputElement; intro: HTMLTextAreaElement; closing: HTMLTextAreaElement }
+    let templateRowList: TemplateRow[] = []
+    let editingAppId: string | null = null
+    const addTemplateRow = (t?: { id: string; subject: string; intro: string; closing: string }) => {
+      const id = h('input', { type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'auth.verify', value: t?.id ?? '' }) as HTMLInputElement
+      const subject = h('input', { type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'Verify your email', value: t?.subject ?? '' }) as HTMLInputElement
+      const intro = h('textarea', { rows: '2', spellcheck: false, placeholder: 'Use this link to verify your email address.' }, t?.intro ?? '') as HTMLTextAreaElement
+      const closing = h('textarea', { rows: '2', spellcheck: false, placeholder: 'If you did not create this account, ignore this message.' }, t?.closing ?? '') as HTMLTextAreaElement
+      const row = h('div', { className: 'admin-template' },
+        h('div', { className: 'admin-template-row' },
+          h('div', { className: 'field' }, h('label', {}, 'Template id'), id),
+          h('div', { className: 'field' }, h('label', {}, 'Subject'), subject)),
+        h('div', { className: 'field' }, h('label', {}, 'Intro'), intro),
+        h('div', { className: 'field' }, h('label', {}, 'Closing'), closing),
+        h('div', {}, btn('btn btn-ghost btn-sm', 'Remove template', undefined, { onclick: () => {
+          if (templateRowList.length <= 1) return
+          templateRowList = templateRowList.filter((r) => r.row !== row)
+          row.remove()
+        } })))
+      templateRowList.push({ row, id, subject, intro, closing })
+      templateRows.append(row)
+    }
+    const resetAppForm = () => {
+      editingAppId = null
+      appId.value = ''
+      appId.disabled = false
+      appHost.value = ''
+      templateRowList = []
+      templateRows.replaceChildren()
+      addTemplateRow()
+      appSubmit.replaceChildren(h('span', { className: 'btn-label' }, 'Register app'))
+      appCancel.hidden = true
+      appFormTitle.replaceChildren('Register a new app. It can send and take keys at once, no restart needed.')
+      appFormError.replaceChildren()
+    }
+    const startEditApp = (a: IntegrationAppFull) => {
+      editingAppId = a.id
+      appId.value = a.id
+      appId.disabled = true
+      appHost.value = a.host
+      templateRowList = []
+      templateRows.replaceChildren()
+      a.templates.forEach((t) => addTemplateRow(t))
+      appSubmit.replaceChildren(h('span', { className: 'btn-label' }, 'Save changes'))
+      appCancel.hidden = false
+      appFormTitle.replaceChildren(`Editing ${a.id}. The id cannot change; the host and templates are replaced.`)
+      appFormError.replaceChildren()
+    }
+    const deleteApp = async (a: IntegrationAppFull) => {
+      if (!(await confirmDialog(`Delete ${a.id}?`, 'The app and its templates are removed. This cannot be undone.', 'Delete app'))) return
+      try { await api(`/api/v1/admin/integration-apps/${encodeURIComponent(a.id)}`, { method: 'DELETE' }); toast(`${a.id} deleted`); void renderAdmin() } catch (err) { toast(adminError(err)) }
+    }
+    const appForm = h('form', { className: 'admin-app-form' },
+      h('div', { className: 'field' }, h('label', { htmlFor: 'app-id' }, 'App id'), appId),
+      h('div', { className: 'field' }, h('label', { htmlFor: 'app-host' }, 'Host'), appHost),
+      h('div', { className: 'field' }, h('label', {}, 'Templates'), templateRows,
+        btn('btn btn-ghost btn-sm', 'Add template', undefined, { onclick: () => { addTemplateRow() } })),
+      appFormError,
+      h('div', { className: 'admin-actions' }, appSubmit, appCancel))
+    appCancel.onclick = () => resetAppForm()
+    appForm.onsubmit = async (e) => {
+      e.preventDefault()
+      appFormError.replaceChildren()
+      const id = appId.value.trim().toLowerCase()
+      const host = appHost.value.trim().toLowerCase()
+      const templates = templateRowList.map((r) => ({
+        id: r.id.value.trim(),
+        subject: r.subject.value.trim(),
+        intro: r.intro.value.trim(),
+        closing: r.closing.value.trim(),
+      }))
+      if (!id || !host) {
+        appFormError.replaceChildren(h('span', {}, 'Fill in the app id and host.'))
+        return
+      }
+      if (!templates.length || templates.some((t) => !t.id || !t.subject || !t.intro || !t.closing)) {
+        appFormError.replaceChildren(h('span', {}, 'Each template needs an id, subject, intro and closing.'))
+        return
+      }
+      try {
+        if (editingAppId) {
+          await api(`/api/v1/admin/integration-apps/${encodeURIComponent(editingAppId)}`, {
+            method: 'PUT',
+            body: JSON.stringify({ host, templates }),
+          })
+          toast(`${editingAppId} updated`)
+        } else {
+          await api('/api/v1/admin/integration-apps', {
+            method: 'POST',
+            body: JSON.stringify({ id, host, templates }),
+          })
+          toast(`${id} registered`)
+        }
+        void renderAdmin()
+      } catch (err) { appFormError.replaceChildren(h('span', {}, adminError(err))) }
+    }
+    resetAppForm()
+    const appRows = appsList.apps.map((a) => [
+      a.id,
+      a.host,
+      a.templates.map((t) => `${t.id} (${t.subject})`).join(', '),
+      fmtDate(a.created_at),
+      h('span', { className: 'admin-actions' },
+        btn('btn btn-ghost btn-sm', 'Edit', undefined, { onclick: () => startEditApp(a) }),
+        btn('btn btn-ghost btn-sm', 'Delete', undefined, { onclick: () => void deleteApp(a) })),
+    ])
     body.replaceChildren(title, intro,
       h('div', { className: 'admin-stats' },
         stat('Users', String(s.users.total)),
@@ -2602,6 +2732,11 @@ async function renderAdmin() {
               `/api/v1/admin/integration-keys/${k.key_id}/revoke`, `Key revoked for ${k.app_id}`) })
             : h('span', { className: 'muted' }, '—'),
         ])),
+        h('h3', {}, 'Integration apps'),
+        h('p', { className: 'muted' }, 'Apps registered here can send transactional email and take keys. Changes take effect at once, no restart needed.'),
+        table(['App', 'Host', 'Templates', 'Registered', 'Actions'], appRows.length ? appRows : [['—', '—', '—', '—', 'No apps registered yet.']]),
+        appFormTitle,
+        appForm,
         h('p', { className: 'muted' }, 'Setup guide for companion apps: ', h('a', { href: '#/docs/integrations' }, 'Integration docs')),
         h('p', {}, 'Create an integration key for a companion app. The secret is shown once, copy it before you press Done.'),
         keyForm,

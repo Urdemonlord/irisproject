@@ -190,8 +190,13 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
         )
         .collect();
     // The registered integration apps, so the dashboard can offer them
-    // in the create-key form with the scopes each one may hold.
-    let registry_apps: Vec<_> = crate::integration_apps::apps()
+    // in the create-key form with the scopes each one may hold. The
+    // snapshot in `AppState::registry` mirrors the database tables
+    // and is refreshed after every app mutation.
+    let registry_apps: Vec<_> = s
+        .registry
+        .read()
+        .await
         .iter()
         .map(|app| {
             json!({
@@ -465,19 +470,6 @@ pub(crate) struct CreateIntegrationKeyBody {
     scopes: Option<Vec<String>>,
 }
 
-/// App ids are lowercase slugs: a lowercase letter first, then
-/// lowercase letters, digits and hyphens, at most 64 chars. The
-/// registry lookup is the real gate; this only rejects obvious junk
-/// before it.
-fn valid_app_slug(app: &str) -> bool {
-    !app.is_empty()
-        && app.len() <= 64
-        && app.bytes().next().is_some_and(|b| b.is_ascii_lowercase())
-        && app
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-}
-
 /// Mint an integration key for an app. Reuses the CLI minting logic
 /// (`integration_keys::issue`), so dashboard keys and CLI keys are
 /// identical: the plaintext secret is hashed before storage and is
@@ -491,13 +483,16 @@ pub(crate) async fn create_integration_key(
     Json(body): Json<CreateIntegrationKeyBody>,
 ) -> ApiResult {
     require_admin(&s.config, &u.email)?;
-    if !valid_app_slug(&body.app) {
+    if !crate::integration_apps::valid_app_slug(&body.app) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_app"));
     }
     if !(1..=365).contains(&body.expires_days) || !(1..=10_000).contains(&body.daily_limit) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_limits"));
     }
-    let Some(app) = crate::integration_apps::app(&body.app) else {
+    // One snapshot for the whole handler: the registry cannot change
+    // under the checks below, so the gate and the mint agree.
+    let apps = s.registry.read().await.clone();
+    let Some(app) = crate::integration_apps::app(&apps, &body.app) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "unsupported_app"));
     };
     let scopes = match body.scopes {
@@ -514,7 +509,7 @@ pub(crate) async fn create_integration_key(
     let mut seen = std::collections::HashSet::new();
     if scopes.len() > 4
         || scopes.iter().any(|scope| {
-            !seen.insert(scope) || !crate::integration_apps::scope_allowed(&body.app, scope)
+            !seen.insert(scope) || !crate::integration_apps::scope_allowed(&apps, &body.app, scope)
         })
         || !scopes
             .iter()
@@ -524,6 +519,7 @@ pub(crate) async fn create_integration_key(
     }
     let generated = crate::integration_keys::issue(
         &s.pool,
+        &apps,
         &body.app,
         &scopes.join(","),
         body.expires_days,
@@ -558,6 +554,265 @@ pub(crate) async fn create_integration_key(
         "scopes": stored_scopes,
     }))
     .into_response())
+}
+
+/// Refresh the in-memory registry from the database after an app
+/// mutation, so the send path and key creation see the change at
+/// once with no restart. Called after the database write commits;
+/// a failure here is a 500, never a silent stale registry.
+async fn refresh_registry(s: &crate::AppState) -> Result<(), ApiError> {
+    let apps = crate::integration_apps::load_apps(&s.pool).await?;
+    *s.registry.write().await = apps;
+    Ok(())
+}
+
+fn integration_app_json(
+    app: &crate::integration_apps::IntegrationApp,
+    created_at: &str,
+) -> serde_json::Value {
+    json!({
+        "id": app.id,
+        "host": app.host,
+        "created_at": created_at,
+        "templates": app.templates.iter().map(|t| json!({
+            "id": t.id,
+            "subject": t.subject,
+            "intro": t.intro,
+            "closing": t.closing,
+        })).collect::<Vec<_>>(),
+    })
+}
+
+/// Body for one template in a create/update app request.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct IntegrationAppTemplateBody {
+    id: String,
+    subject: String,
+    intro: String,
+    closing: String,
+}
+
+/// Body for registering an app from the dashboard. The id is part of
+/// the create body because the app is addressed by it from then on.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct CreateIntegrationAppBody {
+    id: String,
+    host: String,
+    templates: Vec<IntegrationAppTemplateBody>,
+}
+
+/// Body for updating an app. The id itself is immutable and comes
+/// from the path, so only the host and templates are replaced.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct UpdateIntegrationAppBody {
+    host: String,
+    templates: Vec<IntegrationAppTemplateBody>,
+}
+
+fn integration_app_from(
+    id: String,
+    host: String,
+    templates: Vec<IntegrationAppTemplateBody>,
+) -> crate::integration_apps::IntegrationApp {
+    crate::integration_apps::IntegrationApp {
+        id,
+        host,
+        templates: templates
+            .into_iter()
+            .map(|t| crate::integration_apps::Template {
+                id: t.id,
+                subject: t.subject,
+                intro: t.intro,
+                closing: t.closing,
+            })
+            .collect(),
+    }
+}
+
+/// Map shared app validation to the admin error codes, so a bad id,
+/// host, or template answers 400 with a code the UI can explain.
+fn app_validation_error(err: crate::integration_apps::AppValidation) -> ApiError {
+    use crate::integration_apps::AppValidation;
+    match err {
+        AppValidation::App(_) => ApiError(StatusCode::BAD_REQUEST, "invalid_app"),
+        AppValidation::Host(_) => ApiError(StatusCode::BAD_REQUEST, "invalid_host"),
+        AppValidation::Templates(_) => ApiError(StatusCode::BAD_REQUEST, "invalid_templates"),
+    }
+}
+
+/// List every registered app with its templates, ordered by id.
+/// The dashboard table reads this, not the summary, so it sees the
+/// full template text (subjects) the summary's id-only list omits.
+pub(crate) async fn list_integration_apps(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let stored = crate::integration_apps::load_stored_apps(&s.pool).await?;
+    let apps: Vec<_> = stored
+        .iter()
+        .map(|(app, created_at)| integration_app_json(app, created_at))
+        .collect();
+    Ok(Json(json!({ "apps": apps })).into_response())
+}
+
+/// Register an app from the dashboard. The id and the host must both
+/// be free (409 `duplicate_app` / `duplicate_host`); the templates
+/// follow the same shared validation as the env seed, so an app
+/// registered here and one seeded from config obey the same rules.
+/// The in-memory registry is refreshed before answering, so the app
+/// can send and take keys at once.
+pub(crate) async fn create_integration_app(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Json(body): Json<CreateIntegrationAppBody>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let app = integration_app_from(body.id, body.host, body.templates);
+    crate::integration_apps::validate_app(&app).map_err(app_validation_error)?;
+    let now = auth::now();
+    let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let id_taken: Option<String> = sqlx::query_scalar("SELECT id FROM integration_apps WHERE id=?")
+        .bind(&app.id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if id_taken.is_some() {
+        return Err(ApiError(StatusCode::CONFLICT, "duplicate_app"));
+    }
+    let host_taken: Option<String> =
+        sqlx::query_scalar("SELECT id FROM integration_apps WHERE host=?")
+            .bind(&app.host)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if host_taken.is_some() {
+        return Err(ApiError(StatusCode::CONFLICT, "duplicate_host"));
+    }
+    sqlx::query("INSERT INTO integration_apps (id, host, created_at) VALUES (?,?,?)")
+        .bind(&app.id)
+        .bind(&app.host)
+        .bind(&now)
+        .execute(&mut *tx)
+        .await?;
+    for template in &app.templates {
+        sqlx::query(
+            "INSERT INTO integration_app_templates (app_id, template_id, subject, intro, closing) VALUES (?,?,?,?,?)",
+        )
+        .bind(&app.id)
+        .bind(&template.id)
+        .bind(&template.subject)
+        .bind(&template.intro)
+        .bind(&template.closing)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    refresh_registry(&s).await?;
+    Ok((StatusCode::CREATED, Json(integration_app_json(&app, &now))).into_response())
+}
+
+/// Replace an app's host and templates. The id in the path is the
+/// app's identity and never changes; a template the new list omits
+/// is gone, and a key scoped to it stops authenticating. Same
+/// validation and duplicate-host check as create, except the app's
+/// own host is not a conflict.
+pub(crate) async fn update_integration_app(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateIntegrationAppBody>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let app = integration_app_from(id.clone(), body.host, body.templates);
+    crate::integration_apps::validate_app(&app).map_err(app_validation_error)?;
+    let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM integration_apps WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "unknown_app"));
+    }
+    let host_taken: Option<String> =
+        sqlx::query_scalar("SELECT id FROM integration_apps WHERE host=? AND id<>?")
+            .bind(&app.host)
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await?;
+    if host_taken.is_some() {
+        return Err(ApiError(StatusCode::CONFLICT, "duplicate_host"));
+    }
+    sqlx::query("UPDATE integration_apps SET host=? WHERE id=?")
+        .bind(&app.host)
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query("DELETE FROM integration_app_templates WHERE app_id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    for template in &app.templates {
+        sqlx::query(
+            "INSERT INTO integration_app_templates (app_id, template_id, subject, intro, closing) VALUES (?,?,?,?,?)",
+        )
+        .bind(&id)
+        .bind(&template.id)
+        .bind(&template.subject)
+        .bind(&template.intro)
+        .bind(&template.closing)
+        .execute(&mut *tx)
+        .await?;
+    }
+    tx.commit().await?;
+    refresh_registry(&s).await?;
+    let created_at: String =
+        sqlx::query_scalar("SELECT created_at FROM integration_apps WHERE id=?")
+            .bind(&id)
+            .fetch_one(&s.pool)
+            .await?;
+    Ok(Json(integration_app_json(&app, &created_at)).into_response())
+}
+
+/// Delete an app. Refused with 409 `app_has_active_keys` while any
+/// key for the app is still active (not revoked and not expired):
+/// deleting under a live key would leave a key that authenticates
+/// against nothing. Revoke the keys first, then delete. Templates go
+/// with the app (cascade); past delivery rows keep their `app_id`
+/// string and are unaffected.
+pub(crate) async fn delete_integration_app(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let mut tx = s.pool.begin_with("BEGIN IMMEDIATE").await?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM integration_apps WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&mut *tx)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "unknown_app"));
+    }
+    let active_keys: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM integration_keys WHERE app_id=? AND status='active' AND (expires_at IS NULL OR expires_at>?)",
+    )
+    .bind(&id)
+    .bind(auth::now())
+    .fetch_optional(&mut *tx)
+    .await?
+    .unwrap_or(0);
+    if active_keys > 0 {
+        return Err(ApiError(StatusCode::CONFLICT, "app_has_active_keys"));
+    }
+    sqlx::query("DELETE FROM integration_apps WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    refresh_registry(&s).await?;
+    Ok(Json(json!({ "id": id, "deleted": true })).into_response())
 }
 
 /// Delete an active temp inbox early. Same write as the user-facing
@@ -607,6 +862,7 @@ mod tests {
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,
+            registry: tokio::sync::RwLock::new(crate::integration_apps::default_registry()),
             html_bodies: crate::html_body::HtmlBodyStore::new(),
             mail_watch: crate::notify::MailWatch::from_limits(),
             config: Config {
@@ -1083,7 +1339,13 @@ mod tests {
 
     #[tokio::test]
     async fn admin_routes_answer_401_without_a_session() {
-        use axum::{body::Body, http::Request, middleware, routing::post, Router};
+        use axum::{
+            body::Body,
+            http::Request,
+            middleware,
+            routing::{delete, get, post, put},
+            Router,
+        };
         use tower::ServiceExt;
         let s = test_state(vec!["admin@example.test".into()]).await;
         // The real `require_session` middleware, on the same routes the
@@ -1104,6 +1366,14 @@ mod tests {
                 post(create_integration_key),
             )
             .route(
+                "/api/v1/admin/integration-apps",
+                get(list_integration_apps).post(create_integration_app),
+            )
+            .route(
+                "/api/v1/admin/integration-apps/:id",
+                put(update_integration_app).delete(delete_integration_app),
+            )
+            .route(
                 "/api/v1/admin/temp-inboxes/:id/delete",
                 post(delete_temp_inbox),
             )
@@ -1118,6 +1388,7 @@ mod tests {
             "/api/v1/admin/users/u-alice/revoke-sessions",
             "/api/v1/admin/integration-keys/a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/revoke",
             "/api/v1/admin/temp-inboxes/t-1/delete",
+            "/api/v1/admin/integration-apps/alpha",
         ] {
             let req = Request::builder()
                 .method("POST")
@@ -1273,6 +1544,318 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(rows, 0, "no key may be minted for refused input");
+    }
+
+    fn app_body(id: &str, host: &str) -> CreateIntegrationAppBody {
+        CreateIntegrationAppBody {
+            id: id.into(),
+            host: host.into(),
+            templates: vec![IntegrationAppTemplateBody {
+                id: "auth.verify".into(),
+                subject: "Verify".into(),
+                intro: "Verify.".into(),
+                closing: "Ignore.".into(),
+            }],
+        }
+    }
+
+    fn update_body(host: &str, template_ids: &[&str]) -> UpdateIntegrationAppBody {
+        UpdateIntegrationAppBody {
+            host: host.into(),
+            templates: template_ids
+                .iter()
+                .map(|id| IntegrationAppTemplateBody {
+                    id: (*id).into(),
+                    subject: format!("Subject for {id}"),
+                    intro: "Intro.".into(),
+                    closing: "Closing.".into(),
+                })
+                .collect(),
+        }
+    }
+
+    #[tokio::test]
+    async fn integration_app_crud_and_validation() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        // Create: 201, stored in both tables, and visible to the
+        // registry at once (a key can be minted for it right away).
+        let resp = create_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Json(app_body("myapp", "myapp.example.com")),
+        )
+        .await
+        .expect("admin must be able to register an app");
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let v = body_json(resp).await;
+        assert_eq!(v["id"], "myapp");
+        assert_eq!(v["host"], "myapp.example.com");
+        assert_eq!(v["templates"][0]["id"], "auth.verify");
+        assert!(v["created_at"].is_string());
+        assert!(crate::integration_apps::app(&s.registry.read().await, "myapp").is_some());
+
+        // The list endpoint shows the app with its full templates.
+        let resp = list_integration_apps(State(s.clone()), Extension(admin()))
+            .await
+            .unwrap();
+        let listed = body_json(resp).await["apps"].clone();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["templates"][0]["subject"], "Verify");
+
+        // Duplicates: same id, or the same host under another id.
+        for (body, code) in [
+            (app_body("myapp", "other.example.com"), "duplicate_app"),
+            (app_body("other", "myapp.example.com"), "duplicate_host"),
+        ] {
+            let err = create_integration_app(State(s.clone()), Extension(admin()), Json(body))
+                .await
+                .expect_err("duplicates must be refused");
+            assert_eq!(err.0, StatusCode::CONFLICT);
+            assert_eq!(err.1, code);
+        }
+        // Invalid input: bad id, bad host, no templates, five
+        // templates, a bad template id.
+        let mut bad_id = app_body("Bad App!", "bad.example.com");
+        bad_id.id = "Bad App!".into();
+        let mut bad_host = app_body("badhost", "https://bad.example.com");
+        bad_host.host = "https://bad.example.com".into();
+        let mut no_templates = app_body("notpl", "notpl.example.com");
+        no_templates.templates = vec![];
+        let mut five = app_body("five", "five.example.com");
+        five.templates = (0..5)
+            .map(|i| IntegrationAppTemplateBody {
+                id: format!("t{i}"),
+                subject: "S".into(),
+                intro: "I".into(),
+                closing: "C".into(),
+            })
+            .collect();
+        let mut bad_template = app_body("badtpl", "badtpl.example.com");
+        bad_template.templates[0].id = "Bad Template".into();
+        for (body, code) in [
+            (bad_id, "invalid_app"),
+            (bad_host, "invalid_host"),
+            (no_templates, "invalid_templates"),
+            (five, "invalid_templates"),
+            (bad_template, "invalid_templates"),
+        ] {
+            let err = create_integration_app(State(s.clone()), Extension(admin()), Json(body))
+                .await
+                .expect_err("invalid input must be refused");
+            assert_eq!(err.0, StatusCode::BAD_REQUEST, "expected 400 for {code}");
+            assert_eq!(err.1, code);
+        }
+
+        // Update: host and templates are replaced wholesale; the old
+        // template is gone and the id stays put.
+        let resp = update_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Path("myapp".into()),
+            Json(update_body("renamed.example.com", &["auth.recovery"])),
+        )
+        .await
+        .expect("admin must be able to update an app");
+        let v = body_json(resp).await;
+        assert_eq!(v["host"], "renamed.example.com");
+        assert_eq!(v["templates"][0]["id"], "auth.recovery");
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT template_id FROM integration_app_templates WHERE app_id='myapp'",
+        )
+        .fetch_all(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(stored, vec!["auth.recovery"]);
+        // Updating an unknown app is 404; taking another app's host
+        // is 409.
+        let err = update_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Path("nosuchapp".into()),
+            Json(update_body("x.example.com", &["auth.verify"])),
+        )
+        .await
+        .expect_err("unknown app must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "unknown_app");
+        create_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Json(app_body("second", "second.example.com")),
+        )
+        .await
+        .unwrap();
+        let err = update_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Path("myapp".into()),
+            Json(update_body("second.example.com", &["auth.recovery"])),
+        )
+        .await
+        .expect_err("taking another app's host must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "duplicate_host");
+
+        // Delete removes the app and its templates, and the registry
+        // forgets it at once.
+        let resp =
+            delete_integration_app(State(s.clone()), Extension(admin()), Path("myapp".into()))
+                .await
+                .unwrap();
+        assert_eq!(body_json(resp).await["deleted"], true);
+        assert!(crate::integration_apps::app(&s.registry.read().await, "myapp").is_none());
+        let remaining: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM integration_app_templates WHERE app_id='myapp'",
+        )
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(remaining, 0);
+        let err =
+            delete_integration_app(State(s.clone()), Extension(admin()), Path("myapp".into()))
+                .await
+                .expect_err("deleting twice must fail");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "unknown_app");
+    }
+
+    #[tokio::test]
+    async fn delete_app_with_active_keys_is_refused_until_they_are_gone() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        create_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Json(app_body("keyed", "keyed.example.com")),
+        )
+        .await
+        .unwrap();
+        let created = create_integration_key(
+            State(s.clone()),
+            Extension(admin()),
+            Json(key_body("keyed", 30, 100, None)),
+        )
+        .await
+        .expect("a key for the new app must be mintable");
+        let key_id = body_json(created).await["key_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let err =
+            delete_integration_app(State(s.clone()), Extension(admin()), Path("keyed".into()))
+                .await
+                .expect_err("an app with a live key must not be deletable");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "app_has_active_keys");
+        // Revoking the key unblocks the delete.
+        revoke_integration_key(State(s.clone()), Extension(admin()), Path(key_id))
+            .await
+            .unwrap();
+        delete_integration_app(State(s.clone()), Extension(admin()), Path("keyed".into()))
+            .await
+            .expect("delete must succeed once the key is revoked");
+        // An expired key does not block either: the key row stays
+        // `active` in the table, but its expiry is past.
+        create_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Json(app_body("stale", "stale.example.com")),
+        )
+        .await
+        .unwrap();
+        let past = (chrono::Utc::now() - chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,status,created_at,expires_at,daily_send_limit) VALUES ('bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb','stale',?,'[]','active',?, ?,100)")
+            .bind("b".repeat(64)).bind(auth::now()).bind(&past)
+            .execute(&s.pool).await.unwrap();
+        delete_integration_app(State(s.clone()), Extension(admin()), Path("stale".into()))
+            .await
+            .expect("an expired key must not block the delete");
+    }
+
+    #[tokio::test]
+    async fn summary_exposes_the_database_registry() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        // Seed a custom app straight into the tables, then refresh
+        // the in-memory registry from the database, the way the app
+        // does at startup and after a mutation.
+        let now = auth::now();
+        sqlx::query("INSERT INTO integration_apps (id, host, created_at) VALUES ('dbapp','dbapp.example.com',?)")
+            .bind(&now).execute(&s.pool).await.unwrap();
+        sqlx::query("INSERT INTO integration_app_templates (app_id, template_id, subject, intro, closing) VALUES ('dbapp','auth.verify','Verify','Verify.','Ignore.')")
+            .execute(&s.pool).await.unwrap();
+        *s.registry.write().await = crate::integration_apps::load_apps(&s.pool).await.unwrap();
+        let resp = summary(State(s.clone()), Extension(admin())).await.unwrap();
+        let apps = body_json(resp).await["delivery"]["integration_apps"]
+            .as_array()
+            .unwrap()
+            .clone();
+        // The snapshot mirrors the database: the custom app is there,
+        // and the example registry is gone.
+        assert!(apps.iter().any(|a| a["id"] == "dbapp"));
+        assert!(apps.iter().all(|a| a["id"] != "alpha"));
+        let dbapp = apps.iter().find(|a| a["id"] == "dbapp").unwrap();
+        assert_eq!(dbapp["host"], "dbapp.example.com");
+        assert!(dbapp["templates"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|t| t == "auth.verify"));
+    }
+
+    #[tokio::test]
+    async fn key_creation_works_for_a_database_only_app() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        create_integration_app(
+            State(s.clone()),
+            Extension(admin()),
+            Json(app_body("dbonly", "dbonly.example.com")),
+        )
+        .await
+        .unwrap();
+        let resp = create_integration_key(
+            State(s.clone()),
+            Extension(admin()),
+            Json(key_body("dbonly", 30, 100, None)),
+        )
+        .await
+        .expect("a key for a dashboard-registered app must be mintable");
+        let v = body_json(resp).await;
+        assert_eq!(v["app"], "dbonly");
+        assert_eq!(
+            v["scopes"],
+            json!(["email:template:auth.verify", "email:status"])
+        );
+        assert!(v["secret"].as_str().unwrap().starts_with("iris1_"));
+    }
+
+    #[tokio::test]
+    async fn non_admin_cannot_manage_apps() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        for result in [
+            list_integration_apps(State(s.clone()), Extension(user("alice@example.test"))).await,
+            create_integration_app(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Json(app_body("nope", "nope.example.com")),
+            )
+            .await,
+            update_integration_app(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("alpha".into()),
+                Json(update_body("x.example.com", &["auth.verify"])),
+            )
+            .await,
+            delete_integration_app(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("alpha".into()),
+            )
+            .await,
+        ] {
+            let err = result.expect_err("non-admins must be refused");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "forbidden");
+        }
     }
 
     #[tokio::test]
