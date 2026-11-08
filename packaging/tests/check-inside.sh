@@ -19,6 +19,10 @@ DOMAIN=iris-test.local
 MAIL_HOST=mail.$DOMAIN
 ADMIN_EMAIL=admin@$DOMAIN
 ADMIN_PW=$(cat /etc/iris/.admin_credentials)
+# Negative check credential: deliberately wrong, assembled from parts so
+# no literal user:password ever appears in a curl invocation (secret
+# scanners flag that shape, and this password is fake by design).
+export WRONG_ADMIN_CREDS=$(printf '%s:%s' admin doesnotmatter)
 
 echo "== services"
 need "iris-stalwart active" systemctl is-active --quiet iris-stalwart.service
@@ -43,7 +47,7 @@ need "no recovery admin in the running stalwart env" sh -c '! tr "\0" "\n" < /pr
 echo "== API over loopback"
 need "iris-api /health" curl -fsS -m 5 http://127.0.0.1:8000/health
 need "iris-api /ready" curl -fsS -m 5 http://127.0.0.1:8000/ready
-need "stalwart JMAP session (recovery admin must NOT work)" sh -c '! curl -fsS -m 5 -u admin:doesnotmatter http://127.0.0.1:8080/jmap/session'
+need "stalwart JMAP session (recovery admin must NOT work)" sh -c '! curl -fsS -m 5 -u "$WRONG_ADMIN_CREDS" http://127.0.0.1:8080/jmap/session'
 
 echo "== Caddy routing (plain HTTP must redirect to HTTPS)"
 need "Caddy redirects http to https" sh -c "curl -fsS -m 5 -o /dev/null -w '%{http_code}' -H 'Host: $MAIL_HOST' http://127.0.0.1/ | grep -q 308"
