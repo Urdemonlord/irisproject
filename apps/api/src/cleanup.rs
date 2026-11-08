@@ -167,6 +167,7 @@ mod tests {
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
             },
         });
         super::run_once(&state).await.unwrap();

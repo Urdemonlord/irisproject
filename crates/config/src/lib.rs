@@ -80,6 +80,15 @@ pub struct Config {
     /// rendering HTML mail in a same-origin srcdoc iframe. Only used to
     /// build one-time render URLs; never a secret.
     pub mail_content_origin: String,
+    /// Admin allow-list for the read-only admin dashboard
+    /// (`GET /api/v1/admin/summary`). Read from `IRIS_ADMIN_EMAILS`
+    /// (comma-separated, lowercased). Empty = nobody is an admin: every
+    /// admin request answers 403. There is no admin role in the login
+    /// flow and `app_users.role` is never read or written by any code,
+    /// so an explicit env list is the gate: it is visible in the
+    /// deployment config, needs no hand-editing of the production
+    /// database, and fails closed when unset.
+    pub admin_emails: Vec<String>,
 }
 
 impl Config {
@@ -155,8 +164,28 @@ impl Config {
             mail_content_origin: normalize_mail_content_origin(
                 std::env::var("MAIL_CONTENT_ORIGIN").ok().as_deref(),
             ),
+            admin_emails: parse_admin_emails(
+                &std::env::var("IRIS_ADMIN_EMAILS").unwrap_or_default(),
+            ),
         })
     }
+}
+
+/// Parse `IRIS_ADMIN_EMAILS` (comma-separated, lowercased, trimmed).
+/// Pure so it can be unit-tested without touching process env.
+pub fn parse_admin_emails(raw: &str) -> Vec<String> {
+    raw.split(',')
+        .map(|e| e.trim().to_lowercase())
+        .filter(|e| !e.is_empty())
+        .collect()
+}
+
+/// True when `email` is on the admin allow-list. The comparison is
+/// case-insensitive (both sides lowercased); an empty list never
+/// matches, so an unset `IRIS_ADMIN_EMAILS` fails closed.
+pub fn is_admin_email(admin_emails: &[String], email: &str) -> bool {
+    let email = email.trim().to_lowercase();
+    !email.is_empty() && admin_emails.iter().any(|a| a == &email)
 }
 
 /// Resolve an env value from its current name, falling back to a deprecated
@@ -483,6 +512,28 @@ mod tests {
             normalize_mail_content_origin(Some("http://mail-content.example.com")),
             ""
         );
+    }
+
+    #[test]
+    fn admin_emails_parse_lowercase_trim_and_drop_empty() {
+        assert_eq!(
+            parse_admin_emails("Admin@Example.com , ops@example.com,, "),
+            vec!["admin@example.com", "ops@example.com"]
+        );
+        assert!(parse_admin_emails("").is_empty());
+        assert!(parse_admin_emails(" , ").is_empty());
+    }
+
+    #[test]
+    fn admin_check_is_case_insensitive_and_fails_closed() {
+        let list = parse_admin_emails("admin@example.com");
+        assert!(is_admin_email(&list, "admin@example.com"));
+        assert!(is_admin_email(&list, "Admin@Example.COM"));
+        assert!(is_admin_email(&list, "  admin@example.com  "));
+        assert!(!is_admin_email(&list, "other@example.com"));
+        assert!(!is_admin_email(&list, ""));
+        // An empty allow-list never matches anyone.
+        assert!(!is_admin_email(&[], "admin@example.com"));
     }
 
     #[test]

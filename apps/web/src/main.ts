@@ -787,8 +787,8 @@ function viewMeta(v: MailView): { label: string; icon: string; empty: [string, s
   }
 }
 
-/** Signed-in account, kept while switching folders so each switch skips two requests. */
-let account: { email: string; mb: string } | null = null
+/** Signed-in account, kept while switching folders so each switch skips two requests. `is_admin` only decides whether the Admin nav link shows; the server gates the admin endpoints. */
+let account: { email: string; mb: string; is_admin: boolean } | null = null
 
 const sendErrors: Record<string, string> = {
   external_sending_disabled: 'IRIS can only send to local addresses for now. Sending to other domains isn’t set up yet.',
@@ -1213,10 +1213,10 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
 async function ensureAccount() {
   if (!account) {
     const [session, { mailboxes }] = await Promise.all([
-      api<{ email: string }>('/api/v1/session'),
+      api<{ email: string; is_admin?: boolean }>('/api/v1/session'),
       api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
     ])
-    account = { email: session.email, mb: mailboxes[0]?.id ?? '' }
+    account = { email: session.email, mb: mailboxes[0]?.id ?? '', is_admin: session.is_admin === true }
   }
   return account
 }
@@ -1311,7 +1311,7 @@ const newFolderDialog = (base: string) => promptDialog({
 })
 
 async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
-  const { email, mb } = await ensureAccount()
+  const { email, mb, is_admin } = await ensureAccount()
   const folder = view.kind === 'role' ? view.role : null
   const key = viewKey(view)
   let meta = viewMeta(view)
@@ -1379,6 +1379,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
       navItem('#/temp', 'timer', 'Temporary inbox'),
+      ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'shield', 'Admin')] : []),
       footerLinks('sidebar-footer'),
     ],
     listTop: [h('header', { className: 'pane-head' }, title, unreadChip, refresh), folderTabs],
@@ -2131,7 +2132,7 @@ async function renderTempStart(note = '') {
   stopTemp()
   setPage({ title: 'Free temporary email', description: 'Get a free disposable email address in one click. Receive-only, no sign-up, deleted automatically after 1 hour.', path: '/#/temp' })
   if (!account) {
-    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
   }
   const loggedIn = !!account
   const status = h('div', { className: 'form-error', role: 'alert' }, ...(note ? [icon('alert'), note] : []))
@@ -2203,7 +2204,7 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   // Resolve auth state so the topbar reflects a logged-in session instead of
   // always showing "Sign in" (issue: logged-in users saw "Sign in" on /#/temp).
   if (!account) {
-    try { const s = await api<{ email: string }>('/api/v1/session'); account = { email: s.email, mb: '' } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
   }
   const loggedIn = !!account
   const auth = { headers: { authorization: `Bearer ${inbox.access_token}` } }
@@ -2377,6 +2378,132 @@ function renderNotFound() {
     h('a', { href: '#/temp', className: 'link' }, 'Get a temporary inbox →')))
 }
 
+// ---------- Admin dashboard ----------
+type AdminUser = {
+  id: string; email: string; display_name: string; role: string; status: string; created_at: string
+  mailboxes: { email_address: string; quota_bytes: number; status: string }[]
+  active_sessions: number; last_seen_at: string | null
+}
+type AdminSummary = {
+  users: { total: number; active: number; disabled: number; truncated: boolean; list: AdminUser[] }
+  quotas: {
+    sends_per_hour: number
+    reads: { max: number; window_minutes: number }
+    temp_inbox: { domain: string; default_expiry_hours: number; creates_per_ip_per_hour: number; active_per_client: number; message_limit: number }
+    compose: { max_recipients: number; max_body_bytes: number; max_attachments: number; max_attachment_bytes: number; max_total_attachment_bytes: number }
+    organize: { max_labels: number; max_custom_folders: number; max_filters: number }
+    integration_email_enabled: boolean
+    relay_configured: boolean
+  }
+  delivery: {
+    transactional_last_24h: Record<string, number>
+    transactional_last_7d: Record<string, number>
+    transactional_per_app_last_7d: Record<string, Record<string, number>>
+    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; created_at: string }[]
+    integration_keys: { app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
+    user_sends_last_24h: number
+  }
+  temp_inboxes: { by_status: Record<string, { count: number; messages: number; bytes: number }>; created_last_24h: number }
+}
+
+/** Admin dashboard: users, quotas, delivery status. Read-only; the
+ * server gates the endpoint, so a non-admin only ever sees the
+ * "not an admin" notice below, never the data. */
+async function renderAdmin() {
+  const { email } = await ensureAccount()
+  setPage({ title: 'Admin', description: 'IRIS admin dashboard: users, quotas and delivery status.', path: '/', noindex: true })
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const title = h('h1', { className: 'pane-title' }, 'Admin')
+  const intro = h('p', { className: 'muted' }, 'Users, quotas and delivery status. Read-only.')
+  const body = h('div', { className: 'admin-inner' })
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, body))
+  body.replaceChildren(title, intro, skeleton(4))
+
+  const stat = (label: string, value: string) =>
+    h('div', { className: 'admin-stat' }, h('strong', {}, value), h('span', {}, label))
+  const countsText = (m: Record<string, number>) => {
+    const parts = Object.entries(m).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k} ${v}`)
+    return parts.length ? parts.join(' · ') : 'none yet'
+  }
+  const table = (headers: string[], rows: string[][]) =>
+    h('div', { className: 'admin-scroll' }, h('table', { className: 'admin-table' },
+      h('thead', {}, h('tr', {}, ...headers.map((x) => h('th', { scope: 'col' }, x)))),
+      h('tbody', {}, ...rows.map((r) => h('tr', {}, ...r.map((c) => h('td', {}, c)))))))
+  const section = (heading: string, text: string, ...kids: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), ...kids)
+
+  try {
+    const s = await api<AdminSummary>('/api/v1/admin/summary')
+    const t24 = s.delivery.transactional_last_24h
+    const tempActive = s.temp_inboxes.by_status.active?.count ?? 0
+    const userRows = s.users.list.map((u) => [
+      u.email,
+      u.display_name,
+      u.role,
+      u.status,
+      u.mailboxes.length ? u.mailboxes.map((m) => `${m.email_address} (${fmtBytes(m.quota_bytes)})`).join(', ') : '—',
+      String(u.active_sessions),
+      u.last_seen_at ? fmtDate(u.last_seen_at) : '—',
+      fmtDate(u.created_at),
+    ])
+    const perAppRows = Object.entries(s.delivery.transactional_per_app_last_7d)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([app, c]) => [app, String(c.accepted ?? 0), String(c.failed ?? 0), String(c.sending ?? 0), String(c.unknown ?? 0)])
+    body.replaceChildren(title, intro,
+      h('div', { className: 'admin-stats' },
+        stat('Users', String(s.users.total)),
+        stat('Active users', String(s.users.active)),
+        stat('Transactional accepted, 24h', String(t24.accepted ?? 0)),
+        stat('Transactional failed, 24h', String(t24.failed ?? 0)),
+        stat('User sends, 24h', String(s.delivery.user_sends_last_24h)),
+        stat('Active temp inboxes', String(tempActive))),
+      section('Users', s.users.truncated ? `Showing the 100 newest of ${s.users.total} users.` : `${s.users.total} users.`,
+        table(['Email', 'Name', 'Role', 'Status', 'Mailboxes', 'Sessions', 'Last seen', 'Joined'], userRows)),
+      section('Quotas', 'Limits in force for every user. Mailbox quotas are per mailbox, in the users table above.',
+        table(['Limit', 'Value'], [
+          ['Sends', `${s.quotas.sends_per_hour} per hour`],
+          ['Message reads', `${s.quotas.reads.max} per ${s.quotas.reads.window_minutes} minutes`],
+          ['Temp inbox domain', s.quotas.temp_inbox.domain],
+          ['Temp inbox lifetime', `${s.quotas.temp_inbox.default_expiry_hours} hour`],
+          ['Temp inbox creates', `${s.quotas.temp_inbox.creates_per_ip_per_hour} per IP per hour`],
+          ['Temp inboxes per browser', String(s.quotas.temp_inbox.active_per_client)],
+          ['Temp inbox message list', String(s.quotas.temp_inbox.message_limit)],
+          ['Compose recipients', String(s.quotas.compose.max_recipients)],
+          ['Compose body', fmtBytes(s.quotas.compose.max_body_bytes)],
+          ['Compose attachments', `${s.quotas.compose.max_attachments} files, ${fmtBytes(s.quotas.compose.max_attachment_bytes)} each, ${fmtBytes(s.quotas.compose.max_total_attachment_bytes)} total`],
+          ['Labels', String(s.quotas.organize.max_labels)],
+          ['Custom folders', String(s.quotas.organize.max_custom_folders)],
+          ['Filters', String(s.quotas.organize.max_filters)],
+          ['Transactional email', s.quotas.integration_email_enabled ? 'enabled' : 'disabled'],
+          ['Outbound relay', s.quotas.relay_configured ? 'configured' : 'not configured'],
+        ])),
+      section('Delivery', 'Transactional email is the API that lets companion apps send auth mail. User sends are counted in aggregate only; individual sends are not attributed.',
+        h('p', { className: 'muted' }, `Last 24h: ${countsText(t24)}`),
+        h('p', { className: 'muted' }, `Last 7 days: ${countsText(s.delivery.transactional_last_7d)}`),
+        table(['App', 'Accepted', 'Failed', 'Sending', 'Unknown'], perAppRows.length ? perAppRows : [['—', '0', '0', '0', '0']]),
+        table(['Time', 'App', 'Template', 'Status', 'Provider id'], s.delivery.transactional_recent.map((r) => [
+          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—',
+        ])),
+        table(['App', 'Status', 'Daily limit', 'Last used', 'Expires'], s.delivery.integration_keys.map((k) => [
+          k.app_id, k.status, String(k.daily_send_limit), k.last_used_at ? fmtDate(k.last_used_at) : '—', k.expires_at ? fmtDate(k.expires_at) : '—',
+        ]))),
+      section('Temp inboxes', `${s.temp_inboxes.created_last_24h} created in the last 24 hours.`,
+        table(['Status', 'Inboxes', 'Messages', 'Bytes'], Object.entries(s.temp_inboxes.by_status)
+          .sort(([a], [b]) => a.localeCompare(b))
+          .map(([status, c]) => [status, String(c.count), String(c.messages), fmtBytes(c.bytes)]))))
+  } catch (err) {
+    if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+    if ((err as HttpError).status === 403) {
+      body.replaceChildren(title, h('p', { className: 'muted' }, 'This page is only for admins. Your account is not on the admin list.'))
+      return
+    }
+    body.replaceChildren(title, errorState('Could not load the dashboard. Try again.', () => { void renderAdmin() }))
+  }
+}
+
 // ---------- Router ----------
 function route() {
   stopTemp()
@@ -2399,7 +2526,7 @@ function route() {
       if (role) view = { kind: 'role', role }
     }
   } catch { /* malformed escape in the hash */ }
-  const page = r === '/organize' ? renderOrganize() : r === '/dmarc' ? renderDmarc() : view ? renderMailbox(view) : undefined
+  const page = r === '/organize' ? renderOrganize() : r === '/dmarc' ? renderDmarc() : r === '/admin' ? renderAdmin() : view ? renderMailbox(view) : undefined
   if (!page) return renderNotFound()
   page.catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }

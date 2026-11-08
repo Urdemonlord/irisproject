@@ -27,6 +27,7 @@ use serde_json::json;
 use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
 
+mod admin;
 mod cleanup;
 mod compose;
 mod contacts;
@@ -205,6 +206,7 @@ async fn main() {
 
     let protected = Router::new()
         .route("/api/v1/session", get(session))
+        .route("/api/v1/admin/summary", get(admin::summary))
         .route("/auth/logout", post(logout))
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
@@ -809,8 +811,14 @@ async fn require_session(
     next.run(req).await
 }
 
-async fn session(Extension(u): Extension<CurrentUser>) -> Json<serde_json::Value> {
-    Json(json!({ "authenticated": true, "email": u.email }))
+async fn session(State(s): S, Extension(u): Extension<CurrentUser>) -> Json<serde_json::Value> {
+    // `is_admin` only decides whether the web shows the Admin nav link;
+    // the server-side gate is `admin::require_admin` on the admin routes.
+    Json(json!({
+        "authenticated": true,
+        "email": u.email,
+        "is_admin": iris_config::is_admin_email(&s.config.admin_emails, &u.email),
+    }))
 }
 
 async fn logout(State(s): S, headers: HeaderMap) -> ApiResult {
@@ -1504,6 +1512,7 @@ mod password_reset_webhook_tests {
                 password_reset_public_origin: origin.into(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
             },
         })
     }
@@ -2220,6 +2229,7 @@ mod read_limit_tests {
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
             },
         })
     }
@@ -2714,6 +2724,7 @@ mod handler_integration_tests {
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
                 mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
             },
         })
     }

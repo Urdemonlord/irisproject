@@ -762,3 +762,16 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
   .org-section { padding: var(--iris-space-4); }
   .organize-top .account-chip { display: none; }
 }
+
+/* ---------- Admin dashboard ---------- */
+.admin-inner { width: 100%; max-width: 980px; margin: 0 auto; padding: var(--iris-space-6) var(--iris-space-4) var(--iris-space-10); display: flex; flex-direction: column; gap: var(--iris-space-6); }
+.admin-stats { display: flex; flex-wrap: wrap; gap: var(--iris-space-3); }
+.admin-stat { display: flex; flex-direction: column; gap: 2px; padding: var(--iris-space-3) var(--iris-space-4); border: 1.5px solid var(--iris-ink); border-radius: var(--iris-radius-1); background: var(--iris-surface); min-width: 140px; }
+.admin-stat strong { font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-h3); }
+.admin-stat span { font-size: var(--iris-text-xs); color: var(--iris-text-secondary); }
+.admin-scroll { width: 100%; overflow-x: auto; }
+.admin-table { width: 100%; border-collapse: collapse; font-size: var(--iris-text-sm); }
+.admin-table th, .admin-table td { text-align: left; padding: var(--iris-space-2) var(--iris-space-3); border-bottom: var(--iris-rule-hair); vertical-align: top; }
+.admin-table td { overflow-wrap: anywhere; }
+.admin-table th { font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-text-secondary); white-space: nowrap; }
+.admin-table td { font-variant-numeric: tabular-nums; }

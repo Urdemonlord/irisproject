@@ -514,6 +514,7 @@ mod tests {
             mail_watch: crate::notify::MailWatch::from_limits(),
             config: iris_config::Config {
                 env: "test".into(),
+                admin_emails: Vec::new(),
                 host: "127.0.0.1".into(),
                 port: 8000,
                 database_url: "sqlite::memory:".into(),
