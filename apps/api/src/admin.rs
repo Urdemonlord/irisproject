@@ -1343,7 +1343,7 @@ mod tests {
             body::Body,
             http::Request,
             middleware,
-            routing::{delete, get, post, put},
+            routing::{get, post, put},
             Router,
         };
         use tower::ServiceExt;
