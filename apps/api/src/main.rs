@@ -2,16 +2,20 @@ use axum::{
     extract::{DefaultBodyLimit, Path, Query, Request, State},
     http::{header, HeaderMap, StatusCode},
     middleware::{self, Next},
-    response::{IntoResponse, Response},
+    response::{
+        sse::{KeepAlive, Sse},
+        IntoResponse, Response,
+    },
     routing::{get, post},
     Extension, Json, Router,
 };
 use iris_auth as auth;
 use iris_config::limits::{
-    DEFAULT_LIST_LIMIT, MAX_ATTACHMENT_BYTES, MAX_COMPOSE_JSON_BYTES, MAX_FAILED_LOGINS,
-    MAX_FAILED_LOGINS_PER_IP, MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT, MAX_PASSWORD_RESET_BODY_BYTES,
-    MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW, MAX_SEARCH_QUERY_CHARS,
-    MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, MAX_TURNSTILE_ATTEMPTS_PER_IP, READ_WINDOW_MINUTES,
+    DEFAULT_LIST_LIMIT, MAIL_WATCH_KEEPALIVE_SECS, MAX_ATTACHMENT_BYTES, MAX_COMPOSE_JSON_BYTES,
+    MAX_FAILED_LOGINS, MAX_FAILED_LOGINS_PER_IP, MAX_HTML_BODY_BYTES, MAX_LIST_LIMIT,
+    MAX_PASSWORD_RESET_BODY_BYTES, MAX_PREVIEW_BYTES, MAX_RAW_BYTES, MAX_READS_PER_WINDOW,
+    MAX_SEARCH_QUERY_CHARS, MAX_TRANSACTIONAL_EMAIL_BODY_BYTES, MAX_TURNSTILE_ATTEMPTS_PER_IP,
+    READ_WINDOW_MINUTES,
 };
 use iris_config::Config;
 use iris_mail::{
@@ -21,7 +25,7 @@ use iris_mail::{
 use serde::Deserialize;
 use serde_json::json;
 use sqlx::SqlitePool;
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 mod cleanup;
 mod compose;
@@ -31,6 +35,7 @@ mod filters;
 mod html_body;
 mod integration_apps;
 mod integration_keys;
+mod notify;
 mod organize;
 mod temp;
 mod transactional_email;
@@ -52,6 +57,10 @@ pub(crate) struct AppState {
     /// the process, like `JmapClient`'s own; a fresh client per login
     /// would throw away connection reuse on every attempt.
     http: reqwest::Client,
+    /// Shared mailbox watchers for the live event stream: one watcher
+    /// task per subscribed mailbox, started on first subscribe and
+    /// stopped when the last tab disconnects (see `notify`).
+    mail_watch: notify::MailWatch,
     /// Outbound relay for other domains (None = only local domains can be reached).
     relay: Option<ResendClient>,
     /// One-time HTML bodies minted for the separate mail-content origin.
@@ -171,6 +180,7 @@ async fn main() {
             .timeout(std::time::Duration::from_secs(10))
             .build()
             .expect("reqwest client"),
+        mail_watch: notify::MailWatch::from_limits(),
         relay: (!config.resend_api_key.is_empty()).then(|| {
             ResendClient::with_endpoint(
                 config.resend_api_key.clone(),
@@ -197,6 +207,7 @@ async fn main() {
         .route("/auth/logout", post(logout))
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
+        .route("/api/v1/mailboxes/:mailbox_id/events", get(mailbox_events))
         .route(
             "/api/v1/mailboxes/:mailbox_id/threads/:thread_id",
             get(get_thread),
@@ -974,6 +985,39 @@ async fn get_thread(
     Ok(Json(json!({ "thread": t })).into_response())
 }
 
+/// Live mailbox stream: server-sent events for new mail, so the web
+/// does not have to poll the list. `EventSource` sends the session
+/// cookie, and this route lives behind `require_session` like every
+/// other mailbox read; a mailbox that is not yours answers 404 before
+/// any watcher starts. A GET needs no CSRF token (safe method).
+///
+/// The handler does NOT consume a read-limit slot: the shared watcher
+/// behind it polls JMAP once per `MAIL_WATCH_POLL_SECS` per mailbox
+/// no matter how many tabs are open, and that bound is the stream's
+/// rate limit (see `limits.rs`). The keep-alive comment keeps the
+/// response open through a reverse proxy's idle timeout.
+async fn mailbox_events(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(mailbox_id): Path<String>,
+) -> Result<Response, ApiError> {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    let rx = s
+        .mail_watch
+        .subscribe(&s.jmap, &u.creds, &account, &u.user_id, &mailbox_id)
+        .await?;
+    // `x-accel-buffering: no` keeps nginx (and other buffering proxies)
+    // from holding the stream until it ends, which for SSE is never.
+    let mut resp = Sse::new(notify::events_stream(rx))
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(MAIL_WATCH_KEEPALIVE_SECS)))
+        .into_response();
+    resp.headers_mut().insert(
+        "x-accel-buffering",
+        axum::http::HeaderValue::from_static("no"),
+    );
+    Ok(resp)
+}
+
 pub(crate) fn valid_message_id(id: &str) -> bool {
     id.len() <= 128
         && id
@@ -1419,6 +1463,7 @@ mod password_reset_webhook_tests {
             http: reqwest::Client::new(),
             relay,
             html_bodies: html_body::HtmlBodyStore::new(),
+            mail_watch: notify::MailWatch::from_limits(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -2134,6 +2179,7 @@ mod read_limit_tests {
             http: reqwest::Client::new(),
             relay: None,
             html_bodies: html_body::HtmlBodyStore::new(),
+            mail_watch: notify::MailWatch::from_limits(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -2317,6 +2363,10 @@ mod handler_integration_tests {
         /// Email/query answers the list once, then nothing: like a server
         /// whose matches disappear once cleared.
         query_drain: bool,
+        /// When non-empty, the Nth Email/query call answers entry N
+        /// (clamped to the last): (total, newest-first ids). Lets a test
+        /// script a mailbox that gains mail between polls.
+        query_sequence: Vec<(u64, Vec<&'static str>)>,
         /// Email/get answer for get_message (None = empty list -> NotFound).
         message: Option<Value>,
         /// Bytes served by GET /jmap/download/... for any blob id.
@@ -2339,6 +2389,7 @@ mod handler_integration_tests {
                 query_total: 0,
                 query_list: vec![],
                 query_drain: false,
+                query_sequence: vec![],
                 message: None,
                 blob: vec![],
                 custom: vec![],
@@ -2416,6 +2467,16 @@ mod handler_integration_tests {
             "Identity/set" => vec![
                 json!(["Identity/set", {"created": {"i": {"id": "ident-1"}}, "notCreated": {}}, "s"]),
             ],
+            "Email/query" if !script.query_sequence.is_empty() => {
+                let (total, ids) =
+                    &script.query_sequence[query_calls.min(script.query_sequence.len() - 1)];
+                let ids: Vec<Value> = ids.iter().map(|id| json!(id)).collect();
+                let list: Vec<Value> = ids.iter().map(|id| json!({"id": id})).collect();
+                vec![
+                    json!(["Email/query", {"total": total, "ids": ids}, "q"]),
+                    json!(["Email/get", {"list": list}, "g"]),
+                ]
+            }
             "Email/query" => {
                 let drained = script.query_drain && query_calls > 0;
                 let list: Vec<Value> = if drained {
@@ -2612,6 +2673,7 @@ mod handler_integration_tests {
             http: reqwest::Client::new(),
             relay,
             html_bodies: html_body::HtmlBodyStore::new(),
+            mail_watch: notify::MailWatch::from_limits(),
             config: Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),
@@ -2861,6 +2923,73 @@ mod handler_integration_tests {
         assert_eq!(args["position"], 2);
         assert_eq!(args["limit"], 2);
         assert_eq!(args["calculateTotal"], true);
+    }
+
+    /// The mailbox watcher shares one task per mailbox, reports the
+    /// arrival, and stops when its last tab disconnects.
+    #[tokio::test]
+    async fn mail_watch_emits_new_mail_and_stops_when_idle() {
+        let jmap = fake_jmap(JmapScript {
+            query_sequence: vec![(1, vec!["m1"]), (2, vec!["m2"])],
+            ..Default::default()
+        })
+        .await;
+        let s = test_state(&jmap, None).await;
+        let watch = notify::MailWatch::new(Duration::from_millis(50));
+        let mut rx = watch
+            .subscribe(&s.jmap, &user().creds, "acct-1", "u-alice", "mbx-1")
+            .await
+            .unwrap();
+        let next_snapshot =
+            async |rx: &mut tokio::sync::watch::Receiver<Option<iris_mail::InboxSnapshot>>| loop {
+                rx.changed().await.unwrap();
+                if let Some(snap) = rx.borrow().clone() {
+                    break snap;
+                }
+            };
+        // First snapshot is the baseline: one message, newest m1.
+        let first = timeout(Duration::from_secs(5), next_snapshot(&mut rx))
+            .await
+            .unwrap();
+        assert_eq!(first.total, 1);
+        assert_eq!(first.newest_id.as_deref(), Some("m1"));
+        // The next poll sees the arrival: total 2, newest m2.
+        let second = timeout(Duration::from_secs(5), next_snapshot(&mut rx))
+            .await
+            .unwrap();
+        assert_eq!(second.total, 2);
+        assert_eq!(second.newest_id.as_deref(), Some("m2"));
+        assert_eq!(iris_mail::new_mail_count(&first, &second), 1);
+        // A second subscriber shares the watcher: no second task.
+        let rx2 = watch
+            .subscribe(&s.jmap, &user().creds, "acct-1", "u-alice", "mbx-1")
+            .await
+            .unwrap();
+        assert_eq!(watch.active_watchers(), 1);
+        drop(rx);
+        drop(rx2);
+        // With no subscribers the watcher stops and unregisters itself.
+        timeout(Duration::from_secs(5), async {
+            loop {
+                if watch.active_watchers() == 0 {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn mailbox_events_rejects_unknown_mailbox() {
+        let jmap = fake_jmap(JmapScript::default()).await;
+        let s = test_state(&jmap, None).await;
+        let err = mailbox_events(State(s), Extension(user()), Path("nope".into()))
+            .await
+            .expect_err("unknown mailbox must fail");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        assert_eq!(err.1, "not_found");
     }
 
     fn page(f: impl FnOnce(&mut Page)) -> Query<Page> {

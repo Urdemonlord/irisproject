@@ -529,8 +529,8 @@ function prefetchMessage(url: string, init?: RequestInit) {
 // Last message list per account, per tab (sessionStorage is cleared when the tab closes).
 //
 // Eviction rules: the stored list is only an initial paint -- load()
-// refetches it on render and every 30 s while the tab is visible -- so the
-// stored copy is bounded on both axes:
+// refetches it on render, on a stream notice, and every 30 s while the
+// live stream is down -- so the stored copy is bounded on both axes:
 // - TTL: entries older than LIST_CACHE_TTL_MS are ignored, so a reloaded
 //   tab shows a skeleton and fetches fresh instead of serving a stale list.
 //   A live tab never hits this: every successful poll rewrites the entry.
@@ -1326,8 +1326,12 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   let loadedQuery = ''
   let loadingMore = false
   let searchTimer: number | undefined
+  /** True while the live stream is connected: the 30 s poll stands down. */
+  let streamLive = false
+  /** New arrivals the stream has reported since the last list load. */
+  let pendingNew = 0
 
-  const signOut = () => { clearMailCache(); account = null; org = { folders: [], labels: [] }; closeComposer?.() }
+  const signOut = () => { mailStream?.close(); mailStream = null; clearMailCache(); account = null; org = { folders: [], labels: [] }; closeComposer?.() }
   const logout = btn('btn btn-ghost btn-icon-sm', 'Sign out', 'logout')
   logout.onclick = async () => { busy(logout, ''); signOut(); await api('/auth/logout', { method: 'POST' }).catch(() => {}); location.hash = '#/signed-out' }
   const refresh = btn('btn btn-ghost btn-icon-sm', 'Refresh', 'refresh')
@@ -1646,6 +1650,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       total = t
       loadedQuery = query
       writeListCache(email, mb, key, all)
+      pendingNew = 0 // the list is fresh, so nothing is pending anymore
       synced.textContent = `Synced ${fmtTime(new Date())}`
       draw()
     } catch (err) {
@@ -1690,8 +1695,30 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
 
   refresh.onclick = () => { load(); loadFolders() }
   loadFolders()
-  // New mail shows up on its own while the tab is visible.
-  tempTimers.push(window.setInterval(() => { if (!document.hidden) { load(); loadFolders() } }, 30_000))
+  // Live new-mail stream: one EventSource per mailbox view, shared
+  // server-side with every other tab on the same mailbox. While it is
+  // live the 30 s poll below stands down; when it drops (error, or a
+  // reconnect after a network blip) the poll resumes and the stream
+  // reconnects on its own. New arrivals surface as a notice with a
+  // Show action instead of yanking the list mid-read.
+  const openStream = () => {
+    mailStream?.close()
+    const es = new EventSource(`${base}/events`)
+    mailStream = es
+    es.addEventListener('hello', () => { streamLive = true })
+    es.addEventListener('new-mail', (ev) => {
+      const data = JSON.parse((ev as MessageEvent).data) as { new: number; total: number }
+      pendingNew += data.new
+      toast(pendingNew === 1 ? '1 new message' : `${pendingNew} new messages`, { label: 'Show', run: () => {
+        pendingNew = 0
+        if (folder === 'inbox') { load(); loadFolders() } else { location.hash = '#/' }
+      } })
+    })
+    es.onerror = () => { streamLive = false }
+  }
+  openStream()
+  // Fallback while the stream is down: the old 30 s poll.
+  tempTimers.push(window.setInterval(() => { if (!document.hidden && !streamLive) { load(); loadFolders() } }, 30_000))
   if (all.length) { draw(); load() } else await load()
 }
 
@@ -1931,8 +1958,12 @@ async function renderOrganize() {
 // ---------- Temp inbox ----------
 let tempTimers: number[] = []
 let onVisible: (() => void) | null = null
+// Live mailbox stream for the current view; closed on every route
+// change (stopTemp) and on sign-out, so a dead tab never holds a
+// stream open.
+let mailStream: EventSource | null = null
 document.addEventListener('visibilitychange', () => onVisible?.())
-const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = []; onVisible = null }
+const stopTemp = () => { tempTimers.forEach(clearInterval); tempTimers = []; onVisible = null; mailStream?.close(); mailStream = null }
 const TEMP_KEY = 'iris_temp_inbox'
 const savedTemp = (): TempInbox | null => { try { return JSON.parse(sessionStorage.getItem(TEMP_KEY) ?? 'null') } catch { return null } }
 const saveTemp = (t: TempInbox | null) => { try { t ? sessionStorage.setItem(TEMP_KEY, JSON.stringify(t)) : sessionStorage.removeItem(TEMP_KEY) } catch { /* storage blocked */ } }

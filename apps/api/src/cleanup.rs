@@ -141,6 +141,7 @@ mod tests {
             http: reqwest::Client::new(),
             relay: None,
             html_bodies: crate::html_body::HtmlBodyStore::new(),
+            mail_watch: crate::notify::MailWatch::from_limits(),
             config: iris_config::Config {
                 env: "test".into(),
                 host: "127.0.0.1".into(),

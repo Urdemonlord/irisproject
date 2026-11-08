@@ -60,6 +60,34 @@ pub struct ThreadDetail {
     pub messages: Vec<MessageDetail>,
 }
 
+/// What one inbox poll sees: the inbox size and its newest message.
+/// Only what the new-mail rule needs — no bodies, no list.
+///
+/// Change rule (`new_mail_count`): a new arrival grows `total`, or
+/// replaces `newest_id` while `total` stays flat (an arrival plus a
+/// deletion inside one poll interval). Deliberately NOT the JMAP
+/// `queryState`: verified against Stalwart v1.0.1 that `queryState`
+/// also changes when a message is merely marked read, so it cannot
+/// tell an arrival from a read.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct InboxSnapshot {
+    pub total: u64,
+    pub newest_id: Option<String>,
+}
+
+/// How many messages arrived between two inbox snapshots. A bigger
+/// `total` is that many arrivals; a changed newest message with a
+/// flat total is one arrival (something else left in the same
+/// interval). Anything else — a read, a move out, a delete — is zero.
+pub fn new_mail_count(prev: &InboxSnapshot, next: &InboxSnapshot) -> u64 {
+    let delta = next.total.saturating_sub(prev.total);
+    if delta == 0 && next.newest_id.is_some() && next.newest_id != prev.newest_id {
+        1
+    } else {
+        delta
+    }
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageDetail {
     #[serde(flatten)]
@@ -524,6 +552,30 @@ impl JmapClient {
         let total = r[0]["total"].as_u64().unwrap_or(0);
         let list = r[1]["list"].as_array().cloned().unwrap_or_default();
         Ok((list.iter().map(summary).collect(), total))
+    }
+
+    /// One cheap inbox poll for the mail watcher: the inbox size and its
+    /// newest message id, in a single `Email/query` (limit 1, newest
+    /// first). No bodies, no list, no folder lookup: the caller resolved
+    /// `inbox_id` once when the watcher started.
+    pub async fn inbox_snapshot(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        inbox_id: &str,
+    ) -> Result<InboxSnapshot, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Email/query", {"accountId": account,
+                    "filter": {"inMailbox": inbox_id},
+                    "sort": [{"property": "receivedAt", "isAscending": false}],
+                    "position": 0, "limit": 1, "calculateTotal": true}, "q"]]),
+            )
+            .await?;
+        Ok(snapshot_from_query(&r[0]))
     }
 
     /// Messages in `account` whose To: header contains exactly `to`, received after `after` (UTC RFC3339).
@@ -1388,6 +1440,21 @@ fn detail_props() -> Vec<&'static str> {
     props
 }
 
+/// Reads an `Email/query` answer as an `InboxSnapshot`. Pure, so the
+/// parsing can be tested from fixtures without a mail server. A
+/// missing `total` reads as 0 and a missing/empty `ids` as no newest
+/// message; both are what a fresh empty inbox answers.
+fn snapshot_from_query(q: &Value) -> InboxSnapshot {
+    InboxSnapshot {
+        total: q["total"].as_u64().unwrap_or(0),
+        newest_id: q["ids"]
+            .as_array()
+            .and_then(|ids| ids.first())
+            .and_then(Value::as_str)
+            .map(str::to_string),
+    }
+}
+
 /// Builds a `ThreadDetail` from fetched messages. Pure, so the sort and
 /// subject rules can be tested from fixtures without a mail server.
 /// `receivedAt` is RFC3339 UTC, so string order is chronological order.
@@ -2137,6 +2204,58 @@ mod tests {
             thread_from_details("t1", vec![]),
             Err(MailError::NotFound)
         ));
+    }
+
+    fn snap(total: u64, newest: Option<&str>) -> InboxSnapshot {
+        InboxSnapshot {
+            total,
+            newest_id: newest.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn snapshot_from_query_reads_total_and_newest() {
+        let q = json!({"total": 14, "ids": ["b2aaaaap"], "queryState": "sde"});
+        assert_eq!(snapshot_from_query(&q), snap(14, Some("b2aaaaap")));
+        assert_eq!(
+            snapshot_from_query(&json!({"total": 0, "ids": []})),
+            snap(0, None)
+        );
+        // A missing total or ids list reads as an empty inbox, never a panic.
+        assert_eq!(snapshot_from_query(&json!({})), snap(0, None));
+    }
+
+    #[test]
+    fn new_mail_count_counts_arrivals() {
+        // One arrival: total up, newest replaced.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(14, Some("b"))),
+            1
+        );
+        // Three arrivals at once.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(16, Some("d"))),
+            3
+        );
+        // Nothing changed.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(13, Some("a"))),
+            0
+        );
+        // Arrival plus a deletion in one interval: flat total, new newest.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(13, Some("b"))),
+            1
+        );
+        // A read or a move out is not an arrival: flat total, same newest.
+        assert_eq!(
+            new_mail_count(&snap(13, Some("a")), &snap(12, Some("a"))),
+            0
+        );
+        // Inbox emptied: no arrival, even though the newest id vanished.
+        assert_eq!(new_mail_count(&snap(1, Some("a")), &snap(0, None)), 0);
+        // First message in an empty inbox.
+        assert_eq!(new_mail_count(&snap(0, None), &snap(1, Some("a"))), 1);
     }
 }
 
