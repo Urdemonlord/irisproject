@@ -28,7 +28,7 @@ concurrency:
 jobs:
   build:
     name: Build macOS tarballs
-    runs-on: macos-14
+    runs-on: macos-15
     env:
       CARGO_TERM_COLOR: always
     steps:
@@ -62,7 +62,7 @@ jobs:
 
   test:
     name: Smoke-test the macOS install
-    runs-on: macos-14
+    runs-on: macos-15
     needs: build
     steps:
       - uses: actions/checkout@v4
