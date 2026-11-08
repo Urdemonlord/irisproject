@@ -325,6 +325,8 @@ async fn main() {
         )
         .route("/api/v1/temp-inboxes", post(temp::create))
         .route("/api/v1/temp-inboxes/:id", get(temp::status))
+        .route("/api/v1/temp-inboxes/:id/extend", post(temp::extend))
+        .route("/api/v1/temp-inboxes/:id/delete", post(temp::delete))
         .route("/api/v1/temp-inboxes/:id/messages", get(temp::messages))
         .route(
             "/api/v1/temp-inboxes/:id/messages/:message_id",
