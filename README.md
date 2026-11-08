@@ -175,6 +175,7 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
 | `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
 | `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
+| `IRIS_ADMIN_EMAILS` | (empty) | Comma-separated emails allowed to see the read-only admin dashboard (`#/admin`); empty = nobody is an admin, every admin request answers 403 |
 
 ### Login CAPTCHA (Cloudflare Turnstile)
 

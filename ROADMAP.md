@@ -32,6 +32,9 @@ commitment to ship it.
   inbox for report attachments (XML, gzip, zip), parse them, store
   per-report totals and per-source rows, and show totals per domain,
   per-domain detail, and the worst failing sources.
+- **Admin dashboard** — read-only users, quotas, and delivery status
+  in one place (`#/admin`), gated by the `IRIS_ADMIN_EMAILS`
+  allow-list (empty = nobody is an admin).
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
   10 creates/hour per IP, 3 active per browser. Extendable by 1 hour,
   up to 5 times and 24 hours total life, or deleted early from the
@@ -57,7 +60,6 @@ commitment to ship it.
 
 ## Planned
 
-- **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
 - **HTML compose + signatures** — rich-text mail and per-mailbox
   signatures (compose attachments shipped in PR #16).
