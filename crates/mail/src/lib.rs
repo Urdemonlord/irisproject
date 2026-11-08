@@ -8,6 +8,8 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+pub mod dmarc;
+
 #[derive(Debug, Error)]
 pub enum MailError {
     #[error("mail server unavailable: {0}")]
@@ -576,6 +578,42 @@ impl JmapClient {
             )
             .await?;
         Ok(snapshot_from_query(&r[0]))
+    }
+
+    /// Inbox messages that carry attachments, newest first. The DMARC scan
+    /// starts here: aggregate reports always arrive as attachments
+    /// (`.xml`, `.xml.gz`, `.zip`), so a plain inbox listing would waste
+    /// a detail fetch on every attachment-less message.
+    pub async fn list_attachment_messages(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        limit: u32,
+    ) -> Result<Vec<MessageSummary>, MailError> {
+        let folders = self.folders(user, pass, account).await?;
+        let inbox = folders
+            .iter()
+            .find(|f| f.role == "inbox")
+            .ok_or(MailError::NotFound)?;
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([
+                    ["Email/query", {"accountId": account,
+                        "filter": {"operator": "AND", "conditions": [
+                            {"inMailbox": inbox.id}, {"hasAttachment": true}]},
+                        "sort": [{"property": "receivedAt", "isAscending": false}],
+                        "position": 0, "limit": limit, "calculateTotal": false}, "q"],
+                    ["Email/get", {"accountId": account,
+                        "#ids": {"resultOf": "q", "name": "Email/query", "path": "/ids"},
+                        "properties": SUMMARY_PROPS}, "g"]
+                ]),
+            )
+            .await?;
+        let list = r[1]["list"].as_array().cloned().unwrap_or_default();
+        Ok(list.iter().map(summary).collect())
     }
 
     /// Messages in `account` whose To: header contains exactly `to`, received after `after` (UTC RFC3339).

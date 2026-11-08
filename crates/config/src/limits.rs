@@ -27,6 +27,23 @@ pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
 /// mailing list) must not pull an unbounded `Email/get`; the newest
 /// slice is still a useful conversation view.
 pub const MAX_THREAD_MESSAGES: usize = 200;
+/// Max inbox messages with attachments one DMARC scan examines, newest
+/// first. A scan that walked the whole inbox would take minutes and
+/// download without bound; reports are recent mail, so the newest
+/// slice is the useful one. Re-scanning after more reports arrive
+/// picks up the rest.
+pub const MAX_DMARC_SCAN_MESSAGES: u32 = 100;
+/// Max size of one attachment a DMARC scan downloads. Reports are
+/// small XML (gzip / zip); anything bigger is not a report.
+pub const MAX_DMARC_SCAN_ATTACHMENT_BYTES: u64 = 5_000_000;
+/// Max per-source rows stored for one DMARC report. A report can carry
+/// thousands of records; the report totals still count every record,
+/// only the drill-down list is capped.
+pub const MAX_DMARC_RECORDS_PER_REPORT: usize = 5000;
+/// Max imported DMARC reports per user. Past the cap a scan imports
+/// nothing new until old reports are pruned (cleanup, same pass as
+/// the other retention jobs).
+pub const MAX_DMARC_REPORTS_PER_USER: i64 = 1000;
 /// Max messages destroyed per JMAP `destroy_to` / `destroy_before` call.
 pub const MAX_DESTROY_PER_CALL: u32 = 500;
 /// Max passes when clearing a label keyword: one pass handles at most
@@ -188,6 +205,10 @@ mod tests {
         assert_eq!(MAX_PREVIEW_TEXT, 2_000_000);
         assert_eq!(MAX_DESTROY_PER_CALL, 500);
         assert_eq!(MAX_THREAD_MESSAGES, 200);
+        assert_eq!(MAX_DMARC_SCAN_MESSAGES, 100);
+        assert_eq!(MAX_DMARC_SCAN_ATTACHMENT_BYTES, 5_000_000);
+        assert_eq!(MAX_DMARC_RECORDS_PER_REPORT, 5000);
+        assert_eq!(MAX_DMARC_REPORTS_PER_USER, 1000);
         assert_eq!(MAX_CLEAR_KEYWORD_BATCHES, 100);
         assert_eq!(MAX_RECIPIENTS, 50);
         assert_eq!(MAX_SUBJECT, 998);

@@ -1374,6 +1374,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       }),
       nav.starred,
       nav.sidebar,
+      navItem('#/dmarc', 'shield', 'DMARC reports'),
       h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
       navItem('#/temp', 'timer', 'Temporary inbox'),
@@ -1955,6 +1956,158 @@ async function renderOrganize() {
   }
 }
 
+// ---------- DMARC dashboard ----------
+type DmarcDomainRow = { domain: string; reports: number; messages: number; passed: number; failed: number; last_end: number }
+type DmarcOffender = { source_ip: string; messages: number; passed: number; failed: number }
+type DmarcSummary = { reports: number; domains: number; messages: number; passed: number; failed: number; first_begin: number | null; last_end: number | null; per_domain: DmarcDomainRow[]; offenders: DmarcOffender[] }
+type DmarcReportRow = { id: string; org_name: string; report_id: string; date_begin: number; date_end: number; total_messages: number; passed_messages: number; failed_messages: number }
+type DmarcSourceRow = { source_ip: string; messages: number; passed: number; failed: number }
+type DmarcDomain = { domain: string; reports: number; messages: number; passed: number; failed: number; report_list: DmarcReportRow[]; sources: DmarcSourceRow[] }
+
+const fmtDay = (unix: number) => new Date(unix * 1000).toLocaleDateString(undefined, { month: 'short', day: 'numeric', year: 'numeric' })
+const pct = (part: number, total: number) => total > 0 ? `${Math.round((part / total) * 100)}%` : 'n/a'
+
+async function renderDmarc() {
+  const { email, mb } = await ensureAccount()
+  const base = `/api/v1/mailboxes/${mb}`
+  setPage({ title: 'DMARC reports', description: 'Aggregate DMARC reports for your domains.', path: '/#/dmarc', noindex: true })
+
+  const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
+  const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
+    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+  const scanBtn = btn('btn btn-primary btn-sm', 'Scan inbox for reports', 'refresh') as HTMLButtonElement
+  const stats = h('div', { className: 'dmarc-stats' })
+  const domainList = h('ul', { className: 'org-list' })
+  const offenderList = h('ul', { className: 'org-list' })
+  const section = (heading: string, text: string, list: HTMLElement, ...extra: HTMLElement[]) =>
+    h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
+
+  let summary: DmarcSummary | null = null
+  let expanded: string | null = null
+  const details = new Map<string, DmarcDomain>()
+
+  const stat = (value: string, label: string) =>
+    h('div', { className: 'dmarc-stat' }, h('b', {}, value), h('span', {}, label))
+
+  const drawStats = () => {
+    if (!summary) return
+    stats.replaceChildren(
+      stat(String(summary.reports), 'Reports'),
+      stat(String(summary.domains), 'Domains'),
+      stat(String(summary.messages), 'Messages checked'),
+      stat(pct(summary.passed, summary.messages), 'DMARC pass'))
+  }
+
+  const drawOffenders = () => {
+    if (!summary) return
+    offenderList.replaceChildren(...(summary.offenders.length ? summary.offenders.map((o) =>
+      h('li', { className: 'org-row' }, icon('shield', 'icon icon-sm'),
+        h('span', { className: 'org-name mono' }, o.source_ip),
+        h('span', { className: 'org-actions muted' }, `${o.messages} messages, ${o.failed} failed`)))
+      : [h('li', { className: 'org-empty muted' }, 'No failing sources. Every checked message passed DMARC.')]))
+  }
+
+  const drawDomains = () => {
+    if (!summary) return
+    if (!summary.per_domain.length) {
+      domainList.replaceChildren(h('li', { className: 'org-empty muted' }, 'No reports yet. Receiving servers send aggregate reports as attachments to your inbox; scan to import them.'))
+      return
+    }
+    domainList.replaceChildren(...summary.per_domain.map((d) => {
+      const li = h('li', { className: 'dmarc-domain' })
+      const isOpen = expanded === d.domain
+      const row = h('button', { type: 'button', className: 'dmarc-row', 'aria-expanded': String(isOpen) },
+        h('span', { className: 'dmarc-domain-name' }, d.domain),
+        h('span', { className: 'muted' }, `${d.reports} report${d.reports === 1 ? '' : 's'}`),
+        h('span', { className: 'muted' }, `${d.messages} messages`),
+        h('span', { className: d.failed > 0 ? 'dmarc-fail' : '' }, `${pct(d.passed, d.messages)} pass`),
+        h('span', { className: 'muted' }, `last ${fmtDay(d.last_end)}`))
+      row.onclick = () => { void toggleDomain(d.domain) }
+      li.append(row)
+      if (isOpen) {
+        const detail = details.get(d.domain)
+        const box = h('div', { className: 'dmarc-detail' })
+        if (!detail) {
+          box.replaceChildren(h('p', { className: 'muted' }, 'Loading…'))
+        } else {
+          const reports = h('ul', { className: 'org-list' }, ...detail.report_list.map((r) =>
+            h('li', { className: 'org-row' }, icon('mail', 'icon icon-sm'),
+              h('span', { className: 'org-name' }, `${r.org_name} · ${fmtDay(r.date_begin)} to ${fmtDay(r.date_end)}`),
+              h('span', { className: 'org-actions muted' }, `${r.total_messages} messages, ${r.failed_messages} failed`))))
+          const sources = h('ul', { className: 'org-list' }, ...(detail.sources.length ? detail.sources.map((s) =>
+            h('li', { className: 'org-row' }, icon('shield', 'icon icon-sm'),
+              h('span', { className: 'org-name mono' }, s.source_ip),
+              h('span', { className: 'org-actions muted' }, `${s.messages} messages, ${s.failed} failed`)))
+            : [h('li', { className: 'org-empty muted' }, 'No sources in these reports.')]))
+          box.replaceChildren(
+            h('h3', {}, 'Reports'),
+            reports,
+            h('h3', {}, 'Sources'),
+            sources)
+        }
+        li.append(box)
+      }
+      return li
+    }))
+  }
+
+  const toggleDomain = async (domain: string) => {
+    if (expanded === domain) { expanded = null; drawDomains(); return }
+    expanded = domain
+    drawDomains()
+    if (!details.has(domain)) {
+      try {
+        const { domain: d } = await api<{ domain: DmarcDomain }>(`${base}/dmarc/domains/${encodeURIComponent(domain)}`)
+        details.set(domain, d)
+        drawDomains()
+      } catch (err) {
+        if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+        toast('Could not load this domain.')
+        expanded = null
+        drawDomains()
+      }
+    }
+  }
+
+  const load = async () => {
+    try {
+      const { summary: s } = await api<{ summary: DmarcSummary }>(`${base}/dmarc/summary`)
+      summary = s
+      drawStats(); drawDomains(); drawOffenders()
+    } catch (err) {
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      domainList.replaceChildren(errorState('Could not load DMARC reports.', () => { void load() }))
+    }
+  }
+
+  scanBtn.onclick = async () => {
+    const restore = busy(scanBtn, 'Scanning…')
+    try {
+      const r = await api<{ scanned: number; imported: number; skipped: number }>(`${base}/dmarc/scan`, { method: 'POST' })
+      restore()
+      toast(r.imported > 0
+        ? `Imported ${r.imported} new report${r.imported === 1 ? '' : 's'} from ${r.scanned} message${r.scanned === 1 ? '' : 's'}.`
+        : 'No new reports found in your inbox.')
+      await load()
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      toast('Scan failed. Try again.')
+    }
+  }
+
+  app.className = 'app-shell'
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
+    h('h1', { className: 'pane-title' }, 'DMARC reports'),
+    h('p', { className: 'muted' }, 'Aggregate reports show how receiving servers treat mail from your domains: how much passed DMARC, and which sources failed.'),
+    h('div', { className: 'org-submit' }, scanBtn),
+    section('Totals', 'Across all imported reports.', stats),
+    section('By domain', 'Open a domain to see its reports and the sources that sent mail for it.', domainList),
+    section('Worst offenders', 'Sources with the most failed messages, across all domains.', offenderList))))
+  stats.replaceChildren()
+  await load()
+}
+
 // ---------- Temp inbox ----------
 let tempTimers: number[] = []
 let onVisible: (() => void) | null = null
@@ -2173,7 +2326,7 @@ function route() {
       if (role) view = { kind: 'role', role }
     }
   } catch { /* malformed escape in the hash */ }
-  const page = r === '/organize' ? renderOrganize() : view ? renderMailbox(view) : undefined
+  const page = r === '/organize' ? renderOrganize() : r === '/dmarc' ? renderDmarc() : view ? renderMailbox(view) : undefined
   if (!page) return renderNotFound()
   page.catch((err) => {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
