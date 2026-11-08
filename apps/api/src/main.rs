@@ -207,6 +207,20 @@ async fn main() {
     let protected = Router::new()
         .route("/api/v1/session", get(session))
         .route("/api/v1/admin/summary", get(admin::summary))
+        .route("/api/v1/admin/users/:id/disable", post(admin::disable_user))
+        .route("/api/v1/admin/users/:id/enable", post(admin::enable_user))
+        .route(
+            "/api/v1/admin/users/:id/revoke-sessions",
+            post(admin::revoke_user_sessions),
+        )
+        .route(
+            "/api/v1/admin/integration-keys/:key_id/revoke",
+            post(admin::revoke_integration_key),
+        )
+        .route(
+            "/api/v1/admin/temp-inboxes/:id/delete",
+            post(admin::delete_temp_inbox),
+        )
         .route("/auth/logout", post(logout))
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))

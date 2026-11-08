@@ -775,3 +775,4 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .admin-table td { overflow-wrap: anywhere; }
 .admin-table th { font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-text-secondary); white-space: nowrap; }
 .admin-table td { font-variant-numeric: tabular-nums; }
+.admin-actions { display: inline-flex; flex-wrap: wrap; gap: var(--iris-space-2); }

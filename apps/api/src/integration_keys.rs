@@ -2,7 +2,8 @@ use crate::integration_apps::scope_allowed;
 use iris_auth as auth;
 use sqlx::SqlitePool;
 
-fn valid_key_id(key_id: &str) -> bool {
+/// Key ids are the 32 lowercase hex characters minted at creation.
+pub(crate) fn valid_key_id(key_id: &str) -> bool {
     key_id.len() == 32
         && key_id
             .bytes()
@@ -58,7 +59,10 @@ async fn issue(
     Ok(generated)
 }
 
-async fn revoke(pool: &SqlitePool, key_id: &str) -> Result<(), &'static str> {
+/// Revoke an active key. The transactional endpoint authenticates with
+/// `WHERE key_id=? AND status='active'`, so a revoked key fails auth
+/// from this write on. Shared by the CLI and the admin dashboard.
+pub(crate) async fn revoke(pool: &SqlitePool, key_id: &str) -> Result<(), &'static str> {
     if !valid_key_id(key_id) {
         return Err("invalid_key_id");
     }

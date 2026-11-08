@@ -1,4 +1,6 @@
-//! Read-only admin dashboard: users, quotas, and delivery status.
+//! Admin dashboard: users, quotas, and delivery status, plus the
+//! actions an admin needs: disable/enable users, revoke their
+//! sessions, revoke integration keys, and delete temp inboxes.
 //!
 //! The gate is an explicit allow-list, `IRIS_ADMIN_EMAILS`
 //! (comma-separated, lowercased), read into `Config::admin_emails`.
@@ -13,17 +15,25 @@
 //! answer 401 before this code is reached); the web only uses
 //! `is_admin` from `/api/v1/session` to show or hide the nav link.
 //!
-//! The dashboard is read-only and reuses tables the API already
-//! maintains: `app_users` / `permanent_mailboxes` / `auth_sessions`
+//! The dashboard reads tables the API already maintains:
+//! `app_users` / `permanent_mailboxes` / `auth_sessions`
 //! for users, `integration_email_requests` / `integration_keys` for
 //! transactional delivery, `rate_limit_events` for aggregate user
 //! sends, and `temporary_inboxes` for temp-inbox counts. No new
 //! table, no migration. Recipients of transactional mail are stored
 //! only as hashes (`recipient_hash`), so the dashboard can never
 //! show them; the recent-requests list carries no recipient field.
+//! Integration keys expose their `key_id` (the public identifier the
+//! UI needs to revoke one); the token itself is never stored or
+//! shown, only its hash.
 
 use crate::{ApiError, ApiResult, CurrentUser, S};
-use axum::{extract::State, http::StatusCode, response::IntoResponse, Extension, Json};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    response::IntoResponse,
+    Extension, Json,
+};
 use iris_auth as auth;
 use iris_config::limits::{
     ACTIVE_PER_CLIENT, IP_CREATES_PER_HOUR, MAX_BODY, MAX_COMPOSE_ATTACHMENTS,
@@ -37,9 +47,9 @@ use std::collections::HashMap;
 /// One row of the recent transactional-requests list: id, app, template,
 /// status, provider message id, created time.
 type RecentRequestRow = (String, String, String, String, Option<String>, String);
-/// One row of the integration-keys list: app, status, daily limit,
+/// One row of the integration-keys list: id, app, status, daily limit,
 /// last used, expiry.
-type IntegrationKeyRow = (String, String, i64, Option<String>, Option<String>);
+type IntegrationKeyRow = (String, String, String, i64, Option<String>, Option<String>);
 
 /// Admin gate: the session user's email must be on the
 /// `IRIS_ADMIN_EMAILS` allow-list. Non-admins get 403 `forbidden`;
@@ -168,15 +178,16 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
         )
         .collect();
     let key_rows: Vec<IntegrationKeyRow> = sqlx::query_as(
-        "SELECT app_id, status, daily_send_limit, last_used_at, expires_at FROM integration_keys ORDER BY created_at DESC LIMIT 100",
+        "SELECT key_id, app_id, status, daily_send_limit, last_used_at, expires_at FROM integration_keys ORDER BY created_at DESC LIMIT 100",
     )
     .fetch_all(&s.pool)
     .await?;
     let keys: Vec<_> = key_rows
         .into_iter()
         .map(
-            |(app_id, status, daily_send_limit, last_used_at, expires_at)| {
+            |(key_id, app_id, status, daily_send_limit, last_used_at, expires_at)| {
                 json!({
+                    "key_id": key_id,
                     "app_id": app_id,
                     "status": status,
                     "daily_send_limit": daily_send_limit,
@@ -209,6 +220,24 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
             .bind(&day_ago)
             .fetch_one(&s.pool)
             .await?;
+    // Active temp inboxes the admin can delete early, newest first.
+    let temp_active_rows: Vec<(String, String, String, String, i64)> = sqlx::query_as(
+        "SELECT id, address, created_at, expires_at, message_count FROM temporary_inboxes WHERE status='active' ORDER BY created_at DESC LIMIT 100",
+    )
+    .fetch_all(&s.pool)
+    .await?;
+    let temp_active: Vec<_> = temp_active_rows
+        .into_iter()
+        .map(|(id, address, created_at, expires_at, message_count)| {
+            json!({
+                "id": id,
+                "address": address,
+                "created_at": created_at,
+                "expires_at": expires_at,
+                "message_count": message_count,
+            })
+        })
+        .collect();
     let temp_by_status: HashMap<String, serde_json::Value> = temp_rows
         .into_iter()
         .map(|(status, count, messages, bytes)| {
@@ -263,7 +292,164 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
         "temp_inboxes": {
             "by_status": temp_by_status,
             "created_last_24h": temp_created_last_24h,
+            "active_list": temp_active,
         },
+    }))
+    .into_response())
+}
+
+/// Disable a user. A disabled user cannot log in (`persist_login`
+/// refuses them with `account_disabled`) and their live sessions stop
+/// validating (`require_session` requires `status='active'`), so the
+/// account is locked out at once. The admin cannot disable their own
+/// account: that would lock the only admin out with no way back in.
+pub(crate) async fn disable_user(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    if u.user_id == id {
+        return Err(ApiError(StatusCode::CONFLICT, "cannot_disable_self"));
+    }
+    set_user_status(&s.pool, &id, "active", "disabled").await
+}
+
+/// Re-enable a disabled user. Login works again from this write on.
+pub(crate) async fn enable_user(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    set_user_status(&s.pool, &id, "disabled", "active").await
+}
+
+/// Shared disable/enable write: flip `status` from `from` to `to`.
+/// Unknown id answers 404; a user in any other status answers 409.
+/// The write is conditional on the old status, so a second click (or
+/// a second admin) hears 409 instead of silently succeeding.
+async fn set_user_status(pool: &sqlx::SqlitePool, id: &str, from: &str, to: &str) -> ApiResult {
+    let code = if to == "disabled" {
+        "user_not_active"
+    } else {
+        "user_not_disabled"
+    };
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT email, status FROM app_users WHERE id=?")
+            .bind(id)
+            .fetch_optional(pool)
+            .await?;
+    let Some((email, status)) = row else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    };
+    if status != from {
+        return Err(ApiError(StatusCode::CONFLICT, code));
+    }
+    let now = auth::now();
+    let updated =
+        sqlx::query("UPDATE app_users SET status=?, updated_at=? WHERE id=? AND status=?")
+            .bind(to)
+            .bind(&now)
+            .bind(id)
+            .bind(from)
+            .execute(pool)
+            .await?;
+    if updated.rows_affected() == 0 {
+        return Err(ApiError(StatusCode::CONFLICT, code));
+    }
+    Ok(Json(json!({ "id": id, "email": email, "status": to })).into_response())
+}
+
+/// Revoke all of a user's live sessions, signing them out everywhere.
+/// This only flips `revoked_at` on the session rows: it cannot destroy
+/// the Stalwart app passwords behind them, because opening a sealed
+/// mail credential needs that user's session token, which the admin
+/// does not have. The passwords expire on their own (30 days) and the
+/// sessions stop validating at once, so the sign-out is immediate.
+pub(crate) async fn revoke_user_sessions(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let exists: Option<String> = sqlx::query_scalar("SELECT id FROM app_users WHERE id=?")
+        .bind(&id)
+        .fetch_optional(&s.pool)
+        .await?;
+    if exists.is_none() {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    }
+    let revoked = sqlx::query(
+        "UPDATE auth_sessions SET revoked_at=? WHERE user_id=? AND revoked_at IS NULL AND expires_at>?",
+    )
+    .bind(auth::now())
+    .bind(&id)
+    .bind(auth::now())
+    .execute(&s.pool)
+    .await?;
+    Ok(Json(json!({ "id": id, "revoked": revoked.rows_affected() })).into_response())
+}
+
+/// Revoke an integration key. The transactional endpoint authenticates
+/// with `WHERE key_id=? AND status='active'`, so the key stops working
+/// from this write on. Reuses the CLI revoke so both paths share one
+/// implementation.
+pub(crate) async fn revoke_integration_key(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(key_id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    if !crate::integration_keys::valid_key_id(&key_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_key_id"));
+    }
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT app_id, status FROM integration_keys WHERE key_id=?")
+            .bind(&key_id)
+            .fetch_optional(&s.pool)
+            .await?;
+    let Some((app_id, status)) = row else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    };
+    if status != "active" {
+        return Err(ApiError(StatusCode::CONFLICT, "key_not_active"));
+    }
+    crate::integration_keys::revoke(&s.pool, &key_id)
+        .await
+        .map_err(|err| match err {
+            "invalid_key_id" => ApiError(StatusCode::BAD_REQUEST, "invalid_key_id"),
+            _ => ApiError(StatusCode::CONFLICT, "key_not_active"),
+        })?;
+    Ok(Json(json!({ "key_id": key_id, "app_id": app_id, "status": "revoked" })).into_response())
+}
+
+/// Delete an active temp inbox early. Same write as the user-facing
+/// delete (`temp::mark_deletion_pending`): the address dies at once
+/// and the retention job purges the mail. No Bearer token is involved:
+/// the admin gate replaces the capability check.
+pub(crate) async fn delete_temp_inbox(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> ApiResult {
+    require_admin(&s.config, &u.email)?;
+    let row: Option<(String, String)> =
+        sqlx::query_as("SELECT address, status FROM temporary_inboxes WHERE id=?")
+            .bind(&id)
+            .fetch_optional(&s.pool)
+            .await?;
+    let Some((address, status)) = row else {
+        return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
+    };
+    if status != "active" {
+        return Err(ApiError(StatusCode::CONFLICT, "temp_inbox_not_active"));
+    }
+    let Some(deleted_at) = crate::temp::mark_deletion_pending(&s.pool, &id).await? else {
+        return Err(ApiError(StatusCode::CONFLICT, "temp_inbox_not_active"));
+    };
+    Ok(Json(json!({
+        "id": id, "address": address, "status": "deleted", "deleted_at": deleted_at,
     }))
     .into_response())
 }
@@ -460,11 +646,19 @@ mod tests {
             v["delivery"]["integration_keys"].as_array().unwrap().len(),
             2
         );
-        assert!(v["delivery"]["integration_keys"][0].get("key_id").is_none());
+        // key_id is the public identifier the UI needs to revoke a key;
+        // the token hash is never exposed.
+        assert!(v["delivery"]["integration_keys"][0].get("key_id").is_some());
+        assert!(v["delivery"]["integration_keys"][0]
+            .get("token_hash")
+            .is_none());
 
         assert_eq!(v["temp_inboxes"]["by_status"]["active"]["count"], 1);
         assert_eq!(v["temp_inboxes"]["by_status"]["expired"]["count"], 1);
         assert_eq!(v["temp_inboxes"]["created_last_24h"], 2);
+        let active_list = v["temp_inboxes"]["active_list"].as_array().unwrap();
+        assert_eq!(active_list.len(), 1);
+        assert_eq!(active_list[0]["address"], "aaa@example.test");
     }
 
     #[tokio::test]
@@ -494,5 +688,271 @@ mod tests {
         summary(State(s), Extension(user("ADMIN@Example.Test")))
             .await
             .expect("case must not matter for the admin check");
+    }
+
+    /// The seeded admin, with the real `u-admin` id the seed uses (the
+    /// `user()` helper fabricates `u-{email}`, which matches no row).
+    fn admin() -> CurrentUser {
+        CurrentUser {
+            user_id: "u-admin".into(),
+            email: "admin@example.test".into(),
+            creds: Creds {
+                user: "admin@example.test".into(),
+                pass: "secret".into(),
+            },
+        }
+    }
+
+    #[tokio::test]
+    async fn disable_then_enable_user() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        seed(&s).await;
+        let resp = disable_user(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["status"], "disabled");
+        let status: String = sqlx::query_scalar("SELECT status FROM app_users WHERE id='u-alice'")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "disabled");
+        // A second disable hears 409 instead of silently succeeding.
+        let err = disable_user(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+            .await
+            .expect_err("disabling twice must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "user_not_active");
+        // Unknown user: 404.
+        let err = disable_user(
+            State(s.clone()),
+            Extension(admin()),
+            Path("u-nobody".into()),
+        )
+        .await
+        .expect_err("unknown user must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+        // The admin cannot disable their own account.
+        let err = disable_user(State(s.clone()), Extension(admin()), Path("u-admin".into()))
+            .await
+            .expect_err("self-disable must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "cannot_disable_self");
+        // Re-enable restores the account, and a second enable is 409.
+        let resp = enable_user(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+            .await
+            .unwrap();
+        assert_eq!(body_json(resp).await["status"], "active");
+        let err = enable_user(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+            .await
+            .expect_err("enabling twice must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "user_not_disabled");
+    }
+
+    #[tokio::test]
+    async fn admin_actions_refuse_non_admins() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        seed(&s).await;
+        for result in [
+            disable_user(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("u-bob".into()),
+            )
+            .await,
+            enable_user(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("u-bob".into()),
+            )
+            .await,
+            revoke_user_sessions(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("u-bob".into()),
+            )
+            .await,
+            revoke_integration_key(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".into()),
+            )
+            .await,
+            delete_temp_inbox(
+                State(s.clone()),
+                Extension(user("alice@example.test")),
+                Path("t-1".into()),
+            )
+            .await,
+        ] {
+            let err = result.expect_err("non-admins must be refused");
+            assert_eq!(err.0, StatusCode::FORBIDDEN);
+            assert_eq!(err.1, "forbidden");
+        }
+    }
+
+    #[tokio::test]
+    async fn revoke_sessions_signs_user_out_everywhere() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        seed(&s).await;
+        // Alice has exactly one live session (one expired, one revoked).
+        let resp =
+            revoke_user_sessions(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+                .await
+                .unwrap();
+        assert_eq!(body_json(resp).await["revoked"], 1);
+        let live: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM auth_sessions WHERE user_id='u-alice' AND revoked_at IS NULL AND expires_at>?",
+        )
+        .bind(auth::now())
+        .fetch_one(&s.pool)
+        .await
+        .unwrap();
+        assert_eq!(live, 0);
+        // Nothing left to revoke: still a success, with a zero count.
+        let resp =
+            revoke_user_sessions(State(s.clone()), Extension(admin()), Path("u-alice".into()))
+                .await
+                .unwrap();
+        assert_eq!(body_json(resp).await["revoked"], 0);
+        // Unknown user: 404.
+        let err = revoke_user_sessions(
+            State(s.clone()),
+            Extension(admin()),
+            Path("u-nobody".into()),
+        )
+        .await
+        .expect_err("unknown user must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn revoke_key_kills_authentication() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        seed(&s).await;
+        // A real key id (32 lowercase hex); the seed's "key-alpha" is
+        // not a valid id shape for the revoke path.
+        let key_id = "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6";
+        let now = auth::now();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,status,created_at,daily_send_limit) VALUES (?,'alpha',?,'[]','active',?,100)")
+            .bind(key_id).bind("a".repeat(64)).bind(&now)
+            .execute(&s.pool).await.unwrap();
+        let resp =
+            revoke_integration_key(State(s.clone()), Extension(admin()), Path(key_id.into()))
+                .await
+                .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "revoked");
+        assert_eq!(v["app_id"], "alpha");
+        // The exact lookup the transactional endpoint authenticates
+        // with no longer finds the key.
+        let found: Option<String> = sqlx::query_scalar(
+            "SELECT key_id FROM integration_keys WHERE key_id=? AND status='active'",
+        )
+        .bind(key_id)
+        .fetch_optional(&s.pool)
+        .await
+        .unwrap();
+        assert!(found.is_none());
+        // A second revoke hears 409.
+        let err = revoke_integration_key(State(s.clone()), Extension(admin()), Path(key_id.into()))
+            .await
+            .expect_err("revoking twice must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "key_not_active");
+        // Malformed id: 400. Well-formed but unknown: 404.
+        let err = revoke_integration_key(
+            State(s.clone()),
+            Extension(admin()),
+            Path("not-a-key".into()),
+        )
+        .await
+        .expect_err("malformed key id must be 400");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid_key_id");
+        let err = revoke_integration_key(
+            State(s.clone()),
+            Extension(admin()),
+            Path("ffffffffffffffffffffffffffffffff".into()),
+        )
+        .await
+        .expect_err("unknown key must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_temp_delete() {
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        seed(&s).await;
+        let resp = delete_temp_inbox(State(s.clone()), Extension(admin()), Path("t-1".into()))
+            .await
+            .unwrap();
+        let v = body_json(resp).await;
+        assert_eq!(v["status"], "deleted");
+        assert_eq!(v["address"], "aaa@example.test");
+        let status: String =
+            sqlx::query_scalar("SELECT status FROM temporary_inboxes WHERE id='t-1'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(status, "deletion_pending");
+        // Already deleted: 409. Unknown: 404.
+        let err = delete_temp_inbox(State(s.clone()), Extension(admin()), Path("t-1".into()))
+            .await
+            .expect_err("deleting twice must fail");
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "temp_inbox_not_active");
+        let err = delete_temp_inbox(
+            State(s.clone()),
+            Extension(admin()),
+            Path("t-nobody".into()),
+        )
+        .await
+        .expect_err("unknown inbox must be 404");
+        assert_eq!(err.0, StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn admin_routes_answer_401_without_a_session() {
+        use axum::{body::Body, http::Request, middleware, routing::post, Router};
+        use tower::ServiceExt;
+        let s = test_state(vec!["admin@example.test".into()]).await;
+        // The real `require_session` middleware, on the same routes the
+        // app serves: no cookie, no session, no handler runs.
+        let app = Router::new()
+            .route("/api/v1/admin/users/:id/disable", post(disable_user))
+            .route("/api/v1/admin/users/:id/enable", post(enable_user))
+            .route(
+                "/api/v1/admin/users/:id/revoke-sessions",
+                post(revoke_user_sessions),
+            )
+            .route(
+                "/api/v1/admin/integration-keys/:key_id/revoke",
+                post(revoke_integration_key),
+            )
+            .route(
+                "/api/v1/admin/temp-inboxes/:id/delete",
+                post(delete_temp_inbox),
+            )
+            .route_layer(middleware::from_fn_with_state(
+                s.clone(),
+                crate::require_session,
+            ))
+            .with_state(s);
+        for uri in [
+            "/api/v1/admin/users/u-alice/disable",
+            "/api/v1/admin/users/u-alice/enable",
+            "/api/v1/admin/users/u-alice/revoke-sessions",
+            "/api/v1/admin/integration-keys/a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6/revoke",
+            "/api/v1/admin/temp-inboxes/t-1/delete",
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .body(Body::empty())
+                .unwrap();
+            let resp = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "{uri} must be 401");
+        }
     }
 }
