@@ -96,10 +96,28 @@ pub const MAX_TURNSTILE_ATTEMPTS_PER_IP: i64 = 20;
 // out at ~1 read/sec per user instead of unbounded JMAP round-trips.
 // Keyed per user, not per IP: reads are authenticated, so one user's
 // hammering must never block another user behind the same NAT.
+//
+// The live mailbox stream (`notify::MailWatch`, `MAIL_WATCH_POLL_SECS`)
+// does NOT draw from this bucket: it is server-driven, one shared
+// watcher per mailbox, one small JMAP poll per interval no matter how
+// many tabs are open, and it stops when the last tab disconnects.
+// That bound is the rate limit for the stream — charging the bucket
+// per reconnect instead would let a flapping EventSource burn the
+// budget the user's own list reads need.
 /// Max authenticated message reads per user per window.
 pub const MAX_READS_PER_WINDOW: i64 = 600;
 /// Window for MAX_READS_PER_WINDOW, in minutes.
 pub const READ_WINDOW_MINUTES: i64 = 10;
+
+/// How often one shared mailbox watcher polls JMAP for new mail, in
+/// seconds. One small `Email/query` per mailbox per interval, shared
+/// by every open tab on that mailbox; the web falls back to its 30 s
+/// list poll only while the stream is down.
+pub const MAIL_WATCH_POLL_SECS: u64 = 15;
+/// How often the SSE stream sends a keep-alive comment, in seconds:
+/// inside the 60 s read timeout a reverse proxy typically applies to
+/// an idle response.
+pub const MAIL_WATCH_KEEPALIVE_SECS: u64 = 30;
 
 // --- Request caps (were `apps/api/src/main.rs`) ----------------------------
 
@@ -188,6 +206,8 @@ mod tests {
         assert_eq!(MAX_FAILED_LOGINS, 10);
         assert_eq!(MAX_FAILED_LOGINS_PER_IP, 50);
         assert_eq!(MAX_TURNSTILE_ATTEMPTS_PER_IP, 20);
+        assert_eq!(MAIL_WATCH_POLL_SECS, 15);
+        assert_eq!(MAIL_WATCH_KEEPALIVE_SECS, 30);
         assert_eq!(MAX_READS_PER_WINDOW, 600);
         assert_eq!(READ_WINDOW_MINUTES, 10);
         assert_eq!(DEFAULT_LIST_LIMIT, 50);

@@ -30,6 +30,11 @@ commitment to ship it.
   their mailboxes).
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
   10 creates/hour per IP, 3 active per browser.
+- **Real-time notifications** — new mail arrives over a server-sent
+  event stream: one shared watcher per mailbox polls the inbox
+  snapshot (size + newest message) every 15 s and pushes a notice
+  when mail arrives; the 30 s list poll stays as a fallback while
+  the stream is down.
 - **Transactional email API** — scoped API keys for companion apps
   (per-template scopes, daily limits, CLI key management). The app
   registry is configuration: set `IRIS_INTEGRATION_APPS` (JSON) to
@@ -47,7 +52,6 @@ commitment to ship it.
 
 - **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
-- **Real-time notifications** — new mail without polling.
 - **DMARC dashboard** — aggregate DMARC reports across domains.
 - **Temp inbox extend/delete** — extend an address past 1 hour, or delete
   it early.
