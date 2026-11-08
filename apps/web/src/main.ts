@@ -1,6 +1,6 @@
 import { SITE, footerLinks, initSite, setPage } from './site'
 
-type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[] }
+type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[]; thread_id?: string | null }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
 type MimePart = { part_id: string; content_type: string; name?: string | null; disposition?: string | null; size: number }
 type Detail = Summary & { text_body: string | null; html_body: string | null; cc?: string[]; message_id?: string | null; references?: string[]; attachments?: Attachment[]; mime_parts?: MimePart[]; body_source?: string }
@@ -637,6 +637,95 @@ function fillList(list: HTMLElement, messages: Summary[], o: { current: string; 
       const label = m.is_starred ? 'Unstar' : 'Star'
       li.append(h('button', { type: 'button', className: `star-btn${m.is_starred ? ' is-on' : ''}`, ariaLabel: `${label}: ${m.subject || '(no subject)'}`, title: label, 'aria-pressed': String(!!m.is_starred), onclick: () => o.onStar!(m) },
         icon(m.is_starred ? 'star-fill' : 'star', 'icon icon-sm')))
+    }
+    return li
+  })), ...(o.footer ? [o.footer] : []))
+}
+
+/** One conversation in the list: all loaded messages sharing a threadId. */
+type ThreadGroup = { id: string; subject: string; participants: string[]; count: number; latest: Summary; unread: boolean; messages: Summary[] }
+type ThreadDetail = { thread_id: string; subject: string; messages: Detail[] }
+
+/** Group loaded summaries into conversations, newest thread first.
+ * Messages without a threadId are a thread of their own. Pure, so the
+ * grouping rule is the same everywhere the list is drawn. With `showTo`
+ * (Sent, Drafts) participants are the recipients, as in the flat list. */
+function groupThreads(messages: Summary[], showTo = false): ThreadGroup[] {
+  const byId = new Map<string, Summary[]>()
+  for (const m of messages) {
+    const key = m.thread_id ?? `msg:${m.id}`
+    const g = byId.get(key)
+    if (g) g.push(m)
+    else byId.set(key, [m])
+  }
+  const groups: ThreadGroup[] = []
+  for (const [id, ms] of byId) {
+    const sorted = [...ms].sort((a, b) => b.received_at.localeCompare(a.received_at))
+    const latest = sorted[0]
+    groups.push({
+      id,
+      subject: sorted.find((m) => m.subject.trim())?.subject ?? '',
+      participants: uniq(ms.flatMap((m) => showTo ? m.to.map(senderName) : [senderName(m.from)])),
+      count: ms.length,
+      latest,
+      unread: ms.some((m) => !m.is_read),
+      messages: ms,
+    })
+  }
+  return groups.sort((a, b) => b.latest.received_at.localeCompare(a.latest.received_at))
+}
+
+/** Render one row per conversation. Expanding a row shows its messages
+ * oldest first (the full thread when fetched, else the loaded page's
+ * slice) using the same rows as the flat list. */
+function fillThreadList(list: HTMLElement, groups: ThreadGroup[], o: {
+  current: string
+  empty: HTMLElement
+  footer?: HTMLElement
+  showTo?: boolean
+  expanded: Set<string>
+  threads: Map<string, ThreadDetail>
+  onToggle: (g: ThreadGroup) => void
+  onOpen: (m: Summary, index: number, wasUnread: boolean, total: number) => void
+  onIntent?: (m: Summary) => void
+  onStar?: (m: Summary) => void
+}) {
+  if (!groups.length) return list.replaceChildren(o.empty)
+  list.replaceChildren(h('ul', { className: 'message-list thread-list', ariaLabel: 'Conversations' }, ...groups.map((g) => {
+    const isOpen = o.expanded.has(g.id)
+    const countLabel = g.count === 1 ? '1 message' : `${g.count} messages`
+    const row = h('button', { type: 'button', className: `thread-row${g.unread ? ' unread' : ''}`, 'aria-expanded': String(isOpen), title: countLabel },
+      h('span', { className: 'msg-from' },
+        ...(g.unread ? [h('span', { className: 'iris-mark', title: 'Unread' }, h('span', { className: 'sr-only' }, 'Unread: '))] : []),
+        h('span', { className: 'msg-from-name' }, g.participants.join(', ') || '(unknown sender)'),
+        ...(g.count > 1 ? [h('span', { className: 'thread-count' }, String(g.count))] : [])),
+      h('time', { className: 'msg-date', dateTime: g.latest.received_at, title: fmtDate(g.latest.received_at) }, fmtShort(g.latest.received_at)),
+      h('span', { className: 'msg-subject' }, g.subject || '(no subject)'),
+      ...(g.latest.preview ? [h('span', { className: 'msg-preview' }, g.latest.preview)] : []))
+    row.onclick = () => o.onToggle(g)
+    const head = h('div', { className: 'thread-head' }, row)
+    if (o.onStar) {
+      const latest = g.latest
+      head.append(h('button', {
+        type: 'button', className: `star-btn${latest.is_starred ? ' is-on' : ''}`,
+        ariaLabel: `${latest.is_starred ? 'Unstar' : 'Star'}: ${g.subject || '(no subject)'}`, title: latest.is_starred ? 'Unstar' : 'Star',
+        'aria-pressed': String(!!latest.is_starred), onclick: () => o.onStar!(latest),
+      }, icon(latest.is_starred ? 'star-fill' : 'star', 'icon icon-sm')))
+    }
+    const li = h('li', { className: 'thread-item' }, head)
+    if (isOpen) {
+      const cached = o.threads.get(g.id)
+      const msgs = [...(cached?.messages ?? g.messages)].sort((a, b) => a.received_at.localeCompare(b.received_at))
+      const box = h('div', { className: 'thread-messages' })
+      fillList(box, msgs, {
+        current: o.current,
+        showTo: o.showTo,
+        empty: h('div'),
+        onOpen: (m, i, wasUnread) => o.onOpen(m, i, wasUnread, msgs.length),
+        ...(o.onIntent ? { onIntent: o.onIntent } : {}),
+        ...(o.onStar ? { onStar: o.onStar } : {}),
+      })
+      li.append(box)
     }
     return li
   })), ...(o.footer ? [o.footer] : []))
@@ -1390,6 +1479,47 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       btn('btn btn-secondary btn-sm', loadingMore ? 'Loading…' : 'Load more', undefined, { disabled: loadingMore, onclick: () => { void loadMore() } }))
   }
 
+  /** Opened threads and their fetched details, kept across redraws. */
+  const expandedThreads = new Set<string>()
+  const threadDetails = new Map<string, ThreadDetail>()
+
+  const openFromList = (m: Summary, i: number, wasUnread: boolean, total: number) => {
+    if (folder === 'drafts' || m.is_draft) return void openDraft(m)
+    if (wasUnread) {
+      writeListCache(email, mb, key, all)
+      api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
+    }
+    current = m.id
+    draw()
+    ui.show()
+    openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${total}`, toolbar(m), htmlBodyMinter(url(m.id)))
+  }
+
+  const toggleThread = (g: ThreadGroup) => {
+    if (expandedThreads.has(g.id)) { expandedThreads.delete(g.id); draw(); return }
+    expandedThreads.add(g.id)
+    draw()
+    // A one-message thread needs no fetch: the loaded summary is the
+    // whole conversation. Larger threads fetch once and cache.
+    if (g.count > 1 && !threadDetails.has(g.id) && !g.id.startsWith('msg:')) {
+      api<{ thread: ThreadDetail }>(`${base}/threads/${encodeURIComponent(g.id)}`)
+        .then(({ thread }) => {
+          threadDetails.set(g.id, thread)
+          // Seed the message cache so opening a message in the thread
+          // needs no second fetch.
+          for (const d of thread.messages) {
+            const u = url(d.id)
+            if (!messageCache.has(u)) {
+              while (messageCache.size >= MESSAGE_CACHE_MAX) messageCache.delete(messageCache.keys().next().value!)
+              messageCache.set(u, { at: Date.now(), p: Promise.resolve({ message: d }) })
+            }
+          }
+          draw()
+        })
+        .catch(() => { toast('Could not load this conversation.') })
+    }
+  }
+
   const draw = () => {
     // When the loaded list already matches the query (server-side search),
     // show it as-is: a body-only hit would fail the local from/subject/preview filter.
@@ -1398,23 +1528,16 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
     unreadChip.textContent = `${unread} unread`
     unreadChip.hidden = folder !== 'inbox' || !unread
     const [emptyTitle, emptyText] = meta.empty
-    fillList(ui.list, shown, {
+    fillThreadList(ui.list, groupThreads(shown, folder === 'sent' || folder === 'drafts'), {
       current,
       showTo: folder === 'sent' || folder === 'drafts',
       empty: query ? emptyState('search', 'No matches', `Nothing in ${meta.label} matches “${query}”.`) : emptyState(meta.icon, emptyTitle, emptyText),
       footer: loadMoreFooter(),
+      expanded: expandedThreads,
+      threads: threadDetails,
+      onToggle: (g) => { toggleThread(g) },
+      onOpen: (m, i, wasUnread, total) => openFromList(m, i, wasUnread, total),
       onStar: folder === 'drafts' ? undefined : (m) => { void toggleStar(m) },
-      onOpen: (m, i, wasUnread) => {
-        if (folder === 'drafts' || m.is_draft) return void openDraft(m)
-        if (wasUnread) {
-          writeListCache(email, mb, key, all)
-          api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
-        }
-        current = m.id
-        draw()
-        ui.show()
-        openMessageAt(url(m.id), ui.readerBody, undefined, () => { signOut(); renderLogin() }, `${i + 1} of ${shown.length}`, toolbar(m), htmlBodyMinter(url(m.id)))
-      },
       onIntent: folder === 'drafts' ? undefined : (m) => prefetchMessage(url(m.id)),
     })
   }

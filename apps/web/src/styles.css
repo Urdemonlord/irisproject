@@ -234,6 +234,28 @@ button:disabled { cursor: not-allowed; }
 .msg-preview { color: var(--iris-graphite); }
 .msg-date { font-family: var(--iris-font-mono); font-size: var(--iris-text-xs); color: var(--iris-graphite); font-variant-numeric: tabular-nums; white-space: nowrap; }
 .msg.unread .msg-date { color: var(--iris-vermilion); }
+
+/* ---------- Threads ---------- */
+.thread-item { border-bottom: var(--iris-rule-hair); }
+.thread-item:hover { background: var(--iris-cream-sunk); }
+.thread-head { display: flex; align-items: center; }
+.thread-row {
+  flex: 1; min-width: 0; text-align: left; background: none; border: 0;
+  padding: var(--iris-space-3) var(--iris-space-4); position: relative;
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; column-gap: var(--iris-space-3); row-gap: 2px;
+  color: var(--iris-text); transition: background-color var(--iris-dur-fast) var(--iris-ease);
+  min-height: 76px; align-content: center;
+}
+.thread-row:focus-visible { outline-offset: -2px; }
+.thread-row.unread .msg-from, .thread-row.unread .msg-subject { font-weight: 600; color: var(--iris-text); }
+.thread-row.unread .msg-date { color: var(--iris-vermilion); }
+.thread-row[aria-expanded="true"] .msg-subject { color: var(--iris-text); }
+.thread-count { flex: none; font-family: var(--iris-font-mono); font-size: var(--iris-text-xs); font-weight: 600; color: var(--iris-cream); background: var(--iris-graphite); border-radius: var(--iris-radius-1); padding: 1px 6px; font-variant-numeric: tabular-nums; }
+.thread-row.unread .thread-count { background: var(--iris-vermilion); }
+.thread-messages { border-top: var(--iris-rule-hair); background: var(--iris-cream-sunk); }
+.thread-messages .msg-item { border-bottom: 0; border-top: var(--iris-rule-hair); }
+.thread-messages .msg-item:first-child { border-top: 0; }
+.thread-messages .msg { min-height: 60px; padding-left: calc(var(--iris-space-4) + 14px); }
 .iris-mark { width: 10px; height: 10px; border-radius: 50%; background: var(--iris-vermilion); position: relative; flex: none; display: inline-block; }
 .iris-mark::after { content: ""; position: absolute; left: 50%; top: 50%; transform: translate(-50%, -50%); width: 1.3px; height: 3.6px; background: var(--iris-ink); border-radius: 1px; }
 .otp-chip { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 32px; margin-right: var(--iris-space-3); padding: 0 var(--iris-space-2); border: 1px solid var(--iris-ink); border-radius: var(--iris-radius-1); background: var(--iris-cream); font-family: var(--iris-font-mono); font-size: var(--iris-text-xs); font-weight: 600; letter-spacing: 0.06em; }

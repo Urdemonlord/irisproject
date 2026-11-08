@@ -23,6 +23,10 @@ pub const MAX_PREVIEW_BYTES: u64 = 5_000_000;
 /// Extracted preview text is truncated at this many bytes instead of refused,
 /// so a big DMARC report still shows its first records.
 pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
+/// Max messages returned for one thread. A runaway thread (a busy
+/// mailing list) must not pull an unbounded `Email/get`; the newest
+/// slice is still a useful conversation view.
+pub const MAX_THREAD_MESSAGES: usize = 200;
 /// Max messages destroyed per JMAP `destroy_to` / `destroy_before` call.
 pub const MAX_DESTROY_PER_CALL: u32 = 500;
 /// Max passes when clearing a label keyword: one pass handles at most
@@ -83,8 +87,8 @@ pub const MAX_TURNSTILE_ATTEMPTS_PER_IP: i64 = 20;
 
 // --- Authenticated message reads (debt round 2, slice 9) -------------------
 // One shared bucket for every JMAP-backed read behind the session:
-// list_messages, get_message, get_message_raw, get_attachment,
-// get_attachment_preview and compose::folders. The web polls list +
+// list_messages, get_message, get_thread, get_message_raw,
+// get_attachment, get_attachment_preview and compose::folders. The web polls list +
 // folders every 30 s while visible (4 reads/min per tab) and debounces
 // search to one list call per 300 ms pause, so 600 reads per 10 minutes
 // leaves ~15x headroom for a single tab — search bursts, load-more paging
@@ -150,6 +154,7 @@ mod tests {
         assert_eq!(MAX_PREVIEW_BYTES, 5_000_000);
         assert_eq!(MAX_PREVIEW_TEXT, 2_000_000);
         assert_eq!(MAX_DESTROY_PER_CALL, 500);
+        assert_eq!(MAX_THREAD_MESSAGES, 200);
         assert_eq!(MAX_CLEAR_KEYWORD_BATCHES, 100);
         assert_eq!(MAX_RECIPIENTS, 50);
         assert_eq!(MAX_SUBJECT, 998);

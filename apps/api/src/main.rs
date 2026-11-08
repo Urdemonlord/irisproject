@@ -197,6 +197,10 @@ async fn main() {
         .route("/api/v1/mailboxes", get(mailboxes))
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
         .route(
+            "/api/v1/mailboxes/:mailbox_id/threads/:thread_id",
+            get(get_thread),
+        )
+        .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id",
             get(get_message).delete(compose::delete_message),
         )
@@ -939,6 +943,26 @@ async fn list_messages(
         )
         .await?;
     Ok(Json(json!({ "messages": messages, "total": total, "position": position })).into_response())
+}
+
+/// One JMAP thread: every message in the conversation, oldest first.
+/// A thread id is server-issued, same shape as a message id, so the
+/// same validation applies; an unknown thread answers 404.
+async fn get_thread(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path((mailbox_id, thread_id)): Path<(String, String)>,
+) -> ApiResult {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    if !valid_message_id(&thread_id) {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    }
+    check_read_limit(&s, &u).await?;
+    let t = s
+        .jmap
+        .get_thread(&u.creds.user, &u.creds.pass, &account, &thread_id)
+        .await?;
+    Ok(Json(json!({ "thread": t })).into_response())
 }
 
 pub(crate) fn valid_message_id(id: &str) -> bool {
