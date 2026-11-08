@@ -1,7 +1,9 @@
 //! Minimal JMAP client. Every call uses the end user's own credentials
 //! (never an admin credential), per TRD §5.
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use iris_config::limits::{MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT};
+use iris_config::limits::{
+    MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT, MAX_THREAD_MESSAGES,
+};
 use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
@@ -41,6 +43,21 @@ pub struct MessageSummary {
     /// IRIS labels: the message's keywords that are valid label names
     /// (no `$` system keywords), sorted.
     pub labels: Vec<String>,
+    /// JMAP thread this message belongs to (`Email.threadId`). `None`
+    /// when the server did not report one; the web then treats the
+    /// message as a thread of its own.
+    pub thread_id: Option<String>,
+}
+
+/// One JMAP thread: every message in the conversation, oldest first.
+/// The subject is the newest message's subject (first non-empty one
+/// scanning newest-first), so a re-titled reply still shows the
+/// subject the conversation ended with.
+#[derive(Debug, Clone, Serialize)]
+pub struct ThreadDetail {
+    pub thread_id: String,
+    pub subject: String,
+    pub messages: Vec<MessageDetail>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -196,7 +213,7 @@ const USING_SUBMIT: [&str; 3] = [
     "urn:ietf:params:jmap:mail",
     "urn:ietf:params:jmap:submission",
 ];
-const SUMMARY_PROPS: [&str; 8] = [
+const SUMMARY_PROPS: [&str; 9] = [
     "from",
     "to",
     "subject",
@@ -205,6 +222,7 @@ const SUMMARY_PROPS: [&str; 8] = [
     "keywords",
     "size",
     "hasAttachment",
+    "threadId",
 ];
 
 /// JMAP `Email/query` filter for one folder, optionally narrowed by a
@@ -1216,24 +1234,12 @@ impl JmapClient {
         account: &str,
         id: &str,
     ) -> Result<MessageDetail, MailError> {
-        let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
-        props.extend([
-            "textBody",
-            "htmlBody",
-            "bodyValues",
-            "bodyStructure",
-            "attachments",
-            "blobId",
-            "cc",
-            "messageId",
-            "references",
-        ]);
         let r = self
             .call(
                 user,
                 pass,
                 json!([["Email/get", {"accountId": account, "ids": [id],
-                "properties": props, "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
                 // Classified body parts alone are not enough: a text part nested
                 // under multipart/mixed or multipart/report (the usual DMARC
                 // shape) may not appear in textBody/htmlBody at all, so also
@@ -1244,6 +1250,66 @@ impl JmapClient {
             .await?;
         let e = r[0]["list"].get(0).ok_or(MailError::NotFound)?;
         Ok(detail_from_email(e))
+    }
+
+    /// One thread, oldest first, with bodies. `Thread/get` first resolves
+    /// the thread to its message ids, then `Email/get` fetches them with
+    /// the same properties as `get_message`, so a thread view never needs
+    /// a second fetch per message.
+    ///
+    /// Two round trips on purpose: the ids are capped to
+    /// `MAX_THREAD_MESSAGES` before the fetch, and the cap needs the
+    /// `Thread/get` answer first. Stalwart returns `emailIds` oldest
+    /// first (verified against the local server), so the tail of an
+    /// over-long thread is its newest slice; the fetched details are
+    /// still sorted by `receivedAt` below rather than trusting that.
+    pub async fn get_thread(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        thread_id: &str,
+    ) -> Result<ThreadDetail, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Thread/get", {"accountId": account, "ids": [thread_id]}, "t"]]),
+            )
+            .await?;
+        let ids: Vec<&str> = r[0]["list"]
+            .get(0)
+            .and_then(|t| t["emailIds"].as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+            .collect();
+        if ids.is_empty() {
+            return Err(MailError::NotFound);
+        }
+        let ids: Vec<&str> = if ids.len() > MAX_THREAD_MESSAGES {
+            ids[ids.len() - MAX_THREAD_MESSAGES..].to_vec()
+        } else {
+            ids
+        };
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Email/get", {"accountId": account, "ids": ids,
+                "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                "fetchAllBodyValues": true,
+                "maxBodyValueBytes": 1_000_000}, "g"]]),
+            )
+            .await?;
+        let details: Vec<MessageDetail> = r[0]["list"]
+            .as_array()
+            .cloned()
+            .unwrap_or_default()
+            .iter()
+            .map(detail_from_email)
+            .collect();
+        thread_from_details(thread_id, details)
     }
 
     /// Streams one JMAP blob (a whole message, or one attachment part) with
@@ -1299,6 +1365,53 @@ impl JmapClient {
             .map(|b| b.to_vec())
             .map_err(|e| MailError::Unavailable(e.to_string()))
     }
+}
+
+/// Properties for a full message fetch: the summary set plus bodies.
+/// Classified body parts alone are not enough: a text part nested
+/// under multipart/mixed or multipart/report (the usual DMARC shape)
+/// may not appear in textBody/htmlBody at all, so `fetchAllBodyValues`
+/// is set by the callers and `detail_from_email` walks bodyStructure.
+fn detail_props() -> Vec<&'static str> {
+    let mut props: Vec<&str> = SUMMARY_PROPS.to_vec();
+    props.extend([
+        "textBody",
+        "htmlBody",
+        "bodyValues",
+        "bodyStructure",
+        "attachments",
+        "blobId",
+        "cc",
+        "messageId",
+        "references",
+    ]);
+    props
+}
+
+/// Builds a `ThreadDetail` from fetched messages. Pure, so the sort and
+/// subject rules can be tested from fixtures without a mail server.
+/// `receivedAt` is RFC3339 UTC, so string order is chronological order.
+fn thread_from_details(
+    thread_id: &str,
+    mut details: Vec<MessageDetail>,
+) -> Result<ThreadDetail, MailError> {
+    if details.is_empty() {
+        return Err(MailError::NotFound);
+    }
+    details.sort_by(|a, b| a.summary.received_at.cmp(&b.summary.received_at));
+    let subject = details
+        .iter()
+        .rev()
+        .find_map(|d| {
+            let s = d.summary.subject.trim();
+            (!s.is_empty()).then_some(s.to_string())
+        })
+        .unwrap_or_default();
+    Ok(ThreadDetail {
+        thread_id: thread_id.to_string(),
+        subject,
+        messages: details,
+    })
 }
 
 /// Builds a `MessageDetail` from one JMAP Email object. Pure, so the DMARC
@@ -1628,6 +1741,7 @@ fn summary(e: &Value) -> MessageSummary {
         size_bytes: e["size"].as_u64().unwrap_or(0),
         is_starred: e["keywords"]["$flagged"] == true,
         labels: labels_of(e),
+        thread_id: e["threadId"].as_str().map(str::to_string),
     }
 }
 
@@ -1963,6 +2077,66 @@ mod tests {
         assert_eq!(searched["conditions"][1]["text"], "invoice");
         // A blank search term is the same as no search.
         assert_eq!(folder_filter("m1", Some("   "))["inMailbox"], "m1");
+    }
+
+    /// Minimal Email object for thread tests: only what `summary` and
+    /// `detail_from_email` read.
+    fn thread_email(id: &str, thread: &str, subject: &str, received_at: &str) -> Value {
+        json!({
+            "id": id, "threadId": thread,
+            "from": [{"email": "a@example.com"}],
+            "to": [{"email": "b@example.com"}],
+            "subject": subject, "preview": "", "receivedAt": received_at,
+            "keywords": {"$seen": true}, "size": 100, "hasAttachment": false,
+            "textBody": [], "htmlBody": [], "bodyValues": {}, "bodyStructure": {},
+        })
+    }
+
+    #[test]
+    fn summary_carries_thread_id() {
+        let s = summary(&thread_email("m1", "t9", "Hi", "2026-11-08T00:00:00Z"));
+        assert_eq!(s.thread_id.as_deref(), Some("t9"));
+        let mut e = thread_email("m2", "t9", "Hi", "2026-11-08T00:00:00Z");
+        e.as_object_mut().unwrap().remove("threadId");
+        assert_eq!(summary(&e).thread_id, None);
+    }
+
+    #[test]
+    fn thread_from_details_sorts_oldest_first() {
+        let newest = detail_from_email(&thread_email(
+            "m3",
+            "t1",
+            "Re: Launch",
+            "2026-11-08T03:00:00Z",
+        ));
+        let oldest = detail_from_email(&thread_email("m1", "t1", "Launch", "2026-11-08T01:00:00Z"));
+        let middle = detail_from_email(&thread_email(
+            "m2",
+            "t1",
+            "Re: Launch",
+            "2026-11-08T02:00:00Z",
+        ));
+        let t = thread_from_details("t1", vec![newest, oldest, middle]).unwrap();
+        assert_eq!(t.thread_id, "t1");
+        assert_eq!(t.subject, "Re: Launch");
+        let ids: Vec<&str> = t.messages.iter().map(|d| d.summary.id.as_str()).collect();
+        assert_eq!(ids, ["m1", "m2", "m3"]);
+    }
+
+    #[test]
+    fn thread_subject_falls_back_to_older_subject() {
+        let newest = detail_from_email(&thread_email("m2", "t1", "", "2026-11-08T02:00:00Z"));
+        let oldest = detail_from_email(&thread_email("m1", "t1", "Launch", "2026-11-08T01:00:00Z"));
+        let t = thread_from_details("t1", vec![newest, oldest]).unwrap();
+        assert_eq!(t.subject, "Launch");
+    }
+
+    #[test]
+    fn thread_from_details_empty_is_not_found() {
+        assert!(matches!(
+            thread_from_details("t1", vec![]),
+            Err(MailError::NotFound)
+        ));
     }
 }
 
