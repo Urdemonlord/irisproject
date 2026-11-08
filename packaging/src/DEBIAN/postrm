@@ -1,0 +1,29 @@
+#!/bin/sh
+# iris-mail-stack postrm. Remove leaves everything behind; purge wipes
+# config, data, logs and the system users. Purging deletes mail.
+set -e
+case "$1" in
+  purge)
+    rm -rf /etc/iris /etc/stalwart /etc/caddy/Caddyfile
+    rm -rf /var/lib/iris /var/lib/stalwart /var/log/stalwart /var/lib/caddy
+    rm -rf /srv/iris
+    rm -f /etc/systemd/system/iris-api.service /etc/systemd/system/iris-stalwart.service
+    rm -f /etc/systemd/system/iris-caddy.service /etc/systemd/system/iris-cleanup.service
+    rm -f /etc/systemd/system/iris-cleanup.timer /etc/systemd/system/iris-cert-sync.service
+    rm -f /etc/systemd/system/iris-cert-sync.timer
+    for u in iris stalwart caddy; do
+      if getent passwd "$u" >/dev/null 2>&1; then
+        userdel "$u" 2>/dev/null || true
+      fi
+    done
+    systemctl daemon-reload 2>/dev/null || true
+    ;;
+  remove|upgrade|disappear|failed-upgrade|abort-install|abort-upgrade)
+    ;;
+  *)
+    echo "postrm called with unknown argument '$1'" >&2
+    exit 1
+    ;;
+esac
+#DEBHELPER#
+exit 0

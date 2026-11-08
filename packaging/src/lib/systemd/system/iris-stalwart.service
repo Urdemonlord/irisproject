@@ -1,0 +1,29 @@
+[Unit]
+Description=Stalwart mail server (IRIS stack)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=stalwart
+Group=stalwart
+WorkingDirectory=/var/lib/stalwart
+Environment=SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt
+ExecStart=/usr/local/bin/stalwart --config /etc/stalwart/config.json
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/var/lib/stalwart /var/log/stalwart
+MemoryMax=768M
+# Stalwart binds privileged ports as user stalwart (SMTP 25, submissions
+# 465, IMAPS 993, POP3S 995); without the ambient capability those
+# listeners fail and only the high ports (8080, 4190) come up.
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+CapabilityBoundingSet=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

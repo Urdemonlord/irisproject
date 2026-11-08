@@ -1,0 +1,17 @@
+Package: iris-mail-stack
+Version: @VERSION@
+Section: mail
+Priority: optional
+Architecture: amd64
+Depends: python3, curl, openssl, ca-certificates
+Maintainer: Meow Labs <admin@meowlabs.id>
+Homepage: https://github.com/Urdemonlord/irisproject
+Description: IRIS webmail and Stalwart mail server in one package
+ One .deb installs the whole self-hosted mail stack: the IRIS webmail
+ API and web app, the Stalwart mail server (SMTP, IMAP, JMAP), and a
+ Caddy reverse proxy with automatic TLS. The installer asks for one
+ domain, generates all secrets, and provisions the mail server, so a
+ fresh server goes from empty to working webmail in one step.
+ .
+ IRIS is a single 13 MB binary with no containers and no cloud account.
+ Stalwart is a single static binary. Both are pinned in versions.env.

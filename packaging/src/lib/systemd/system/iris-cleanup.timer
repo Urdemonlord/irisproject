@@ -1,0 +1,11 @@
+[Unit]
+Description=Run the IRIS retention cleanup every 15 minutes
+
+[Timer]
+OnCalendar=*:0/15
+Persistent=true
+RandomizedDelaySec=60
+Unit=iris-cleanup.service
+
+[Install]
+WantedBy=timers.target

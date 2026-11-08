@@ -1,0 +1,84 @@
+# IRIS - public reverse proxy (Caddy v2). Rendered by iris-install.sh
+# from this template; @MAIL_HOST@ and @CONTENT_HOST@ are replaced with
+# the operator's domains. Caddy issues TLS certificates automatically.
+# Based on the IRIS repo deploy/caddy/Caddyfile, plus the separate
+# mail-content origin (one-time HTML-body tokens only, everything else 404).
+
+{
+	# Pin the admin API to loopback. The default binds the machine's
+	# hostname address, which fails on hosts whose hostname resolves
+	# to an address that is not assigned locally, and the admin API
+	# must never listen on a public interface (it accepts config
+	# changes without authentication).
+	admin 127.0.0.1:2019
+}
+
+@MAIL_HOST@ {
+	encode zstd gzip
+
+	# API + auth -> iris-api (same origin, needed for CSRF cookie + SameSite).
+	# X-Real-IP is trusted by the API only from loopback.
+	# flush_interval -1 keeps the SSE notification stream unbuffered.
+	@backend path /api/* /auth/* /health /ready
+	handle @backend {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Real-IP {remote_host}
+			flush_interval -1
+		}
+	}
+
+	# Static web app.
+	handle {
+		root * /srv/iris/dist
+
+		# Hashed build files never change: cache for a year.
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+		# HTML and root files (favicon, og-image, robots, sitemap): always revalidate.
+		@revalidate not path /assets/*
+		header @revalidate Cache-Control "no-cache"
+
+		file_server
+	}
+
+	# Unknown static paths -> custom 404 page (keeps the 404 status).
+	# Only errors raised by Caddy itself land here; API 404s pass through untouched.
+	handle_errors 404 {
+		root * /srv/iris/dist
+		rewrite * /404.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		-Server
+	}
+}
+
+@CONTENT_HOST@ {
+	# Separate origin for HTML mail rendering. Only the one-time
+	# html-body token URL is proxied to iris-api; everything else 404s.
+	# The frame may only be embedded by the mail host.
+	@htmlbody path /api/v1/mailboxes/*/messages/*/html-body
+	handle @htmlbody {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+
+	header {
+		Content-Security-Policy "frame-ancestors https://@MAIL_HOST@"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
