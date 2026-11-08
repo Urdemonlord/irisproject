@@ -28,6 +28,10 @@ commitment to ship it.
 - **Contacts** — address book with autocomplete in compose; managed on
   the Organize page (add, edit, delete; one list per user, shared across
   their mailboxes).
+- **DMARC dashboard** — aggregate DMARC reports across domains: scan the
+  inbox for report attachments (XML, gzip, zip), parse them, store
+  per-report totals and per-source rows, and show totals per domain,
+  per-domain detail, and the worst failing sources.
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
   10 creates/hour per IP, 3 active per browser.
 - **Real-time notifications** — new mail arrives over a server-sent
@@ -52,7 +56,6 @@ commitment to ship it.
 
 - **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
-- **DMARC dashboard** — aggregate DMARC reports across domains.
 - **Temp inbox extend/delete** — extend an address past 1 hour, or delete
   it early.
 - **HTML compose + signatures** — rich-text mail and per-mailbox

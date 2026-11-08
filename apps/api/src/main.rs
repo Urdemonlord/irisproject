@@ -30,6 +30,7 @@ use std::{sync::Arc, time::Duration};
 mod cleanup;
 mod compose;
 mod contacts;
+mod dmarc;
 mod email_address;
 mod filters;
 mod html_body;
@@ -275,6 +276,18 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id/move",
             post(compose::move_message),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/dmarc/scan",
+            post(dmarc::scan),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/dmarc/summary",
+            get(dmarc::summary),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/dmarc/domains/:domain",
+            get(dmarc::domain_detail),
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/messages/:message_id/seen",
@@ -1060,7 +1073,7 @@ pub(crate) fn find_attachment<'a>(m: &'a MessageDetail, part_id: &str) -> Option
     m.attachments.iter().find(|a| a.part_id == part_id)
 }
 
-fn sanitized_filename(name: &str) -> String {
+pub(crate) fn sanitized_filename(name: &str) -> String {
     let mut s: String = name
         .chars()
         .map(|c| {

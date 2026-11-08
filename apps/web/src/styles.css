@@ -740,6 +740,23 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .org-form .org-submit { grid-column: 1 / -1; }
 .org-form .form-error { grid-column: 1 / -1; }
 .org-form [hidden] { display: none; }
+
+/* ---------- DMARC dashboard ---------- */
+.mono { font-family: var(--iris-font-mono); }
+.dmarc-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: var(--iris-space-3); width: 100%; }
+.dmarc-stat { border: var(--iris-rule-hair); border-radius: var(--iris-radius-1); padding: var(--iris-space-3) var(--iris-space-4); background: var(--iris-cream); }
+.dmarc-stat b { display: block; font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-h3); }
+.dmarc-stat span { font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-graphite); }
+.dmarc-domain { border-bottom: var(--iris-rule-hair); }
+.dmarc-row { width: 100%; display: grid; grid-template-columns: minmax(0, 2fr) repeat(4, auto); gap: var(--iris-space-3); align-items: center; min-height: 48px; padding: var(--iris-space-2) 0; background: none; border: 0; text-align: left; color: var(--iris-text); cursor: pointer; }
+.dmarc-row:hover .dmarc-domain-name { text-decoration: underline; }
+.dmarc-domain-name { font-weight: 700; overflow-wrap: anywhere; }
+.dmarc-fail { color: var(--iris-vermilion); font-weight: 700; }
+.dmarc-detail { padding: var(--iris-space-3) 0 var(--iris-space-4); display: flex; flex-direction: column; gap: var(--iris-space-3); }
+.dmarc-detail h3 { font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-h4); }
+@media (max-width: 767px) {
+  .dmarc-row { grid-template-columns: minmax(0, 1fr) auto; row-gap: 2px; }
+}
 @media (max-width: 767px) {
   .org-form { grid-template-columns: 1fr; }
   .org-section { padding: var(--iris-space-4); }
