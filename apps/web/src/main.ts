@@ -1,4 +1,5 @@
 import { SITE, footerLinks, initSite, setPage } from './site'
+import { INTEGRATION_DOCS_HTML } from './docs-integrations'
 
 type Summary = { id: string; from: string; to: string[]; subject: string; preview: string; received_at: string; is_read: boolean; is_draft?: boolean; has_attachment?: boolean; is_starred?: boolean; labels?: string[]; thread_id?: string | null }
 type Attachment = { part_id: string; blob_id: string; name: string; content_type: string; size: number; disposition?: string | null }
@@ -2368,6 +2369,14 @@ function renderSignedOut() {
     h('a', { href: '#/temp', className: 'link' }, 'Or get a temporary inbox →')))
 }
 
+// ---------- Integration docs (public page, generated from docs/INTEGRATIONS.md) ----------
+function renderIntegrationDocs() {
+  setPage({ title: 'Integration docs', description: 'How companion apps send auth mail through the IRIS transactional email API.', path: '/#/docs/integrations', noindex: true })
+  const article = document.createElement('article')
+  article.innerHTML = INTEGRATION_DOCS_HTML
+  simplePage('legal', h('p', {}, h('a', { href: '#/', className: 'link' }, '← Back to IRIS')), article)
+}
+
 function renderNotFound() {
   setPage({ title: 'Page not found', description: 'This page does not exist.', path: '/404', noindex: true })
   simplePage('auth-main', h('section', { className: 'auth-card center' },
@@ -2593,7 +2602,7 @@ async function renderAdmin() {
               `/api/v1/admin/integration-keys/${k.key_id}/revoke`, `Key revoked for ${k.app_id}`) })
             : h('span', { className: 'muted' }, '—'),
         ])),
-        h('p', { className: 'muted' }, 'Setup guide for companion apps: ', h('a', { href: 'https://github.com/Urdemonlord/irisproject/blob/main/docs/INTEGRATIONS.md', target: '_blank', rel: 'noopener' }, 'Integration docs')),
+        h('p', { className: 'muted' }, 'Setup guide for companion apps: ', h('a', { href: '#/docs/integrations' }, 'Integration docs')),
         h('p', {}, 'Create an integration key for a companion app. The secret is shown once, copy it before you press Done.'),
         keyForm,
         keySecret),
@@ -2631,6 +2640,7 @@ function route() {
     return renderTempStart()
   }
   if (r === '/signed-out') return renderSignedOut()
+  if (r === '/docs/integrations') return renderIntegrationDocs()
   let view: MailView | undefined
   try {
     if (r === '/') view = { kind: 'role', role: 'inbox' }
