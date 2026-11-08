@@ -1379,7 +1379,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
       navItem('#/temp', 'timer', 'Temporary inbox'),
-      ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'shield', 'Admin')] : []),
+      ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'account', 'Admin')] : []),
       footerLinks('sidebar-footer'),
     ],
     listTop: [h('header', { className: 'pane-head' }, title, unreadChip, refresh), folderTabs],
@@ -2400,15 +2400,20 @@ type AdminSummary = {
     transactional_last_7d: Record<string, number>
     transactional_per_app_last_7d: Record<string, Record<string, number>>
     transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; created_at: string }[]
-    integration_keys: { app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
+    integration_keys: { key_id: string; app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
     user_sends_last_24h: number
   }
-  temp_inboxes: { by_status: Record<string, { count: number; messages: number; bytes: number }>; created_last_24h: number }
+  temp_inboxes: {
+    by_status: Record<string, { count: number; messages: number; bytes: number }>
+    created_last_24h: number
+    active_list: { id: string; address: string; created_at: string; expires_at: string; message_count: number }[]
+  }
 }
 
-/** Admin dashboard: users, quotas, delivery status. Read-only; the
- * server gates the endpoint, so a non-admin only ever sees the
- * "not an admin" notice below, never the data. */
+/** Admin dashboard: users, quotas, delivery status, and the actions
+ * an admin can take on them. The server gates every admin endpoint,
+ * so a non-admin only ever sees the "not an admin" notice below,
+ * never the data. */
 async function renderAdmin() {
   const { email } = await ensureAccount()
   setPage({ title: 'Admin', description: 'IRIS admin dashboard: users, quotas and delivery status.', path: '/', noindex: true })
@@ -2416,7 +2421,7 @@ async function renderAdmin() {
   const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
     h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
   const title = h('h1', { className: 'pane-title' }, 'Admin')
-  const intro = h('p', { className: 'muted' }, 'Users, quotas and delivery status. Read-only.')
+  const intro = h('p', { className: 'muted' }, 'Users, quotas and delivery status. Disable users, revoke sessions and keys, and delete temp inboxes.')
   const body = h('div', { className: 'admin-inner' })
   app.className = 'app-shell'
   app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, body))
@@ -2428,27 +2433,57 @@ async function renderAdmin() {
     const parts = Object.entries(m).sort(([a], [b]) => a.localeCompare(b)).map(([k, v]) => `${k} ${v}`)
     return parts.length ? parts.join(' · ') : 'none yet'
   }
-  const table = (headers: string[], rows: string[][]) =>
+  const table = (headers: string[], rows: (string | HTMLElement)[][]) =>
     h('div', { className: 'admin-scroll' }, h('table', { className: 'admin-table' },
       h('thead', {}, h('tr', {}, ...headers.map((x) => h('th', { scope: 'col' }, x)))),
       h('tbody', {}, ...rows.map((r) => h('tr', {}, ...r.map((c) => h('td', {}, c)))))))
   const section = (heading: string, text: string, ...kids: HTMLElement[]) =>
     h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), ...kids)
+  /** Friendly text for the error codes the admin actions can answer. */
+  const adminError = (err: unknown) => ({
+    user_not_active: 'That user is already disabled.',
+    user_not_disabled: 'That user is already active.',
+    cannot_disable_self: 'You cannot disable your own account.',
+    key_not_active: 'That key is already revoked.',
+    temp_inbox_not_active: 'That inbox is already gone.',
+    not_found: 'That item no longer exists. Reload the page to see the latest state.',
+  }[(err as HttpError).code] ?? 'Something went wrong. Try again.')
+  /** Confirm, run one admin action, toast the outcome, reload the page. */
+  const adminAction = async (confirm: [string, string, string], path: string, done: string) => {
+    if (!(await confirmDialog(confirm[0], confirm[1], confirm[2]))) return
+    try { await api(path, { method: 'POST' }); toast(done); void renderAdmin() } catch (err) { toast(adminError(err)) }
+  }
 
   try {
     const s = await api<AdminSummary>('/api/v1/admin/summary')
     const t24 = s.delivery.transactional_last_24h
     const tempActive = s.temp_inboxes.by_status.active?.count ?? 0
-    const userRows = s.users.list.map((u) => [
-      u.email,
-      u.display_name,
-      u.role,
-      u.status,
-      u.mailboxes.length ? u.mailboxes.map((m) => `${m.email_address} (${fmtBytes(m.quota_bytes)})`).join(', ') : '—',
-      String(u.active_sessions),
-      u.last_seen_at ? fmtDate(u.last_seen_at) : '—',
-      fmtDate(u.created_at),
-    ])
+    const userRows = s.users.list.map((u) => {
+      const actions = u.email === email
+        ? h('span', { className: 'muted' }, 'This is you')
+        : h('span', { className: 'admin-actions' },
+          u.status === 'active'
+            ? btn('btn btn-ghost btn-sm', 'Disable', undefined, { onclick: () => void adminAction(
+              [`Disable ${u.email}?`, 'The account cannot sign in until you enable it again.', 'Disable user'],
+              `/api/v1/admin/users/${u.id}/disable`, `${u.email} disabled`) })
+            : btn('btn btn-ghost btn-sm', 'Enable', undefined, { onclick: () => void adminAction(
+              [`Enable ${u.email}?`, 'The account can sign in again.', 'Enable user'],
+              `/api/v1/admin/users/${u.id}/enable`, `${u.email} enabled`) }),
+          btn('btn btn-ghost btn-sm', 'Revoke sessions', undefined, { onclick: () => void adminAction(
+            [`Revoke sessions for ${u.email}?`, 'The account is signed out everywhere at once.', 'Revoke sessions'],
+            `/api/v1/admin/users/${u.id}/revoke-sessions`, `Sessions revoked for ${u.email}`) }))
+      return [
+        u.email,
+        u.display_name,
+        u.role,
+        u.status,
+        u.mailboxes.length ? u.mailboxes.map((m) => `${m.email_address} (${fmtBytes(m.quota_bytes)})`).join(', ') : '—',
+        String(u.active_sessions),
+        u.last_seen_at ? fmtDate(u.last_seen_at) : '—',
+        fmtDate(u.created_at),
+        actions,
+      ]
+    })
     const perAppRows = Object.entries(s.delivery.transactional_per_app_last_7d)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([app, c]) => [app, String(c.accepted ?? 0), String(c.failed ?? 0), String(c.sending ?? 0), String(c.unknown ?? 0)])
@@ -2461,7 +2496,7 @@ async function renderAdmin() {
         stat('User sends, 24h', String(s.delivery.user_sends_last_24h)),
         stat('Active temp inboxes', String(tempActive))),
       section('Users', s.users.truncated ? `Showing the 100 newest of ${s.users.total} users.` : `${s.users.total} users.`,
-        table(['Email', 'Name', 'Role', 'Status', 'Mailboxes', 'Sessions', 'Last seen', 'Joined'], userRows)),
+        table(['Email', 'Name', 'Role', 'Status', 'Mailboxes', 'Sessions', 'Last seen', 'Joined', 'Actions'], userRows)),
       section('Quotas', 'Limits in force for every user. Mailbox quotas are per mailbox, in the users table above.',
         table(['Limit', 'Value'], [
           ['Sends', `${s.quotas.sends_per_hour} per hour`],
@@ -2487,13 +2522,27 @@ async function renderAdmin() {
         table(['Time', 'App', 'Template', 'Status', 'Provider id'], s.delivery.transactional_recent.map((r) => [
           fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—',
         ])),
-        table(['App', 'Status', 'Daily limit', 'Last used', 'Expires'], s.delivery.integration_keys.map((k) => [
+        table(['App', 'Status', 'Daily limit', 'Last used', 'Expires', 'Actions'], s.delivery.integration_keys.map((k) => [
           k.app_id, k.status, String(k.daily_send_limit), k.last_used_at ? fmtDate(k.last_used_at) : '—', k.expires_at ? fmtDate(k.expires_at) : '—',
+          k.status === 'active'
+            ? btn('btn btn-ghost btn-sm', 'Revoke', undefined, { onclick: () => void adminAction(
+              [`Revoke the ${k.app_id} key?`, 'Apps using this key stop authenticating at once.', 'Revoke key'],
+              `/api/v1/admin/integration-keys/${k.key_id}/revoke`, `Key revoked for ${k.app_id}`) })
+            : h('span', { className: 'muted' }, '—'),
         ]))),
       section('Temp inboxes', `${s.temp_inboxes.created_last_24h} created in the last 24 hours.`,
         table(['Status', 'Inboxes', 'Messages', 'Bytes'], Object.entries(s.temp_inboxes.by_status)
           .sort(([a], [b]) => a.localeCompare(b))
-          .map(([status, c]) => [status, String(c.count), String(c.messages), fmtBytes(c.bytes)]))))
+          .map(([status, c]) => [status, String(c.count), String(c.messages), fmtBytes(c.bytes)])),
+        ...(s.temp_inboxes.active_list.length
+          ? [table(['Address', 'Created', 'Expires', 'Messages', 'Actions'], s.temp_inboxes.active_list.map((t) => [
+            t.address, fmtDate(t.created_at), fmtDate(t.expires_at), String(t.message_count),
+            btn('btn btn-ghost btn-sm', 'Delete', undefined, { onclick: () => void adminAction(
+              [`Delete ${t.address}?`, 'The address stops working right away and its messages will be deleted. You cannot undo this.', 'Delete address'],
+              `/api/v1/admin/temp-inboxes/${t.id}/delete`, `${t.address} deleted`) }),
+          ]))]
+          : [h('p', { className: 'muted' }, 'No active temp inboxes right now.')])))
+
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     if ((err as HttpError).status === 403) {

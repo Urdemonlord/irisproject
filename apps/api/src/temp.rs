@@ -260,6 +260,30 @@ pub async fn extend(
     .into_response())
 }
 
+/// Shared delete write: mark an active inbox `deletion_pending` so the
+/// address stops at once and the retention job purges the mail. Returns
+/// the deletion time when a row flipped from active, `None` when the id
+/// is unknown or not active. Both the user-facing delete (after the
+/// Bearer check) and the admin delete use this, so the semantics stay
+/// identical.
+pub(crate) async fn mark_deletion_pending(
+    pool: &sqlx::SqlitePool,
+    id: &str,
+) -> Result<Option<String>, sqlx::Error> {
+    let now = ts(Utc::now());
+    let updated = sqlx::query(
+        "UPDATE temporary_inboxes SET status='deletion_pending', expires_at=? WHERE id=? AND status='active'",
+    )
+    .bind(&now)
+    .bind(id)
+    .execute(pool)
+    .await?;
+    if updated.rows_affected() == 0 {
+        return Ok(None);
+    }
+    Ok(Some(now))
+}
+
 /// Delete an address early. The address stops working immediately:
 /// `authorize` answers 410 for anything not `active`. The row goes to
 /// `deletion_pending`, the queue the retention job already purges through
@@ -271,19 +295,11 @@ pub async fn delete(
     headers: HeaderMap,
 ) -> ApiResult {
     let i = authorize(&s, &id, &headers).await?;
-    let now = ts(Utc::now());
-    let updated = sqlx::query(
-        "UPDATE temporary_inboxes SET status='deletion_pending', expires_at=? WHERE id=? AND status='active'",
-    )
-    .bind(&now)
-    .bind(&id)
-    .execute(&s.pool)
-    .await?;
-    if updated.rows_affected() == 0 {
+    let Some(deleted_at) = mark_deletion_pending(&s.pool, &id).await? else {
         return Err(ApiError(StatusCode::GONE, "expired"));
-    }
+    };
     Ok(Json(json!({
-        "id": id, "address": i.address, "status": "deleted", "deleted_at": now,
+        "id": id, "address": i.address, "status": "deleted", "deleted_at": deleted_at,
     }))
     .into_response())
 }
