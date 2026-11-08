@@ -2399,8 +2399,9 @@ type AdminSummary = {
     transactional_last_24h: Record<string, number>
     transactional_last_7d: Record<string, number>
     transactional_per_app_last_7d: Record<string, Record<string, number>>
-    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; created_at: string }[]
+    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; error_message: string | null; created_at: string }[]
     integration_keys: { key_id: string; app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
+    integration_apps: { id: string; host: string; templates: string[] }[]
     user_sends_last_24h: number
   }
   temp_inboxes: {
@@ -2447,6 +2448,10 @@ async function renderAdmin() {
     key_not_active: 'That key is already revoked.',
     temp_inbox_not_active: 'That inbox is already gone.',
     not_found: 'That item no longer exists. Reload the page to see the latest state.',
+    invalid_app: 'App names use lowercase letters, digits and hyphens.',
+    unsupported_app: 'That app is not registered. Check the app name.',
+    invalid_limits: 'Expiry must be 1 to 365 days and the daily limit 1 to 10000.',
+    invalid_scopes: 'Those scopes are not allowed for this app.',
   }[(err as HttpError).code] ?? 'Something went wrong. Try again.')
   /** Confirm, run one admin action, toast the outcome, reload the page. */
   const adminAction = async (confirm: [string, string, string], path: string, done: string) => {
@@ -2487,6 +2492,64 @@ async function renderAdmin() {
     const perAppRows = Object.entries(s.delivery.transactional_per_app_last_7d)
       .sort(([a], [b]) => a.localeCompare(b))
       .map(([app, c]) => [app, String(c.accepted ?? 0), String(c.failed ?? 0), String(c.sending ?? 0), String(c.unknown ?? 0)])
+    // Create-key form. Scopes follow the selected app: one per template
+    // it owns, plus email:status. All are checked by default, which is
+    // what the API does when scopes are omitted.
+    const keyApps = s.delivery.integration_apps
+    const keyApp = h('select', { id: 'key-app', className: 'org-select' },
+      ...keyApps.map((a) => h('option', { value: a.id }, `${a.id} (${a.host})`))) as HTMLSelectElement
+    const keyExpires = h('input', { id: 'key-expires', type: 'number', min: '1', max: '365', value: '365', autocomplete: 'off', spellcheck: false }) as HTMLInputElement
+    const keyLimit = h('input', { id: 'key-limit', type: 'number', min: '1', max: '10000', value: '100', autocomplete: 'off', spellcheck: false }) as HTMLInputElement
+    const keyScopes = h('div', { className: 'admin-scopes' })
+    const keyFormError = h('div', { className: 'form-error', role: 'alert' })
+    const keySecret = h('div', { className: 'admin-secret', hidden: true })
+    const drawKeyScopes = () => {
+      const app = keyApps.find((a) => a.id === keyApp.value)
+      const scopes = app ? [...app.templates.map((t) => `email:template:${t}`), 'email:status'] : []
+      keyScopes.replaceChildren(...scopes.map((scope) => {
+        const cb = h('input', { type: 'checkbox', value: scope, checked: true }) as HTMLInputElement
+        return h('label', { className: 'admin-scope' }, cb, ` ${scope}`)
+      }))
+    }
+    keyApp.onchange = drawKeyScopes
+    drawKeyScopes()
+    const keyForm = h('form', { className: 'org-form' },
+      h('div', { className: 'field' }, h('label', { htmlFor: 'key-app' }, 'App'), keyApp),
+      h('div', { className: 'field' }, h('label', { htmlFor: 'key-expires' }, 'Expires in (days, 1 to 365)'), keyExpires),
+      h('div', { className: 'field' }, h('label', { htmlFor: 'key-limit' }, 'Daily limit (1 to 10000)'), keyLimit),
+      h('div', { className: 'field' }, h('label', {}, 'Scopes'), keyScopes),
+      keyFormError,
+      h('button', { type: 'submit', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, 'Create integration key')))
+    keyForm.onsubmit = async (e) => {
+      e.preventDefault()
+      keyFormError.replaceChildren()
+      const expires = Number(keyExpires.value)
+      const limit = Number(keyLimit.value)
+      if (!Number.isInteger(expires) || expires < 1 || expires > 365 || !Number.isInteger(limit) || limit < 1 || limit > 10000) {
+        keyFormError.replaceChildren(h('span', {}, 'Expiry must be 1 to 365 days and the daily limit 1 to 10000.'))
+        return
+      }
+      const scopes = [...keyScopes.querySelectorAll('input:checked')].map((cb) => (cb as HTMLInputElement).value)
+      if (!scopes.length) {
+        keyFormError.replaceChildren(h('span', {}, 'Pick at least one scope.'))
+        return
+      }
+      try {
+        const created = await api<{ key_id: string; app: string; secret: string; expires_at: string; daily_limit: number; scopes: string[] }>('/api/v1/admin/integration-keys', {
+          method: 'POST',
+          body: JSON.stringify({ app: keyApp.value, expires_days: expires, daily_limit: limit, scopes }),
+        })
+        keyForm.hidden = true
+        keySecret.hidden = false
+        const secretInput = h('input', { type: 'text', readonly: true, value: created.secret, autocomplete: 'off', spellcheck: false, 'aria-label': 'New integration key secret' }) as HTMLInputElement
+        secretInput.onclick = () => secretInput.select()
+        keySecret.replaceChildren(
+          h('p', {}, 'Key created. Copy the secret now, it will never be shown again.'),
+          h('div', { className: 'admin-secret-row' }, secretInput,
+            btn('btn btn-ghost btn-sm', 'Copy', undefined, { onclick: async () => { try { await navigator.clipboard.writeText(created.secret); toast('Secret copied.') } catch { toast('Copy failed. Select the secret and copy it by hand.') } } })),
+          btn('btn btn-ghost btn-sm', 'Done', undefined, { onclick: () => { void renderAdmin() } }))
+      } catch (err) { keyFormError.replaceChildren(h('span', {}, adminError(err))) }
+    }
     body.replaceChildren(title, intro,
       h('div', { className: 'admin-stats' },
         stat('Users', String(s.users.total)),
@@ -2519,8 +2582,8 @@ async function renderAdmin() {
         h('p', { className: 'muted' }, `Last 24h: ${countsText(t24)}`),
         h('p', { className: 'muted' }, `Last 7 days: ${countsText(s.delivery.transactional_last_7d)}`),
         table(['App', 'Accepted', 'Failed', 'Sending', 'Unknown'], perAppRows.length ? perAppRows : [['—', '0', '0', '0', '0']]),
-        table(['Time', 'App', 'Template', 'Status', 'Provider id'], s.delivery.transactional_recent.map((r) => [
-          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—',
+        table(['Time', 'App', 'Template', 'Status', 'Provider id', 'Error'], s.delivery.transactional_recent.map((r) => [
+          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—', r.error_message ?? '—',
         ])),
         table(['App', 'Status', 'Daily limit', 'Last used', 'Expires', 'Actions'], s.delivery.integration_keys.map((k) => [
           k.app_id, k.status, String(k.daily_send_limit), k.last_used_at ? fmtDate(k.last_used_at) : '—', k.expires_at ? fmtDate(k.expires_at) : '—',
@@ -2529,7 +2592,11 @@ async function renderAdmin() {
               [`Revoke the ${k.app_id} key?`, 'Apps using this key stop authenticating at once.', 'Revoke key'],
               `/api/v1/admin/integration-keys/${k.key_id}/revoke`, `Key revoked for ${k.app_id}`) })
             : h('span', { className: 'muted' }, '—'),
-        ]))),
+        ])),
+        h('p', { className: 'muted' }, 'Setup guide for companion apps: ', h('a', { href: 'https://github.com/Urdemonlord/irisproject/blob/main/docs/INTEGRATIONS.md', target: '_blank', rel: 'noopener' }, 'Integration docs')),
+        h('p', {}, 'Create an integration key for a companion app. The secret is shown once, copy it before you press Done.'),
+        keyForm,
+        keySecret),
       section('Temp inboxes', `${s.temp_inboxes.created_last_24h} created in the last 24 hours.`,
         table(['Status', 'Inboxes', 'Messages', 'Bytes'], Object.entries(s.temp_inboxes.by_status)
           .sort(([a], [b]) => a.localeCompare(b))

@@ -776,3 +776,10 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .admin-table th { font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-text-secondary); white-space: nowrap; }
 .admin-table td { font-variant-numeric: tabular-nums; }
 .admin-actions { display: inline-flex; flex-wrap: wrap; gap: var(--iris-space-2); }
+.admin-scopes { display: flex; flex-wrap: wrap; gap: var(--iris-space-2) var(--iris-space-4); }
+.admin-scope { display: inline-flex; align-items: center; gap: 6px; font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); cursor: pointer; }
+.admin-scope input { width: 16px; height: 16px; accent-color: var(--iris-ink); }
+.admin-secret { display: flex; flex-direction: column; gap: var(--iris-space-3); }
+.admin-secret[hidden] { display: none; }
+.admin-secret-row { display: flex; gap: var(--iris-space-2); align-items: center; }
+.admin-secret-row input { flex: 1; height: 42px; padding: 0 var(--iris-space-3); border: 1.5px solid var(--iris-stone); border-radius: var(--iris-radius-1); background: var(--iris-cream-raised); color: var(--iris-text); font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); }

@@ -15,7 +15,8 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - **Temporary inboxes** — anonymous, receive-only addresses that live 1 hour,
   no sign-up. Web UI: `/#/temp`.
 - **Transactional email API** — scoped API keys let your own apps send
-  auth emails (verify, password reset, sign-in link) through IRIS.
+  auth emails (verify, password reset, sign-in link) through IRIS
+  (see [`docs/INTEGRATIONS.md`](docs/INTEGRATIONS.md)).
 - **Separate HTML-mail origin** — HTML bodies can render in an isolated
   origin behind one-time tokens instead of the app origin (see
   [`docs/separate-mail-origin.md`](docs/separate-mail-origin.md)).
@@ -30,6 +31,7 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - [IPD](docs/06-IPD.md) — Implementation Plan
 - [Design System](docs/design.md) — UI/UX Design
 - [Production Readiness](docs/07-PRODUCTION-READINESS.md) — launch checklist + DNS status
+- [Integrations](docs/INTEGRATIONS.md): transactional email API: keys, sending, limits, troubleshooting
 - [Roadmap](ROADMAP.md) — what is built and what is planned
 
 ## Prerequisites

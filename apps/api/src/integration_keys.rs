@@ -10,7 +10,7 @@ pub(crate) fn valid_key_id(key_id: &str) -> bool {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
 }
 
-async fn issue(
+pub(crate) async fn issue(
     pool: &SqlitePool,
     app_id: &str,
     scopes_arg: &str,

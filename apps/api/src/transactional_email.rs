@@ -119,6 +119,16 @@ fn send_response(status: StatusCode, request_id: &str, delivery_status: &str) ->
         .into_response())
 }
 
+/// Cap a stored relay reason so a hostile or chatty relay cannot bloat
+/// the requests table. 500 chars is far more than any Resend message.
+fn cap_reason(reason: &str) -> String {
+    if reason.chars().count() > 500 {
+        reason.chars().take(500).collect()
+    } else {
+        reason.to_string()
+    }
+}
+
 pub async fn send(
     State(state): State<Arc<crate::AppState>>,
     headers: HeaderMap,
@@ -240,20 +250,63 @@ pub async fn send(
                 ?;
             send_response(StatusCode::ACCEPTED, &request_id, "accepted")
         }
-        Err(iris_mail::MailError::Rejected(_)) => {
+        // The relay refused the message: store its reason so the failure
+        // is diagnosable from the admin dashboard instead of a bare
+        // `failed` status with no cause.
+        Err(iris_mail::MailError::Rejected(detail)) => {
+            let reason = cap_reason(&detail);
+            tracing::warn!(
+                request_id = %request_id,
+                app_id = %principal.app_id,
+                template_id = %body.template_id,
+                reason = %reason,
+                "transactional email rejected by relay"
+            );
             sqlx::query(
-                "UPDATE integration_email_requests SET status='failed',updated_at=? WHERE id=?",
+                "UPDATE integration_email_requests SET status='failed',error_message=?,updated_at=? WHERE id=?",
             )
+            .bind(&reason)
             .bind(auth::now())
             .bind(&request_id)
             .execute(&state.pool)
             .await?;
             send_response(StatusCode::UNPROCESSABLE_ENTITY, &request_id, "failed")
         }
-        _ => {
+        Ok(_) => {
+            // The relay answered 2xx with no provider id: nothing was
+            // proven delivered, so the request stays `unknown` and the
+            // reason is stored the same way.
+            let reason = "relay returned an empty provider id";
+            tracing::warn!(
+                request_id = %request_id,
+                app_id = %principal.app_id,
+                template_id = %body.template_id,
+                reason = reason,
+                "transactional email relay returned no provider id"
+            );
             sqlx::query(
-                "UPDATE integration_email_requests SET status='unknown',updated_at=? WHERE id=?",
+                "UPDATE integration_email_requests SET status='unknown',error_message=?,updated_at=? WHERE id=?",
             )
+            .bind(reason)
+            .bind(auth::now())
+            .bind(&request_id)
+            .execute(&state.pool)
+            .await?;
+            send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
+        }
+        Err(err) => {
+            let reason = cap_reason(&err.to_string());
+            tracing::warn!(
+                request_id = %request_id,
+                app_id = %principal.app_id,
+                template_id = %body.template_id,
+                reason = %reason,
+                "transactional email relay error"
+            );
+            sqlx::query(
+                "UPDATE integration_email_requests SET status='unknown',error_message=?,updated_at=? WHERE id=?",
+            )
+            .bind(&reason)
             .bind(auth::now())
             .bind(&request_id)
             .execute(&state.pool)
@@ -411,5 +464,236 @@ mod tests {
             .expect("valid scoped key must authenticate");
         assert_eq!(principal.key_id, generated.key_id);
         assert_eq!(principal.app_id, "alpha");
+    }
+
+    /// Minimal local stand-in for the Resend relay: answers one request
+    /// with the given status line and JSON body, then closes.
+    struct FakeRelay {
+        endpoint: String,
+        task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn fake_relay(status_line: &'static str, response_body: &'static str) -> FakeRelay {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            time::{timeout, Duration},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let task = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                return;
+            };
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut expected = None;
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if expected.is_none() {
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected = Some(end + 4 + length);
+                    }
+                }
+                if expected.is_some_and(|end| bytes.len() >= end) {
+                    break;
+                }
+            }
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        FakeRelay {
+            endpoint: format!("http://{address}"),
+            task,
+        }
+    }
+
+    async fn relay_state(relay: iris_mail::ResendClient) -> (Arc<crate::AppState>, String) {
+        use iris_config::Config;
+        let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        let generated = auth::generate_api_key();
+        let expiry = (chrono::Utc::now() + chrono::Duration::days(1)).to_rfc3339();
+        sqlx::query("INSERT INTO integration_keys (key_id,app_id,token_hash,scopes_json,created_at,expires_at,daily_send_limit) VALUES (?,?,?,?,?,?,1000)")
+            .bind(&generated.key_id)
+            .bind("alpha")
+            .bind(&generated.token_hash)
+            .bind(json!(["email:template:auth.verify"]).to_string())
+            .bind(auth::now())
+            .bind(expiry)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let state = Arc::new(crate::AppState {
+            pool,
+            organize_lock: tokio::sync::Mutex::new(()),
+            jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
+            http: reqwest::Client::new(),
+            relay: Some(relay),
+            html_bodies: crate::html_body::HtmlBodyStore::new(),
+            mail_watch: crate::notify::MailWatch::from_limits(),
+            config: Config {
+                env: "test".into(),
+                host: "127.0.0.1".into(),
+                port: 8000,
+                database_url: "sqlite::memory:".into(),
+                session_secret: "test-secret".into(),
+                turnstile_secret_key: String::new(),
+                turnstile_hostnames: Vec::new(),
+                turnstile_siteverify_url: String::new(),
+                stalwart_api_url: "http://127.0.0.1:9".into(),
+                temp_inbox_domain: "example.test".into(),
+                temp_inbox_default_expiry_hours: 1,
+                temp_inbox_mail_user: String::new(),
+                temp_inbox_mail_password: String::new(),
+                send_local_domains: vec![],
+                send_external: false,
+                resend_api_key: "test-resend-key".into(),
+                integration_email_from: "no-reply@example.com".into(),
+                integration_email_enabled: true,
+                password_reset_service_token: String::new(),
+                password_reset_email_from: String::new(),
+                password_reset_email_to: String::new(),
+                password_reset_public_origin: String::new(),
+                resend_api_url: String::new(),
+                mail_content_origin: String::new(),
+                admin_emails: Vec::new(),
+            },
+        });
+        (state, generated.token)
+    }
+
+    fn send_headers(token: &str, idempotency_key: &str) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            axum::http::header::AUTHORIZATION,
+            format!("Bearer {token}").parse().unwrap(),
+        );
+        headers.insert("idempotency-key", idempotency_key.parse().unwrap());
+        headers
+    }
+
+    fn send_body() -> SendEmailBody {
+        SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://alpha.example.com/verify?token=abc".into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn relay_rejection_stores_the_reason_and_stays_failed() {
+        let relay = fake_relay(
+            "400 Bad Request",
+            r#"{"message":"recipient address rejected"}"#,
+        )
+        .await;
+        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
+            "test-key".into(),
+            relay.endpoint.clone(),
+        ))
+        .await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "rej-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a relay rejection answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        relay.task.abort();
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='rej-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1.as_deref(), Some("recipient address rejected"));
+    }
+
+    #[tokio::test]
+    async fn relay_error_stores_the_reason_and_stays_unknown() {
+        let relay = fake_relay(
+            "500 Internal Server Error",
+            r#"{"message":"relay exploded"}"#,
+        )
+        .await;
+        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
+            "test-key".into(),
+            relay.endpoint.clone(),
+        ))
+        .await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "unk-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a relay error answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        relay.task.abort();
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='unk-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "unknown");
+        // The relay formats the Resend message value as JSON, so the
+        // stored reason keeps its quotes.
+        assert_eq!(
+            row.1.as_deref(),
+            Some("mail server unavailable: relay HTTP 500: \"relay exploded\"")
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_provider_id_stores_a_reason_and_stays_unknown() {
+        let relay = fake_relay("200 OK", r#"{"id":""}"#).await;
+        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
+            "test-key".into(),
+            relay.endpoint.clone(),
+        ))
+        .await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "empty-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("an empty provider id answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        relay.task.abort();
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='empty-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "unknown");
+        assert_eq!(
+            row.1.as_deref(),
+            Some("relay returned an empty provider id")
+        );
     }
 }

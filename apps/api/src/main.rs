@@ -218,6 +218,10 @@ async fn main() {
             post(admin::revoke_integration_key),
         )
         .route(
+            "/api/v1/admin/integration-keys",
+            post(admin::create_integration_key),
+        )
+        .route(
             "/api/v1/admin/temp-inboxes/:id/delete",
             post(admin::delete_temp_inbox),
         )
