@@ -140,6 +140,7 @@ mod tests {
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,
+            registry: tokio::sync::RwLock::new(crate::integration_apps::default_registry()),
             html_bodies: crate::html_body::HtmlBodyStore::new(),
             mail_watch: crate::notify::MailWatch::from_limits(),
             config: iris_config::Config {

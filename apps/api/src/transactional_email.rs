@@ -63,11 +63,7 @@ async fn authenticate(
     })
 }
 
-fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
-    let Some(app) = crate::integration_apps::app(app_id) else {
-        return false;
-    };
-
+fn action_url_allowed(app: &crate::integration_apps::IntegrationApp, raw_url: &str) -> bool {
     let Ok(url) = reqwest::Url::parse(raw_url) else {
         return false;
     };
@@ -80,19 +76,16 @@ fn action_url_allowed(app_id: &str, raw_url: &str) -> bool {
 }
 
 fn render_message(
-    app_id: &str,
+    app: &crate::integration_apps::IntegrationApp,
     template_id: &str,
     recipient: &str,
     action_url: &str,
 ) -> Result<iris_mail::Compose, &'static str> {
-    if !crate::email_address::valid_email_address(recipient)
-        || !action_url_allowed(app_id, action_url)
+    if !crate::email_address::valid_email_address(recipient) || !action_url_allowed(app, action_url)
     {
         return Err("invalid request");
     }
-    let Some(template) =
-        crate::integration_apps::app(app_id).and_then(|app| app.template(template_id))
-    else {
+    let Some(template) = app.template(template_id) else {
         return Err("unknown template");
     };
     Ok(iris_mail::Compose {
@@ -162,12 +155,16 @@ pub async fn send(
             StatusCode::BAD_REQUEST,
             "invalid_idempotency_key",
         ))?;
-    let mut message = render_message(
-        &principal.app_id,
-        &body.template_id,
-        &body.recipient,
-        &body.action_url,
-    )
+    let mut message = {
+        // The app behind the key, from the live registry: an app
+        // deleted from the dashboard after the key was issued can no
+        // longer send, instead of falling back to a stale registry.
+        let apps = state.registry.read().await;
+        let Some(app) = crate::integration_apps::app(&apps, &principal.app_id) else {
+            return Err(crate::ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+        };
+        render_message(&app, &body.template_id, &body.recipient, &body.action_url)
+    }
     .map_err(|_| crate::ApiError(StatusCode::BAD_REQUEST, "invalid_request"))?;
     message.from = state.config.integration_email_from.clone();
 
@@ -347,52 +344,54 @@ mod tests {
 
     #[test]
     fn action_urls_are_restricted_to_the_exact_https_origin_for_each_app() {
+        let apps = crate::integration_apps::default_registry();
+        let alpha = crate::integration_apps::app(&apps, "alpha").unwrap();
+        let beta = crate::integration_apps::app(&apps, "beta").unwrap();
+        let gamma = crate::integration_apps::app(&apps, "gamma").unwrap();
         assert!(action_url_allowed(
-            "alpha",
+            &alpha,
             "https://alpha.example.com/verify?token=abc"
         ));
         assert!(action_url_allowed(
-            "beta",
+            &beta,
             "https://beta.example.com/masuk#token=abc"
         ));
         assert!(!action_url_allowed(
-            "alpha",
+            &alpha,
             "https://beta.example.com/verify?token=abc"
         ));
         assert!(!action_url_allowed(
-            "alpha",
+            &alpha,
             "http://alpha.example.com/verify?token=abc"
         ));
         assert!(!action_url_allowed(
-            "alpha",
+            &alpha,
             "https://alpha.example.com.attacker.invalid/verify"
         ));
         assert!(!action_url_allowed(
-            "alpha",
+            &alpha,
             "https://alpha.example.com@attacker.invalid/verify"
         ));
         assert!(!action_url_allowed(
-            "alpha",
+            &alpha,
             "https://alpha.example.com:8443/verify"
         ));
-        assert!(!action_url_allowed(
-            "unknown",
-            "https://alpha.example.com/verify"
-        ));
         assert!(action_url_allowed(
-            "gamma",
+            &gamma,
             "https://gamma.example.com/reset-sandi/?token=abc"
         ));
         assert!(!action_url_allowed(
-            "gamma",
+            &gamma,
             "https://alpha.example.com/reset-sandi/?token=abc"
         ));
     }
 
     #[test]
     fn renders_only_registered_auth_templates_for_the_owning_app() {
+        let apps = crate::integration_apps::default_registry();
+        let alpha = crate::integration_apps::app(&apps, "alpha").unwrap();
         let message = render_message(
-            "alpha",
+            &alpha,
             "auth.verify",
             "user@example.test",
             "https://alpha.example.com/verify?token=abc",
@@ -405,7 +404,7 @@ mod tests {
             .contains("https://alpha.example.com/verify?token=abc"));
 
         assert!(render_message(
-            "alpha",
+            &alpha,
             "auth.login_link",
             "user@example.test",
             "https://alpha.example.com/verify?token=abc",
@@ -434,8 +433,10 @@ mod tests {
 
     #[test]
     fn rejects_header_injection_in_recipient() {
+        let apps = crate::integration_apps::default_registry();
+        let alpha = crate::integration_apps::app(&apps, "alpha").unwrap();
         assert!(render_message(
-            "alpha",
+            &alpha,
             "auth.verify",
             "user@example.test\r\nBcc: attacker@example.test",
             "https://alpha.example.com/verify?token=abc",
@@ -471,6 +472,77 @@ mod tests {
     struct FakeRelay {
         endpoint: String,
         task: tokio::task::JoinHandle<()>,
+    }
+
+    /// Like `fake_relay`, but keeps the raw request bytes the relay
+    /// received, so a test can prove which subject and body the send
+    /// path actually rendered.
+    struct CapturingRelay {
+        endpoint: String,
+        task: tokio::task::JoinHandle<()>,
+        captured: std::sync::Arc<std::sync::Mutex<Vec<u8>>>,
+    }
+
+    async fn fake_relay_capturing(
+        status_line: &'static str,
+        response_body: &'static str,
+    ) -> CapturingRelay {
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+            time::{timeout, Duration},
+        };
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let captured = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let captured_in_task = captured.clone();
+        let task = tokio::spawn(async move {
+            let Ok(Ok((mut stream, _))) = timeout(Duration::from_secs(5), listener.accept()).await
+            else {
+                return;
+            };
+            let mut bytes = Vec::new();
+            let mut chunk = [0u8; 1024];
+            let mut expected = None;
+            loop {
+                let Ok(n) = stream.read(&mut chunk).await else {
+                    return;
+                };
+                if n == 0 {
+                    return;
+                }
+                bytes.extend_from_slice(&chunk[..n]);
+                if expected.is_none() {
+                    if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let headers = String::from_utf8_lossy(&bytes[..end]);
+                        let length = headers
+                            .lines()
+                            .find_map(|line| {
+                                let (name, value) = line.split_once(':')?;
+                                name.eq_ignore_ascii_case("content-length")
+                                    .then(|| value.trim().parse::<usize>().ok())
+                                    .flatten()
+                            })
+                            .unwrap_or(0);
+                        expected = Some(end + 4 + length);
+                    }
+                }
+                if expected.is_some_and(|end| bytes.len() >= end) {
+                    break;
+                }
+            }
+            *captured_in_task.lock().unwrap() = bytes;
+            let response = format!(
+                "HTTP/1.1 {status_line}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{response_body}",
+                response_body.len(),
+            );
+            let _ = stream.write_all(response.as_bytes()).await;
+        });
+        CapturingRelay {
+            endpoint: format!("http://{address}"),
+            task,
+            captured,
+        }
     }
 
     async fn fake_relay(status_line: &'static str, response_body: &'static str) -> FakeRelay {
@@ -549,6 +621,7 @@ mod tests {
             jmap: iris_mail::JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: Some(relay),
+            registry: tokio::sync::RwLock::new(crate::integration_apps::default_registry()),
             html_bodies: crate::html_body::HtmlBodyStore::new(),
             mail_watch: crate::notify::MailWatch::from_limits(),
             config: Config {
@@ -665,6 +738,81 @@ mod tests {
             row.1.as_deref(),
             Some("mail server unavailable: relay HTTP 500: \"relay exploded\"")
         );
+    }
+
+    #[tokio::test]
+    async fn send_uses_a_database_registered_app_host_and_template() {
+        // The app exists only in the database (registered from the
+        // dashboard), never in the env seed or the example registry.
+        let relay = fake_relay_capturing("200 OK", r#"{"id":"prov-1"}"#).await;
+        let (state, _) = relay_state(iris_mail::ResendClient::with_endpoint(
+            "test-key".into(),
+            relay.endpoint.clone(),
+        ))
+        .await;
+        let now = auth::now();
+        sqlx::query("INSERT INTO integration_apps (id, host, created_at) VALUES ('dbapp','dbapp.example.com',?)")
+            .bind(&now).execute(&state.pool).await.unwrap();
+        sqlx::query("INSERT INTO integration_app_templates (app_id, template_id, subject, intro, closing) VALUES ('dbapp','auth.verify','Verify via DB App','Open this link to verify.','Ignore this if it was not you.')")
+            .execute(&state.pool).await.unwrap();
+        *state.registry.write().await = crate::integration_apps::load_apps(&state.pool)
+            .await
+            .unwrap();
+        let apps = state.registry.read().await.clone();
+        let generated = crate::integration_keys::issue(
+            &state.pool,
+            &apps,
+            "dbapp",
+            "email:template:auth.verify,email:status",
+            30,
+            1000,
+        )
+        .await
+        .expect("a key for the database app must be mintable");
+        let headers = send_headers(&generated.token, "db-001");
+        let body = SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://dbapp.example.com/verify?token=abc".into(),
+        };
+        let resp = send(State(state.clone()), headers, Json(body))
+            .await
+            .expect("the send answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        relay.task.abort();
+        // The relay received the database app's template, not the
+        // example registry's wording: its host rule accepted the
+        // dbapp host, and the rendered subject and intro are the
+        // ones stored in the database.
+        let raw = relay.captured.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("Verify via DB App"));
+        assert!(text.contains("Open this link to verify."));
+        assert!(text.contains("https://dbapp.example.com/verify?token=abc"));
+        let row: (String, Option<String>) = sqlx::query_as(
+            "SELECT status, provider_message_id FROM integration_email_requests WHERE idempotency_key='db-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "accepted");
+        assert_eq!(row.1.as_deref(), Some("prov-1"));
+        // And the same send to the example host is refused for this
+        // app: the host rule follows the database row.
+        let body = SendEmailBody {
+            template_id: "auth.verify".into(),
+            recipient: "user@example.test".into(),
+            action_url: "https://alpha.example.com/verify?token=abc".into(),
+        };
+        let err = send(
+            State(state.clone()),
+            send_headers(&generated.token, "db-002"),
+            Json(body),
+        )
+        .await
+        .expect_err("a send to another app's host must be refused");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid_request");
     }
 
     #[tokio::test]

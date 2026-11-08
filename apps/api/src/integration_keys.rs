@@ -1,4 +1,4 @@
-use crate::integration_apps::scope_allowed;
+use crate::integration_apps::{scope_allowed, IntegrationApp};
 use iris_auth as auth;
 use sqlx::SqlitePool;
 
@@ -12,12 +12,13 @@ pub(crate) fn valid_key_id(key_id: &str) -> bool {
 
 pub(crate) async fn issue(
     pool: &SqlitePool,
+    apps: &[IntegrationApp],
     app_id: &str,
     scopes_arg: &str,
     expires_days: u32,
     daily_limit: u32,
 ) -> Result<auth::GeneratedApiKey, &'static str> {
-    if crate::integration_apps::app(app_id).is_none() {
+    if crate::integration_apps::app(apps, app_id).is_none() {
         return Err("unsupported_app");
     }
     if !(1..=365).contains(&expires_days) || !(1..=10_000).contains(&daily_limit) {
@@ -26,7 +27,9 @@ pub(crate) async fn issue(
     let scopes: Vec<&str> = scopes_arg.split(',').collect();
     if scopes.is_empty()
         || scopes.len() > 4
-        || scopes.iter().any(|scope| !scope_allowed(app_id, scope))
+        || scopes
+            .iter()
+            .any(|scope| !scope_allowed(apps, app_id, scope))
         || scopes
             .iter()
             .collect::<std::collections::HashSet<_>>()
@@ -83,11 +86,17 @@ pub(crate) async fn revoke(pool: &SqlitePool, key_id: &str) -> Result<(), &'stat
 
 /// Local operator command: returns a new plaintext token exactly once to the caller.
 pub(crate) async fn run(pool: &SqlitePool, args: &[String]) -> Result<String, String> {
+    // The CLI reads the same database registry the server seeds and
+    // the dashboard manages, so a key minted here works for apps
+    // registered from the dashboard too.
+    let apps = crate::integration_apps::load_apps(pool)
+        .await
+        .map_err(|err| err.to_string())?;
     match args {
         [action, app_id, days, limit, scopes] if action == "create" => {
             let expires_days = days.parse().map_err(|_| "invalid_limits".to_string())?;
             let daily_limit = limit.parse().map_err(|_| "invalid_limits".to_string())?;
-            let generated = issue(pool, app_id, scopes, expires_days, daily_limit)
+            let generated = issue(pool, &apps, app_id, scopes, expires_days, daily_limit)
                 .await
                 .map_err(|err| err.to_string())?;
             Ok(format!("key_id={}\ntoken={}\n", generated.key_id, generated.token))
@@ -98,7 +107,7 @@ pub(crate) async fn run(pool: &SqlitePool, args: &[String]) -> Result<String, St
         }
         _ => Err(format!(
             "usage: integration-key create <{}> <expires-days> <daily-limit> <comma-separated-scopes> | integration-key revoke <key-id>",
-            crate::integration_apps::app_id_choices()
+            crate::integration_apps::app_id_choices(&apps)
         )),
     }
 }
@@ -110,8 +119,10 @@ mod tests {
     #[tokio::test]
     async fn creates_and_revokes_an_app_scoped_key_without_storing_plaintext() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        let apps = crate::integration_apps::default_registry();
         let generated = issue(
             &pool,
+            &apps,
             "alpha",
             "email:template:auth.verify,email:status",
             30,
@@ -150,23 +161,45 @@ mod tests {
     #[tokio::test]
     async fn rejects_cross_app_scopes_and_unbounded_limits() {
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
+        let apps = crate::integration_apps::default_registry();
         assert_eq!(
-            issue(&pool, "beta", "email:template:auth.verify", 30, 10)
+            issue(&pool, &apps, "beta", "email:template:auth.verify", 30, 10)
                 .await
                 .err(),
             Some("invalid_scopes")
         );
         assert_eq!(
-            issue(&pool, "alpha", "email:template:auth.verify", 366, 10)
+            issue(&pool, &apps, "alpha", "email:template:auth.verify", 366, 10)
                 .await
                 .err(),
             Some("invalid_limits")
         );
         assert_eq!(
-            issue(&pool, "alpha", "email:template:auth.verify", 30, 10_001)
-                .await
-                .err(),
+            issue(
+                &pool,
+                &apps,
+                "alpha",
+                "email:template:auth.verify",
+                30,
+                10_001
+            )
+            .await
+            .err(),
             Some("invalid_limits")
+        );
+        // An app that is not in the registry at all cannot get a key.
+        assert_eq!(
+            issue(
+                &pool,
+                &apps,
+                "nosuchapp",
+                "email:template:auth.verify",
+                30,
+                10
+            )
+            .await
+            .err(),
+            Some("unsupported_app")
         );
         let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM integration_keys")
             .fetch_one(&pool)

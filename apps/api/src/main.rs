@@ -65,6 +65,11 @@ pub(crate) struct AppState {
     mail_watch: notify::MailWatch,
     /// Outbound relay for other domains (None = only local domains can be reached).
     relay: Option<ResendClient>,
+    /// Integration apps registry, loaded from the database at startup
+    /// and refreshed by the admin app endpoints after every mutation,
+    /// so the send path and key creation always see the current
+    /// registry without a restart.
+    registry: tokio::sync::RwLock<Vec<integration_apps::IntegrationApp>>,
     /// One-time HTML bodies minted for the separate mail-content origin.
     /// Process-local; entries expire after `HTML_BODY_TOKEN_TTL_SECS`.
     html_bodies: html_body::HtmlBodyStore,
@@ -160,6 +165,14 @@ async fn main() {
     let pool = iris_database::init_pool(&config.database_url)
         .await
         .expect("database");
+    // Seed the integration-apps tables from IRIS_INTEGRATION_APPS on
+    // first run (or the example registry when it is unset or invalid);
+    // a non-empty registry is never reseeded. Both the CLI below and
+    // the server read from these tables, so seeding happens first.
+    let registry_apps =
+        integration_apps::seed_registry(&pool, std::env::var("IRIS_INTEGRATION_APPS").ok())
+            .await
+            .expect("integration apps registry");
     let mut args = std::env::args().skip(1);
     let first_arg = args.next();
     if first_arg.as_deref() == Some("integration-key") {
@@ -189,6 +202,7 @@ async fn main() {
                 config.resend_api_url.clone(),
             )
         }),
+        registry: tokio::sync::RwLock::new(registry_apps),
         config: config.clone(),
     });
     if first_arg.as_deref() == Some("cleanup-once") {
@@ -220,6 +234,14 @@ async fn main() {
         .route(
             "/api/v1/admin/integration-keys",
             post(admin::create_integration_key),
+        )
+        .route(
+            "/api/v1/admin/integration-apps",
+            get(admin::list_integration_apps).post(admin::create_integration_app),
+        )
+        .route(
+            "/api/v1/admin/integration-apps/:id",
+            axum::routing::put(admin::update_integration_app).delete(admin::delete_integration_app),
         )
         .route(
             "/api/v1/admin/temp-inboxes/:id/delete",
@@ -414,7 +436,7 @@ fn valid_reset_token(token: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
 }
 
-fn valid_dns_name(name: &str) -> bool {
+pub(crate) fn valid_dns_name(name: &str) -> bool {
     if name.is_empty() || name.len() > 253 || !name.is_ascii() {
         return false;
     }
@@ -1503,6 +1525,7 @@ mod password_reset_webhook_tests {
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay,
+            registry: tokio::sync::RwLock::new(integration_apps::default_registry()),
             html_bodies: html_body::HtmlBodyStore::new(),
             mail_watch: notify::MailWatch::from_limits(),
             config: Config {
@@ -2220,6 +2243,7 @@ mod read_limit_tests {
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
             relay: None,
+            registry: tokio::sync::RwLock::new(integration_apps::default_registry()),
             html_bodies: html_body::HtmlBodyStore::new(),
             mail_watch: notify::MailWatch::from_limits(),
             config: Config {
@@ -2715,6 +2739,7 @@ mod handler_integration_tests {
             jmap: JmapClient::new(jmap.base_url.clone()),
             http: reqwest::Client::new(),
             relay,
+            registry: tokio::sync::RwLock::new(integration_apps::default_registry()),
             html_bodies: html_body::HtmlBodyStore::new(),
             mail_watch: notify::MailWatch::from_limits(),
             config: Config {

@@ -13,17 +13,33 @@ text, only as hashes, and the request body a caller sends is at most
 
 ## 1. Register your app
 
-An app must be registered before it can send anything. Registration
-is configuration, not code: set `IRIS_INTEGRATION_APPS` to a JSON
-array of `{id, host, templates: [{id, subject, intro, closing}]}`.
+An app must be registered before it can send anything. Register it
+from the admin dashboard: open the Admin page, scroll to the Delivery
+section, and use the "Integration apps" form. Fill in the app id
+(lowercase letters, digits and hyphens), the exact HTTPS host its
+links must point at, and at least one template: an id, a subject, an
+intro, and a closing. The app can send and take keys at once, no
+restart needed. Edit an app from the same form (the id itself never
+changes); delete it when it is no longer needed. Deleting is refused
+while any active key exists for the app, so revoke the keys first.
+
+Operators can also seed the registry from configuration instead:
+set `IRIS_INTEGRATION_APPS` to a JSON array of
+`{id, host, templates: [{id, subject, intro, closing}]}` before the
+first start. The tables are seeded from it only when they are empty;
+after that, the database is the source of truth and the variable is
+ignored until the tables are cleared by hand. When the variable is
+unset, IRIS seeds a built-in example registry so a fresh checkout
+works out of the box. The example apps are `alpha`
+(`alpha.example.com`, templates `auth.verify` and `auth.recovery`),
+`beta` (`beta.example.com`, template `auth.login_link`), and `gamma`
+(`gamma.example.com`, templates `auth.recovery` and
+`auth.verification`). Nothing in the example registry belongs to any
+real deployment.
+
 Each app has one exact HTTPS host its links must point at, and the
-templates it owns. When the variable is unset, IRIS uses a built-in
-example registry so a fresh checkout works out of the box. The
-example apps are `alpha` (`alpha.example.com`, templates
-`auth.verify` and `auth.recovery`), `beta` (`beta.example.com`,
-template `auth.login_link`), and `gamma` (`gamma.example.com`,
-templates `auth.recovery` and `auth.verification`). Nothing in the
-example registry belongs to any real deployment.
+templates it owns. An app may own at most 4 templates: a key holds
+at most 4 scopes, so a fifth template could never be sent with.
 
 A template renders as plain text:
 
