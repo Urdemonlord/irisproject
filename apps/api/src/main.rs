@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 mod cleanup;
 mod compose;
+mod contacts;
 mod email_address;
 mod filters;
 mod html_body;
@@ -247,6 +248,14 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/filters",
             get(filters::list).post(filters::create),
+        )
+        .route(
+            "/api/v1/contacts",
+            get(contacts::list).post(contacts::create),
+        )
+        .route(
+            "/api/v1/contacts/:contact_id",
+            axum::routing::patch(contacts::update).delete(contacts::delete),
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/filters/:filter_id",

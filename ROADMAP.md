@@ -25,6 +25,9 @@ commitment to ship it.
   server's JMAP thread ids; the list shows one row per thread
   (subject, participants, count, latest snippet) and expanding a
   thread shows its messages oldest first.
+- **Contacts** — address book with autocomplete in compose; managed on
+  the Organize page (add, edit, delete; one list per user, shared across
+  their mailboxes).
 - **Temporary inboxes** — anonymous, receive-only, 1-hour addresses;
   10 creates/hour per IP, 3 active per browser.
 - **Transactional email API** — scoped API keys for companion apps
@@ -44,13 +47,12 @@ commitment to ship it.
 
 - **Admin dashboard** — users, quotas, and delivery status in one place.
 - **Audit trail** — who did what, when, for logins, sends, and key use.
-- **Contacts** — address book with autocomplete in compose.
 - **Real-time notifications** — new mail without polling.
 - **DMARC dashboard** — aggregate DMARC reports across domains.
 - **Temp inbox extend/delete** — extend an address past 1 hour, or delete
   it early.
-- **Attachments + HTML compose + signatures** — compose with attachments,
-  rich-text mail, and per-mailbox signatures.
+- **HTML compose + signatures** — rich-text mail and per-mailbox
+  signatures (compose attachments shipped in PR #16).
 - **Multi-mailbox UI** — manage several permanent mailboxes from one login.
 - **Main-page CSP** — a strict Content-Security-Policy for the app shell
   (blocked on the inline-script refactor in `index.html`).
