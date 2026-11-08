@@ -12,6 +12,9 @@ and keeps everything on: temp inbox, admin dashboard, contacts, DMARC
 dashboard, real-time notifications. It is not Vahid's RustMailStack,
 which builds IRIS from his fork (his branding, temp inbox off).
 
+There is also a macOS tarball (Apple Silicon and Intel, no `.deb`):
+see [macOS](#macos).
+
 ## What it installs
 
 | Piece | Location | Notes |
@@ -76,6 +79,68 @@ On a system without dpkg, unpack it as root and run `./install.sh`:
 tar xzf iris-mail-stack-0.3.0.tar.gz
 cd iris-mail-stack-0.3.0
 sudo ./install.sh example.com
+```
+
+## macOS
+
+The same stack as a tarball for macOS 14 and later, Apple Silicon
+(`arm64`) and Intel (`amd64`). There is no `.deb` and no Homebrew
+formula yet; the tarball is the install.
+
+```sh
+tar xzf iris-mail-stack-0.3.0-macos-arm64.tar.gz
+cd iris-mail-stack-0.3.0-macos-arm64
+sudo ./install.sh example.com
+```
+
+Non-interactive install works the same way as on Linux:
+
+```sh
+sudo IRIS_DOMAIN=example.com IRIS_ADMIN_EMAIL=admin@example.com ./install.sh
+```
+
+The installer asks for the domain, generates all secrets, provisions
+Stalwart, and prints the admin password once (also saved to
+`/etc/iris/.admin_credentials`, mode 600). It writes the DNS records
+to publish into `/etc/iris/dns-zone.txt`.
+
+Differences from the Linux package, all forced by macOS:
+
+| Piece | Linux | macOS |
+| --- | --- | --- |
+| Services | systemd units | launchd plists in `/Library/LaunchDaemons` (`im.meowlabs.iris-*`) |
+| Installer scripts | `/usr/lib/iris` | `/usr/local/lib/iris` (`/usr/lib` is SIP-protected) |
+| Stalwart and Caddy user | dedicated `stalwart`/`caddy` users + `CAP_NET_BIND_SERVICE` | run as root: macOS has no Linux-style capability for binding ports 25/80/443 |
+| IRIS API user | `iris` | `iris`, same |
+| Service control | `systemctl status iris-api` | `launchctl print system/im.meowlabs.iris-api` |
+| Cleanup / cert-sync | systemd timers | launchd `StartInterval` (15 min) / `StartCalendarInterval` (daily 03:17) |
+| Env file loading | systemd `EnvironmentFile` | the api and cleanup jobs run through `/usr/local/lib/iris/iris-api-launch.sh`, which exports `/etc/iris/iris.env` |
+
+Everything else is the same: paths (`/etc/iris`, `/etc/stalwart`,
+`/etc/caddy`, `/srv/iris/dist`, `/var/lib/*`), the Caddyfile, the
+provisioning script (`iris-setup.py`, shared verbatim), the cert sync
+(`iris-cert-sync`, shared verbatim), and the health check
+(`iris-health`, one line adapted: macOS LibreSSL `s_client` has no
+`-brief` flag).
+
+Upgrade: unpack the new tarball and run `./install.sh` again. It
+replaces the binaries and the web app, reloads the launchd jobs, and
+restarts the three services. `/etc/iris`, `/var/lib/iris` and
+`/var/lib/stalwart` are kept.
+
+Uninstall (keeps mail and config until the last step):
+
+```sh
+for job in im.meowlabs.iris-stalwart im.meowlabs.iris-api im.meowlabs.iris-caddy im.meowlabs.iris-cleanup im.meowlabs.iris-cert-sync; do
+  sudo launchctl bootout "system/$job" 2>/dev/null || true
+done
+sudo rm /Library/LaunchDaemons/im.meowlabs.iris-*.plist
+sudo rm -rf /usr/local/bin/{iris-api,stalwart,caddy} /usr/local/sbin/{iris-health,iris-cert-sync} /usr/local/lib/iris /usr/local/share/iris /srv/iris /etc/iris /etc/stalwart /etc/caddy
+# Delete mail and data too (irreversible):
+sudo rm -rf /var/lib/iris /var/lib/stalwart /var/log/stalwart /var/lib/caddy /var/log/caddy
+sudo dscl . -delete /Users/iris; sudo dscl . -delete /Groups/iris
+sudo dscl . -delete /Users/stalwart; sudo dscl . -delete /Groups/stalwart
+sudo dscl . -delete /Users/caddy; sudo dscl . -delete /Groups/caddy
 ```
 
 ## After install
@@ -143,6 +208,21 @@ checkout (building it if needed), assembles the package tree, runs
 `build/iris-mail-stack_0.3.0_amd64.deb` and
 `build/iris-mail-stack-0.3.0.tar.gz`.
 
+macOS tarballs are built on a Mac (or a macOS CI runner), one per arch:
+
+```sh
+cd packaging/macos
+./build-macos.sh            # both archs
+./build-macos.sh --arch arm64
+```
+
+It verifies the pinned macOS tarball checksums in
+`versions-macos.env`, builds IRIS for `aarch64-apple-darwin` and
+`x86_64-apple-darwin`, assembles the trees, runs `bash -n`,
+`py_compile` and `plutil -lint`, and writes
+`build/macos/iris-mail-stack-0.3.0-macos-arm64.tar.gz` and
+`build/macos/iris-mail-stack-0.3.0-macos-amd64.tar.gz`.
+
 ## Real install test
 
 ```sh
@@ -161,6 +241,17 @@ ReadWritePaths) in the container only. The shipped units keep them.
 `tests/container-shell.sh` boots the same container for one-off
 commands when debugging the install.
 
+The macOS install is smoke-tested the same way on a GitHub macOS
+runner (`.github/workflows/package-macos.yml`): it builds both
+tarballs, installs the arm64 one with the throwaway domain
+`iris-test.local`, and runs `packaging/macos/check-macos.sh`, which
+covers services, config, login, temp inbox mail flow, and the admin
+dashboard. Run it by hand on a Mac after installing a tarball:
+
+```sh
+sudo ./packaging/macos/check-macos.sh
+```
+
 ## Releasing
 
 The package lives in `packaging/` of this repo and its version follows
@@ -170,3 +261,7 @@ uploaded as `install.sh` (the README one-liner fetches that name).
 To release: tag the IRIS version, build from that tag with
 `packaging/build.sh`, then upload the three assets to the release.
 Bump `packaging/VERSION` together with the tag.
+
+The macOS tarballs ride the same release: build them from the tag with
+`packaging/macos/build-macos.sh` (or take them from the `macOS
+package` workflow run for the tag) and upload both to the release.

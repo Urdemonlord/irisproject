@@ -1,0 +1,39 @@
+#!/bin/sh
+# iris-health - check the whole IRIS stack. Exit 0 when every check passes.
+# macOS adaptation of the Linux iris-health: identical checks, except the
+# TLS check uses "Verify return code: 0" instead of s_client -brief,
+# which macOS LibreSSL does not support.
+set -u
+fail=0
+# A check retries briefly: a service that just started is not
+# unhealthy, it is starting. Stalwart takes about 6s to bind its
+# listeners after a (re)start, so a point-in-time probe right after a
+# restart would false-alarm without this grace period.
+check() {
+  desc="$1"; shift
+  i=0
+  while [ "$i" -lt 8 ]; do
+    if "$@" >/dev/null 2>&1; then
+      echo "ok   $desc"
+      return 0
+    fi
+    i=$((i + 1))
+    [ "$i" -lt 8 ] && sleep 2
+  done
+  echo "FAIL $desc"
+  fail=1
+}
+mail_host=""
+if [ -f /etc/caddy/Caddyfile ]; then
+  mail_host=$(sed -n 's/^\([a-z0-9.-]*\) {$/\1/p' /etc/caddy/Caddyfile | head -1)
+fi
+check "stalwart JMAP answers" curl -fsS -m 5 http://127.0.0.1:8080/jmap/session
+check "iris-api /health" curl -fsS -m 5 http://127.0.0.1:8000/health
+check "iris-api /ready" curl -fsS -m 5 http://127.0.0.1:8000/ready
+if [ -n "$mail_host" ]; then
+  check "caddy serves the web UI at $mail_host" curl -fsS -m 5 --resolve "$mail_host:443:127.0.0.1" "https://$mail_host/"
+  check "TLS certificate for $mail_host" sh -c "openssl s_client -connect 127.0.0.1:443 -servername $mail_host </dev/null 2>/dev/null | grep -q 'Verify return code: 0'"
+else
+  check "caddy serves the web UI" curl -fsS -m 5 -k https://127.0.0.1/
+fi
+exit $fail
