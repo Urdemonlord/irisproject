@@ -434,9 +434,12 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
 .legal { width: 100%; max-width: 720px; margin: 0 auto; padding: var(--iris-space-12) var(--iris-space-6) var(--iris-space-16); flex: 1; }
 .legal h1 { font-family: var(--iris-font-display); font-weight: 900; font-size: var(--iris-text-h1); line-height: 1; letter-spacing: var(--iris-tracking-display); margin: var(--iris-space-2) 0 var(--iris-space-4); }
 .legal h2 { font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-h4); letter-spacing: var(--iris-tracking-display); margin: var(--iris-space-10) 0 var(--iris-space-3); scroll-margin-top: var(--iris-space-6); }
+.legal h3 { font-family: var(--iris-font-display); font-weight: 800; font-size: var(--iris-text-read); letter-spacing: var(--iris-tracking-display); margin: var(--iris-space-8) 0 var(--iris-space-2); scroll-margin-top: var(--iris-space-6); }
+.legal pre { white-space: pre; overflow-x: auto; font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); line-height: 1.5; background: #fff; border: var(--iris-rule-hair); padding: var(--iris-space-3); margin: var(--iris-space-3) 0; }
+.legal pre code { font-size: 1em; }
 .legal p, .legal li { font-size: var(--iris-text-read); line-height: var(--iris-leading-read); color: var(--iris-text); }
 .legal p + p { margin-top: var(--iris-space-3); }
-.legal ul { padding-left: 1.25em; margin: var(--iris-space-3) 0; }
+.legal ul, .legal ol { padding-left: 1.25em; margin: var(--iris-space-3) 0; }
 .legal a { color: var(--iris-vermilion); }
 .legal table { width: 100%; border-collapse: collapse; margin: var(--iris-space-4) 0; font-size: var(--iris-text-sm); }
 .legal th, .legal td { text-align: left; padding: var(--iris-space-2) var(--iris-space-3) var(--iris-space-2) 0; border-bottom: var(--iris-rule-hair); vertical-align: top; }
