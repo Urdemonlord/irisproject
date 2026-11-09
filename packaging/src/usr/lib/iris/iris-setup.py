@@ -119,25 +119,37 @@ def main():
     call("x:Action/set", {"create": {"a1": {"@type": "ReloadTlsCertificates"}}})
     print(f"iris-setup: TLS certificate {cert_id} (files in /etc/stalwart/tls)")
 
-    # 7. Listeners: Stalwart creates a default set at the first normal
-    # start (smtp 25, submissions 465, imaps 993, pop3s 995, sieve 4190,
-    # https 443, http 8080), all bound to every interface. The https
-    # listener on 443 collides with Caddy, which owns 443 on this host:
-    # Stalwart wins the bind and answers HTTPS with its own self-signed
-    # certificate, so the web UI never loads (CI run 42540266525: curl
-    # got a 302 to /account from Stalwart, not the IRIS page). Creating
-    # any listener here suppresses the default set, so create exactly
-    # the two IRIS needs: SMTP on 25 for inbound mail, and the
-    # management/JMAP HTTP listener restricted to loopback. No IMAP,
-    # POP3, submission, Sieve, or HTTPS listener: IRIS clients use the
-    # web UI and the API, never Stalwart directly.
-    call("x:NetworkListener/set", {"create": {
-        "l-smtp": {"name": "smtp", "protocol": "smtp",
-                   "bind": {"[::]:25": True}},
-        "l-http": {"name": "http", "protocol": "http",
-                   "bind": {"127.0.0.1:8080": True},
-                   "implicitTls": False},
-    }})
+    # 7. Listeners: Stalwart creates its default listener set at the
+    # first start, even in recovery mode (smtp 25, submissions 465,
+    # imaps 993, pop3s 995, sieve 4190, https 443, http 8080), all
+    # bound to every interface. The https listener on 443 collides
+    # with Caddy, which owns 443 on this host: Stalwart wins the bind
+    # and answers HTTPS with its own self-signed certificate, so the
+    # web UI never loads (CI run 42540266525: curl got a 302 to
+    # /account from Stalwart, not the IRIS page). So the defaults must
+    # be edited, not created (creating smtp/http fails with
+    # primaryKeyViolation because they already exist): rebind the
+    # management/JMAP HTTP listener to loopback only, delete the ones
+    # IRIS never uses, and leave smtp on 25 for inbound mail. No
+    # IMAP, POP3, submission, Sieve, or HTTPS listener: IRIS clients
+    # use the web UI and the API, never Stalwart directly.
+    res = call("x:NetworkListener/get", {"properties": ["name"]})
+    by_name = {o["name"]: o["id"] for o in res.get("list", [])}
+    if "http" in by_name:
+        call("x:NetworkListener/set", {"update": {
+            by_name["http"]: {"bind": {"127.0.0.1:8080": True}}}})
+    else:
+        call("x:NetworkListener/set", {"create": {"l-http": {
+            "name": "http", "protocol": "http",
+            "bind": {"127.0.0.1:8080": True}, "implicitTls": False}}})
+    gone = [by_name[n] for n in
+            ("submissions", "imaps", "pop3s", "sieve", "https")
+            if n in by_name]
+    if gone:
+        call("x:NetworkListener/set", {"destroy": gone})
+    if "smtp" not in by_name:
+        call("x:NetworkListener/set", {"create": {"l-smtp": {
+            "name": "smtp", "protocol": "smtp", "bind": {"[::]:25": True}}}})
     print("iris-setup: listeners smtp [::]:25, http 127.0.0.1:8080 "
           "(no 443/465/993/995/4190: Caddy owns 443, IRIS needs no IMAP/POP3)")
 
