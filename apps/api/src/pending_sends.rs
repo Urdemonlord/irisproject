@@ -52,11 +52,17 @@ pub(crate) struct Queued {
 /// Persist a validated compose request for the undo window. The caller
 /// (the send handler) already validated the request and checked the
 /// external-sending gate; the hourly cap is enforced at dispatch time.
+/// `from` and `creds` are the sending mailbox's own address and app
+/// password, so a queued send from a linked mailbox dispatches as that
+/// mailbox even after the session that queued it is gone (the credential
+/// is sealed with the server secret alone, like the primary's).
 pub(crate) async fn queue(
     s: &AppState,
     u: &CurrentUser,
     mailbox_id: &str,
     account: &str,
+    from: &str,
+    creds: &Creds,
     body: ComposeBody,
 ) -> Result<Queued, ApiError> {
     let now = Utc::now();
@@ -72,9 +78,9 @@ pub(crate) async fn queue(
     .bind(&u.user_id)
     .bind(mailbox_id)
     .bind(account)
-    .bind(&u.email)
+    .bind(from)
     .bind(&payload)
-    .bind(auth::seal_server(&s.config.session_secret, &u.creds.pass))
+    .bind(auth::seal_server(&s.config.session_secret, &creds.pass))
     .bind(ts(send_at))
     .bind(ts(send_at + Duration::seconds(RETRY_WINDOW_SECS)))
     .bind(ts(now))
@@ -266,6 +272,10 @@ async fn deliver(s: &AppState, row: &PendingRow) -> Result<(), String> {
         mark_failed(&s.pool, id, "payload_unreadable").await;
         return Err("payload_unreadable".into());
     };
+    // The row carries the sending mailbox's own address and sealed app
+    // password (see `queue`): the sweeper rebuilds the sender from the
+    // row alone, so a linked mailbox's queued send still goes out as
+    // that mailbox. No session exists here, hence the empty session fields.
     let user = CurrentUser {
         user_id: user_id.clone(),
         email: email.clone(),
@@ -273,8 +283,11 @@ async fn deliver(s: &AppState, row: &PendingRow) -> Result<(), String> {
             user: email.clone(),
             pass,
         },
+        session_id: String::new(),
+        session_token: String::new(),
+        mailbox_creds: Vec::new(),
     };
-    let Ok((c, draft)) = compose::build(&user, body) else {
+    let Ok((c, draft)) = compose::build(&user.email, body) else {
         mark_failed(&s.pool, id, "payload_invalid").await;
         return Err("payload_invalid".into());
     };
@@ -359,6 +372,15 @@ mod tests {
                 user: "me@x.id".into(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            mailbox_creds: vec![(
+                "mb1".to_string(),
+                Creds {
+                    user: "me@x.id".into(),
+                    pass: "secret".into(),
+                },
+            )],
         }
     }
 
@@ -500,9 +522,17 @@ mod tests {
     }
 
     async fn queued(state: &Arc<AppState>) -> Queued {
-        queue(state, &test_user(), "mb1", "acc1", body())
-            .await
-            .unwrap()
+        queue(
+            state,
+            &test_user(),
+            "mb1",
+            "acc1",
+            "me@x.id",
+            &test_user().creds,
+            body(),
+        )
+        .await
+        .unwrap()
     }
 
     async fn set_due(pool: &sqlx::SqlitePool, id: &str) {
@@ -551,15 +581,57 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queue_from_a_linked_mailbox_stores_that_mailbox() {
+        // A queued send from a linked mailbox must dispatch as that
+        // mailbox: the row carries the mailbox's address and its own
+        // app password, never the primary's.
+        let state = state_with_relay(None).await;
+        let creds = Creds {
+            user: "bob@x.id".into(),
+            pass: "app-secret-for-bob".into(),
+        };
+        let q = queue(
+            &state,
+            &test_user(),
+            "mb2",
+            "acc2",
+            "bob@x.id",
+            &creds,
+            body(),
+        )
+        .await
+        .unwrap();
+        let (email, sealed): (String, String) =
+            sqlx::query_as("SELECT email, credential_sealed FROM pending_sends WHERE id=?")
+                .bind(&q.id)
+                .fetch_one(&state.pool)
+                .await
+                .unwrap();
+        assert_eq!(email, "bob@x.id");
+        assert_eq!(
+            auth::open_server("test-secret", &sealed).as_deref(),
+            Some("app-secret-for-bob")
+        );
+    }
+
+    #[tokio::test]
     async fn queued_html_send_dispatches_as_multipart() {
         let fake = fake_relay("200 OK", r#"{"id":"resend-1"}"#).await;
         let state = state_with_relay(Some(relay_chain(&fake))).await;
         let mut html_body = body();
         html_body.html = Some("<p>Hello <b>world</b></p>".into());
         html_body.text = "Hello world".into();
-        let q = queue(&state, &test_user(), "mb1", "acc1", html_body)
-            .await
-            .unwrap();
+        let q = queue(
+            &state,
+            &test_user(),
+            "mb1",
+            "acc1",
+            "me@x.id",
+            &test_user().creds,
+            html_body,
+        )
+        .await
+        .unwrap();
         set_due(&state.pool, &q.id).await;
         sweep_once(&state).await.unwrap();
         assert_eq!(calls(&fake), 1);

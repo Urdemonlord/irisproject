@@ -4,7 +4,9 @@
 //! label name itself). Custom folders are JMAP mailboxes without a role.
 //! Only the list of label names is kept in SQLite (`mailbox_labels`), so a
 //! label with no messages still exists.
-use crate::{filters, owned_account, valid_message_id, ApiError, ApiResult, CurrentUser, S};
+use crate::{
+    filters, mailbox_creds, owned_account, valid_message_id, ApiError, ApiResult, CurrentUser, S,
+};
 use axum::{
     extract::{Path, State},
     http::StatusCode,
@@ -85,11 +87,12 @@ pub(crate) async fn set_star(
     Json(b): Json<StarBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&id)?;
     s.jmap
         .set_keyword(
-            &u.creds.user,
-            &u.creds.pass,
+            &creds.user,
+            &creds.pass,
             &account,
             &id,
             "$flagged",
@@ -160,6 +163,7 @@ pub(crate) async fn delete_label(
     Path((mailbox_id, name)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     // Held across the in-use check, the keyword clear and the row delete:
     // a filter created between the check and the delete would otherwise
     // keep pointing at a label that no longer exists.
@@ -172,7 +176,7 @@ pub(crate) async fn delete_label(
         return Err(ApiError(StatusCode::CONFLICT, "label_in_use_by_filter"));
     }
     s.jmap
-        .clear_keyword(&u.creds.user, &u.creds.pass, &account, &name)
+        .clear_keyword(&creds.user, &creds.pass, &account, &name)
         .await?;
     sqlx::query("DELETE FROM mailbox_labels WHERE mailbox_id=? AND name=?")
         .bind(&mailbox_id)
@@ -195,6 +199,7 @@ pub(crate) async fn set_message_label(
     Json(b): Json<MessageLabelBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&id)?;
     let name = clean_label(&b.label)?;
     // Serialized with `delete_label` (see `organize_lock`): adding a label
@@ -207,7 +212,7 @@ pub(crate) async fn set_message_label(
         return Err(ApiError(StatusCode::NOT_FOUND, "unknown_label"));
     }
     s.jmap
-        .set_keyword(&u.creds.user, &u.creds.pass, &account, &id, &name, b.on)
+        .set_keyword(&creds.user, &creds.pass, &account, &id, &name, b.on)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -226,11 +231,9 @@ pub(crate) async fn create_folder(
     Json(b): Json<FolderBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     let name = clean_folder_name(&b.name)?;
-    let folders = s
-        .jmap
-        .folders(&u.creds.user, &u.creds.pass, &account)
-        .await?;
+    let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
     if folders.iter().any(|f| f.name.eq_ignore_ascii_case(&name)) {
         return Err(ApiError(StatusCode::CONFLICT, "folder_exists"));
     }
@@ -239,7 +242,7 @@ pub(crate) async fn create_folder(
     }
     let id = s
         .jmap
-        .create_folder(&u.creds.user, &u.creds.pass, &account, &name)
+        .create_folder(&creds.user, &creds.pass, &account, &name)
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -255,12 +258,10 @@ pub(crate) async fn rename_folder(
     Json(b): Json<FolderBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&folder_id)?;
     let name = clean_folder_name(&b.name)?;
-    let folders = s
-        .jmap
-        .folders(&u.creds.user, &u.creds.pass, &account)
-        .await?;
+    let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
     if !folders
         .iter()
         .any(|f| f.role == CUSTOM_ROLE && f.id == folder_id)
@@ -274,7 +275,7 @@ pub(crate) async fn rename_folder(
         return Err(ApiError(StatusCode::CONFLICT, "folder_exists"));
     }
     s.jmap
-        .rename_folder(&u.creds.user, &u.creds.pass, &account, &folder_id, &name)
+        .rename_folder(&creds.user, &creds.pass, &account, &folder_id, &name)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -288,15 +289,13 @@ pub(crate) async fn delete_folder(
     Path((mailbox_id, folder_id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     // Held across the in-use check and the delete: a filter created
     // between them would otherwise keep moving mail into a folder that
     // no longer exists.
     let _guard = s.organize_lock.lock().await;
     message_id(&folder_id)?;
-    let folders = s
-        .jmap
-        .folders(&u.creds.user, &u.creds.pass, &account)
-        .await?;
+    let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
     if !folders
         .iter()
         .any(|f| f.role == CUSTOM_ROLE && f.id == folder_id)
@@ -307,7 +306,7 @@ pub(crate) async fn delete_folder(
         return Err(ApiError(StatusCode::CONFLICT, "folder_in_use_by_filter"));
     }
     s.jmap
-        .delete_folder(&u.creds.user, &u.creds.pass, &account, &folder_id)
+        .delete_folder(&creds.user, &creds.pass, &account, &folder_id)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
