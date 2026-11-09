@@ -876,7 +876,7 @@ function choiceDialog(title: string, items: { label: string; icon: string; run: 
 
 // ----- composer -----
 type ComposeAttachmentIn = { name: string; content_type: string; data: string; size: number }
-type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; inReplyTo?: string | null; references?: string[]; title?: string; attachments?: ComposeAttachmentIn[] }
+type ComposeDraft = { draftId?: string; to?: string[]; cc?: string[]; bcc?: string[]; subject?: string; text?: string; html?: string; inReplyTo?: string | null; references?: string[]; title?: string; attachments?: ComposeAttachmentIn[] }
 const MAX_COMPOSE_FILES = 5
 const MAX_COMPOSE_FILE_BYTES = 5_000_000
 const MAX_COMPOSE_TOTAL_BYTES = 10_000_000
@@ -903,6 +903,80 @@ function htmlToText(html: string) {
   return (doc.body.textContent ?? '').replace(/\n{3,}/g, '\n\n').trim()
 }
 const plainBody = (d: Detail) => (d.text_body ?? htmlToText(d.html_body ?? '')).trim()
+
+/** Plain text as simple HTML: escaped, one `<br>` per line break. */
+function textToHtml(text: string) {
+  return text.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/\n/g, '<br>')
+}
+
+type Signature = { text: string; html: string }
+const signatureCache = new Map<string, Signature>()
+async function loadSignature(base: string): Promise<Signature> {
+  const hit = signatureCache.get(base)
+  if (hit) return hit
+  try {
+    const sig = await api<Signature>(`${base}/signature`)
+    signatureCache.set(base, sig)
+    return sig
+  } catch { return { text: '', html: '' } }
+}
+
+const normWs = (s: string) => s.replace(/\s+/g, ' ').trim()
+/** Insert a signature into a fresh body, once: after the leading blank
+ * lines (the typing area) when there are any, else at the end behind a
+ * standard `-- ` divider. A body that already contains the signature
+ * (typed by hand, or reopened from a draft) is left alone. */
+function withSignature(text: string, sig: string): string {
+  const s = sig.trim()
+  if (!s || normWs(text).includes(normWs(s))) return text
+  const block = `-- \n${s}`
+  if (!text.trim()) return `\n\n${block}`
+  const lines = text.split('\n')
+  let lead = 0
+  while (lead < lines.length && lines[lead].trim() === '') lead++
+  if (lead === 0) return `${text}\n\n${block}`
+  return `${lines.slice(0, lead).join('\n')}\n${block}\n\n${lines.slice(lead).join('\n')}`
+}
+
+/** A small dependency-free rich-text editor: a contenteditable area with
+ * a formatting toolbar (bold, italic, underline, link, lists).
+ * Formatting runs through document.execCommand, which every browser
+ * still supports for these commands; the server sanitizes the HTML
+ * before it is stored or sent. Pastes land as plain text, so formatted
+ * content from elsewhere cannot smuggle in styles or tracking pixels. */
+function makeRichEditor(initialHtml: string, onInput: () => void) {
+  const ed = h('div', { className: 'compose-rich', contentEditable: 'true', ariaLabel: 'Message', spellcheck: true }) as HTMLDivElement
+  ed.innerHTML = initialHtml
+  ed.addEventListener('input', onInput)
+  ed.addEventListener('paste', (e) => {
+    e.preventDefault()
+    document.execCommand('insertText', false, e.clipboardData?.getData('text/plain') ?? '')
+  })
+  const tool = (label: string, cmd: string, arg?: string) => {
+    const b = h('button', { type: 'button', className: 'btn btn-ghost btn-sm rich-tool' }, label) as HTMLButtonElement
+    b.onclick = (e) => { e.preventDefault(); ed.focus(); document.execCommand(cmd, false, arg); onInput() }
+    return b
+  }
+  const link = h('button', { type: 'button', className: 'btn btn-ghost btn-sm rich-tool' }, 'Link') as HTMLButtonElement
+  link.onclick = async () => {
+    ed.focus()
+    await promptDialog({
+      title: 'Add link', label: 'Link address', confirm: 'Add link', hint: 'A web address or email address.',
+      submit: async (v) => {
+        const url = v.trim()
+        if (!/^(https?:\/\/|mailto:)/i.test(url)) return 'Use a web address starting with http:// or https://, or a mailto: address.'
+        document.execCommand('createLink', false, url)
+        onInput()
+        return null
+      },
+    })
+  }
+  const toolbar = h('div', { className: 'rich-toolbar', role: 'toolbar', ariaLabel: 'Formatting' },
+    tool('Bold', 'bold'), tool('Italic', 'italic'), tool('Underline', 'underline'), link,
+    tool('Bullets', 'insertUnorderedList'), tool('Numbered', 'insertOrderedList'))
+  const wrap = h('div', { className: 'rich-wrap' }, toolbar, ed)
+  return { wrap, el: ed, getHtml: () => ed.innerHTML, setHtml: (html: string) => { ed.innerHTML = html } }
+}
 
 function replyDraft(d: Detail, kind: 'reply' | 'all' | 'forward', me: string): ComposeDraft {
   const subject = d.subject || ''
@@ -1018,6 +1092,22 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   let timer = 0
   let closed = false
 
+  // The mailbox signature is appended once, at open, behind the typing
+  // area. The fetch races a short timeout so a slow server never blocks
+  // opening the composer; the cache makes later opens instant.
+  const sig = await Promise.race([
+    loadSignature(base),
+    new Promise<Signature>((r) => setTimeout(() => r({ text: '', html: '' }), 1500)),
+  ])
+  // Plain text stays the default: HTML mode opens only for a draft that
+  // already holds HTML. Switching modes converts the body in place.
+  let htmlMode = !!d.html
+  const rawText = d.text ?? ''
+  const initialText = withSignature(rawText, sig.text)
+  const sigInserted = initialText !== rawText
+  let initialHtml = d.html ?? textToHtml(initialText)
+  if (sigInserted) initialHtml = initialHtml.replace('-- <br>', '<hr>')
+
   const input = (id: string, label: string, value: string, type = 'text') => {
     const el = h('input', { id, type, value, autocomplete: type === 'email' ? 'email' : 'off', spellcheck: type !== 'email' }) as HTMLInputElement
     if (type === 'email') { el.type = 'text'; el.inputMode = 'email'; el.setAttribute('autocapitalize', 'off') }
@@ -1030,7 +1120,31 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   const cc = input('c-cc', 'Cc', (d.cc ?? []).join(', '), 'email')
   const bcc = input('c-bcc', 'Bcc', (d.bcc ?? []).join(', '), 'email')
   const subject = input('c-subject', 'Subject', d.subject ?? '')
-  const body = h('textarea', { className: 'compose-body', ariaLabel: 'Message', value: d.text ?? '', placeholder: 'Write your message…' }) as HTMLTextAreaElement
+  const body = h('textarea', { className: 'compose-body', ariaLabel: 'Message', value: initialText, placeholder: 'Write your message…' }) as HTMLTextAreaElement
+  const rich = makeRichEditor(initialHtml, () => changed())
+  const plainBtn = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', 'aria-pressed': String(!htmlMode) }, 'Plain') as HTMLButtonElement
+  const richBtn = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', 'aria-pressed': String(htmlMode) }, 'Rich') as HTMLButtonElement
+  const setMode = (richMode: boolean) => {
+    if (richMode === htmlMode) return
+    htmlMode = richMode
+    if (richMode) {
+      let html = textToHtml(body.value)
+      if (sig.text.trim() && normWs(body.value).includes(normWs(sig.text))) html = html.replace('-- <br>', '<hr>')
+      rich.setHtml(html)
+    } else {
+      body.value = htmlToText(rich.getHtml())
+    }
+    body.hidden = richMode
+    rich.wrap.hidden = !richMode
+    plainBtn.setAttribute('aria-pressed', String(!richMode))
+    richBtn.setAttribute('aria-pressed', String(richMode))
+    changed()
+  }
+  plainBtn.onclick = () => setMode(false)
+  richBtn.onclick = () => setMode(true)
+  const modeRow = h('div', { className: 'compose-mode', role: 'group', ariaLabel: 'Message format' }, plainBtn, richBtn)
+  body.hidden = htmlMode
+  rich.wrap.hidden = !htmlMode
   const showCc = !!(d.cc?.length || d.bcc?.length)
   cc.row.hidden = bcc.row.hidden = !showCc
   const ccToggle = h('button', { type: 'button', className: 'linklike cc-toggle', hidden: showCc }, 'Cc / Bcc')
@@ -1097,17 +1211,25 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
     h('header', { className: 'composer-head' }, h('h2', {}, d.title ?? 'New message'), status, closeBtn),
     h('div', { className: 'composer-fields' }, to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
     attachBox,
+    modeRow,
+    rich.wrap,
     body,
     error,
     h('footer', { className: 'composer-foot' }, send, h('span', { className: 'compose-hint' }, 'Ctrl + Enter to send'), discard))
 
-  const payload = () => ({
-    to: splitAddrs(to.el.value), cc: splitAddrs(cc.el.value), bcc: splitAddrs(bcc.el.value),
-    subject: subject.el.value.replace(/[\r\n]+/g, ' '), text: body.value,
-    in_reply_to: d.inReplyTo ?? null, references: d.references ?? [], draft_id: draftId ?? null,
-    attachments: atts.map(({ name, content_type, data }) => ({ name, content_type, data })),
-  })
-  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !body.value.trim() && !atts.length
+  /** The body text in the current mode: the editor HTML rendered as
+   * plain text, or the textarea value. */
+  const currentText = () => (htmlMode ? htmlToText(rich.getHtml()) : body.value)
+  const payload = () => {
+    const p = {
+      to: splitAddrs(to.el.value), cc: splitAddrs(cc.el.value), bcc: splitAddrs(bcc.el.value),
+      subject: subject.el.value.replace(/[\r\n]+/g, ' '), text: currentText(),
+      in_reply_to: d.inReplyTo ?? null, references: d.references ?? [], draft_id: draftId ?? null,
+      attachments: atts.map(({ name, content_type, data }) => ({ name, content_type, data })),
+    }
+    return htmlMode ? { ...p, html: rich.getHtml() } : p
+  }
+  const isEmpty = () => !to.el.value.trim() && !cc.el.value.trim() && !bcc.el.value.trim() && !subject.el.value.trim() && !currentText().trim() && !atts.length
 
   const save = async () => {
     clearTimeout(timer)
@@ -1197,8 +1319,23 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
   }
   document.addEventListener('keydown', onKey)
   document.body.append(panel)
-  ;(d.to?.length ? (d.subject ? body : subject.el) : to.el).focus()
-  if (d.to?.length && d.subject) body.setSelectionRange(0, 0)
+  const focusEl = d.to?.length ? (d.subject ? (htmlMode ? rich.el : body) : subject.el) : to.el
+  focusEl.focus()
+  // The typing area is the blank lines at the top (a reply, or a fresh
+  // message with a signature below it): start the caret there. Setting
+  // the selection now persists until the user clicks or tabs in.
+  if (initialText.startsWith('\n')) {
+    if (htmlMode) {
+      const range = document.createRange()
+      range.selectNodeContents(rich.el)
+      range.collapse(true)
+      const sel = window.getSelection()
+      sel?.removeAllRanges()
+      sel?.addRange(range)
+    } else {
+      body.setSelectionRange(0, 0)
+    }
+  }
 }
 
 // ----- mailbox view -----
@@ -1553,7 +1690,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
         const buf = await res.arrayBuffer()
         attachments.push({ name: a.name, content_type: a.content_type, data: bufToBase64(buf), size: buf.byteLength })
       }
-      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '', attachments })
+      compose({ title: 'Draft', draftId: m.id, to: d.to.map(emailOf), cc: (d.cc ?? []).map(emailOf), subject: d.subject, text: d.text_body ?? '', html: d.html_body ?? undefined, attachments })
     } catch { toast('Could not open the draft.') }
   }
 
@@ -1929,6 +2066,56 @@ async function renderOrganize() {
 
   const section = (heading: string, text: string, list: HTMLElement, ...extra: HTMLElement[]) =>
     h('section', { className: 'org-section' }, h('h2', {}, heading), h('p', { className: 'muted' }, text), list, ...extra)
+
+  // Signature: the sign-off the composer appends to new messages. The
+  // editor has the same plain/rich modes as the composer; saving one
+  // form derives the other on the server.
+  const sigText = h('textarea', { className: 'sig-text', ariaLabel: 'Signature (plain text)', placeholder: 'Best regards,\nAda' }) as HTMLTextAreaElement
+  const sigRich = makeRichEditor('', () => { sigStatus.textContent = '' })
+  let sigHtmlMode = false
+  const sigPlainBtn = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', 'aria-pressed': 'true' }, 'Plain') as HTMLButtonElement
+  const sigRichBtn = h('button', { type: 'button', className: 'btn btn-ghost btn-sm', 'aria-pressed': 'false' }, 'Rich') as HTMLButtonElement
+  const setSigMode = (richMode: boolean) => {
+    if (richMode === sigHtmlMode) return
+    sigHtmlMode = richMode
+    if (richMode) sigRich.setHtml(textToHtml(sigText.value))
+    else sigText.value = htmlToText(sigRich.getHtml())
+    sigText.hidden = richMode
+    sigRich.wrap.hidden = !richMode
+    sigPlainBtn.setAttribute('aria-pressed', String(!richMode))
+    sigRichBtn.setAttribute('aria-pressed', String(richMode))
+  }
+  sigPlainBtn.onclick = () => setSigMode(false)
+  sigRichBtn.onclick = () => setSigMode(true)
+  sigRich.wrap.hidden = true
+  const sigStatus = h('span', { className: 'compose-status' })
+  const sigError = h('div', { className: 'form-error', role: 'alert' })
+  const sigSave = h('button', { type: 'button', className: 'btn btn-primary' }, icon('plus'), h('span', { className: 'btn-label' }, 'Save signature')) as HTMLButtonElement
+  sigSave.onclick = async () => {
+    sigError.replaceChildren()
+    const restore = busy(sigSave, 'Saving…')
+    try {
+      const saved = await api<Signature>(`${base}/signature`, {
+        method: 'PUT',
+        body: JSON.stringify(sigHtmlMode ? { text: '', html: sigRich.getHtml() } : { text: sigText.value, html: '' }),
+      })
+      signatureCache.set(base, saved)
+      sigText.value = saved.text
+      sigRich.setHtml(saved.html)
+      restore()
+      sigStatus.textContent = 'Saved'
+      toast('Signature saved')
+    } catch (err) {
+      restore()
+      if ((err as HttpError).status === 401) { account = null; return renderLogin() }
+      sigError.replaceChildren(icon('alert'), h('span', {}, orgError(err)))
+    }
+  }
+  const sigModeRow = h('div', { className: 'compose-mode', role: 'group', ariaLabel: 'Signature format' }, sigPlainBtn, sigRichBtn)
+  const sigBox = h('div', { className: 'sig-editor' }, sigModeRow, sigRich.wrap, sigText, sigError)
+  const sigSection = section('Signature', 'Added automatically to new messages. You can still edit or delete it in the composer.',
+    sigBox, h('div', { className: 'org-submit' }, sigSave, sigStatus))
+
   app.className = 'app-shell'
   app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, h('div', { className: 'organize-inner' },
     h('h1', { className: 'pane-title' }, 'Organize'),
@@ -1937,12 +2124,16 @@ async function renderOrganize() {
     section('Labels', 'Tag messages without moving them. Starred is always available.', labelList,
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
     section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
-    section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm))))
+    section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm),
+    sigSection)))
   folderList.replaceChildren(skeleton(2))
   try {
-    const [, f, ct] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`), api<{ contacts: Contact[] }>('/api/v1/contacts?limit=100')])
+    const [, f, ct, sg] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`), api<{ contacts: Contact[] }>('/api/v1/contacts?limit=100'),
+      api<Signature>(`${base}/signature`).catch(() => ({ text: '', html: '' }))])
     filters = f.filters
     contacts = ct.contacts
+    sigText.value = sg.text
+    sigRich.setHtml(sg.html)
     drawFolders(); drawLabels(); drawFilters(); drawContacts()
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }

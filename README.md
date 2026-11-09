@@ -12,6 +12,9 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
   folders (Inbox, Sent, Drafts, Archive, Trash), server-side search,
   plain-text compose with autosave drafts, reply/forward, attachments,
   undo send (10 second window), raw view, and DMARC report previews.
+  Rich-text compose (bold, italic, lists, links) sends
+  multipart/alternative with a sanitized HTML part, and each mailbox
+  can have its own signature, set on the Organize page.
 - **Temporary inboxes** — anonymous, receive-only addresses that live 1 hour,
   no sign-up. Web UI: `/#/temp`.
 - **Transactional email API** — scoped API keys let your own apps send

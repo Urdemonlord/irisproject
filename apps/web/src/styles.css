@@ -600,6 +600,28 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .compose-attach-list:empty { display: none; }
 .compose-attach-list .attach-row { border-top: 0; padding: var(--iris-space-1) 0; }
 .compose-body { flex: 1; min-height: 120px; resize: none; border: 0; outline: none; padding: var(--iris-space-4); font-family: var(--iris-font-ui); font-size: var(--iris-text-read); line-height: var(--iris-leading-read); color: var(--iris-text); background: none; }
+.compose-body[hidden] { display: none; }
+/* Plain / Rich switch above the body, and the rich-text editor. The
+ * contenteditable area mirrors the textarea's type so switching modes
+ * never reflows the panel. */
+.compose-mode { display: flex; gap: var(--iris-space-1); padding: var(--iris-space-2) var(--iris-space-4) 0; }
+.compose-mode .btn-sm[aria-pressed="true"] { background: var(--iris-ink); color: var(--iris-cream); }
+.rich-wrap { display: flex; flex-direction: column; flex: 1; min-height: 0; }
+.rich-wrap[hidden] { display: none; }
+.rich-toolbar { display: flex; flex-wrap: wrap; gap: var(--iris-space-1); padding: var(--iris-space-2) var(--iris-space-4); border-top: var(--iris-rule-hair); }
+.rich-tool { font-weight: 600; }
+.compose-rich { flex: 1; min-height: 120px; overflow-y: auto; outline: none; padding: var(--iris-space-4); font-family: var(--iris-font-ui); font-size: var(--iris-text-read); line-height: var(--iris-leading-read); color: var(--iris-text); }
+.compose-rich:empty::before { content: 'Write your message…'; color: var(--iris-stone); }
+.compose-rich hr { border: 0; border-top: var(--iris-rule-hair); margin: var(--iris-space-2) 0; }
+.compose-rich a { color: var(--iris-vermilion); }
+/* Signature editor on the Organize page. */
+.sig-editor { display: flex; flex-direction: column; }
+.sig-editor .compose-mode { padding: 0 0 var(--iris-space-2); }
+.sig-editor .rich-toolbar { padding: var(--iris-space-2) 0; border-top: 0; }
+.sig-editor .compose-rich { min-height: 96px; padding: var(--iris-space-2) var(--iris-space-3); border: var(--iris-rule-hair); border-radius: var(--iris-radius-1); }
+.sig-text { width: 100%; min-height: 96px; resize: vertical; padding: var(--iris-space-2) var(--iris-space-3); border: var(--iris-rule-hair); border-radius: var(--iris-radius-1); background: none; outline: none; font-family: var(--iris-font-ui); font-size: var(--iris-text-base); line-height: var(--iris-leading-read); color: var(--iris-text); }
+.sig-text[hidden] { display: none; }
+.sig-text:focus, .sig-editor .compose-rich:focus { border-color: var(--iris-ink); }
 .composer > .form-error { margin: 0 var(--iris-space-4) var(--iris-space-2); }
 /* Contact autocomplete under a recipient field. Anchored to the row so it
  * lines up with the input, past the 56px label. */

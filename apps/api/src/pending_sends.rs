@@ -551,6 +551,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn queued_html_send_dispatches_as_multipart() {
+        let fake = fake_relay("200 OK", r#"{"id":"resend-1"}"#).await;
+        let state = state_with_relay(Some(relay_chain(&fake))).await;
+        let mut html_body = body();
+        html_body.html = Some("<p>Hello <b>world</b></p>".into());
+        html_body.text = "Hello world".into();
+        let q = queue(&state, &test_user(), "mb1", "acc1", html_body)
+            .await
+            .unwrap();
+        set_due(&state.pool, &q.id).await;
+        sweep_once(&state).await.unwrap();
+        assert_eq!(calls(&fake), 1);
+        let captured = String::from_utf8(fake.captured.lock().unwrap().clone()).unwrap();
+        assert!(
+            captured.contains("\"html\":\"<p>Hello <b>world</b></p>\""),
+            "relay got: {captured}"
+        );
+        assert!(
+            captured.contains("\"text\":\"Hello world\""),
+            "relay got: {captured}"
+        );
+        assert_eq!(row_status(&state.pool, &q.id).await, None);
+    }
+
+    #[tokio::test]
     async fn undo_within_window_cancels_and_relay_is_never_called() {
         let fake = fake_relay("200 OK", r#"{"id":"resend-1"}"#).await;
         let state = state_with_relay(Some(relay_chain(&fake))).await;

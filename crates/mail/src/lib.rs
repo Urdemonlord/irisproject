@@ -9,6 +9,7 @@ use serde_json::{json, Value};
 use thiserror::Error;
 
 pub mod dmarc;
+pub mod html;
 
 #[derive(Debug, Error)]
 pub enum MailError {
@@ -212,6 +213,11 @@ pub struct Compose {
     pub bcc: Vec<String>,
     pub subject: String,
     pub text: String,
+    /// Sanitized HTML body, if the user composed in rich-text mode.
+    /// `None` means plain text only. When present, the message is sent
+    /// as multipart/alternative (text + HTML) and the text part is
+    /// always present too.
+    pub html: Option<String>,
     pub in_reply_to: Option<String>,
     pub references: Vec<String>,
     /// Files to attach. Bytes are already validated and bounded by the API
@@ -1904,6 +1910,11 @@ fn email_json(c: &Compose, mailbox: &str, uploaded: &[UploadedAttachment]) -> Va
     if !c.bcc.is_empty() {
         e["bcc"] = json!(addrs(&c.bcc));
     }
+    if let Some(html) = &c.html {
+        // JMAP builds multipart/alternative from textBody + htmlBody.
+        e["bodyValues"]["h"] = json!({"value": html});
+        e["htmlBody"] = json!([{"partId": "h", "type": "text/html"}]);
+    }
     if let Some(r) = &c.in_reply_to {
         e["inReplyTo"] = json!([r]);
     }
@@ -1980,6 +1991,69 @@ mod tests {
         assert_eq!(atts[0]["disposition"], "attachment");
         assert_eq!(atts[1]["blobId"], "blob-2");
         assert_eq!(atts[1]["name"], "photo.png");
+    }
+
+    #[test]
+    fn email_json_emits_html_body_when_present() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            html: Some("<p><b>Body</b></p>".into()),
+            ..Default::default()
+        };
+        let e = email_json(&c, "D", &[]);
+        assert_eq!(e["bodyValues"]["b"]["value"], "Body");
+        assert_eq!(e["bodyValues"]["h"]["value"], "<p><b>Body</b></p>");
+        assert_eq!(e["htmlBody"][0]["partId"], "h");
+        assert_eq!(e["htmlBody"][0]["type"], "text/html");
+        assert_eq!(e["textBody"][0]["partId"], "b");
+    }
+
+    #[test]
+    fn email_json_has_no_html_body_without_html() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            ..Default::default()
+        };
+        let e = email_json(&c, "D", &[]);
+        assert!(e.get("htmlBody").is_none());
+        assert!(e["bodyValues"].get("h").is_none());
+    }
+
+    #[test]
+    fn relay_payloads_carry_html_when_present() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            html: Some("<p>Body</p>".into()),
+            ..Default::default()
+        };
+        let r = resend_json(&c);
+        assert_eq!(r["text"], "Body");
+        assert_eq!(r["html"], "<p>Body</p>");
+        let b = brevo_json(&c);
+        assert_eq!(b["textContent"], "Body");
+        assert_eq!(b["htmlContent"], "<p>Body</p>");
+    }
+
+    #[test]
+    fn relay_payloads_have_no_html_without_it() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            ..Default::default()
+        };
+        assert!(resend_json(&c).get("html").is_none());
+        assert!(brevo_json(&c).get("htmlContent").is_none());
     }
 
     #[test]
@@ -2362,6 +2436,9 @@ impl ResendClient {
 
 fn resend_json(c: &Compose) -> Value {
     let mut v = json!({"from": c.from, "to": c.to, "subject": c.subject, "text": c.text});
+    if let Some(html) = &c.html {
+        v["html"] = json!(html);
+    }
     if !c.cc.is_empty() {
         v["cc"] = json!(c.cc);
     }
@@ -2465,16 +2542,20 @@ impl BrevoClient {
 
 fn brevo_json(c: &Compose) -> Value {
     // Brevo takes recipient objects, not bare strings, and `sender`
-    // as an object; the body is plain text (`textContent`), since
-    // `Compose` carries no HTML. Standard headers (In-Reply-To,
-    // References) are left out: Brevo's API accepts custom headers
-    // only, so threading headers would not survive the relay.
+    // as an object; the body is plain text (`textContent`) plus HTML
+    // (`htmlContent`) when the message was composed in rich-text mode.
+    // Standard headers (In-Reply-To, References) are left out: Brevo's
+    // API accepts custom headers only, so threading headers would not
+    // survive the relay.
     let mut v = json!({
         "sender": {"email": c.from},
         "to": c.to.iter().map(|t| json!({"email": t})).collect::<Vec<_>>(),
         "subject": c.subject,
         "textContent": c.text,
     });
+    if let Some(html) = &c.html {
+        v["htmlContent"] = json!(html);
+    }
     if !c.cc.is_empty() {
         v["cc"] = json!(c.cc.iter().map(|t| json!({"email": t})).collect::<Vec<_>>());
     }

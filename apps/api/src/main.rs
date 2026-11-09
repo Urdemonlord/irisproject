@@ -40,6 +40,7 @@ mod integration_keys;
 mod notify;
 mod organize;
 mod pending_sends;
+mod signatures;
 mod temp;
 mod transactional_email;
 mod turnstile;
@@ -361,6 +362,10 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/send",
             post(compose::send).layer(DefaultBodyLimit::max(MAX_COMPOSE_JSON_BYTES)),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/signature",
+            get(signatures::get).put(signatures::set),
         )
         .route(
             "/api/v1/mailboxes/:mailbox_id/pending-sends/:id",
