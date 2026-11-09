@@ -467,6 +467,7 @@ async fn main() {
         )
         .merge(protected)
         .layer(middleware::from_fn_with_state(state.clone(), require_csrf))
+        .layer(middleware::from_fn(csp_headers))
         .with_state(state);
 
     let addr = format!("{}:{}", config.host, config.port);
@@ -616,6 +617,42 @@ async fn csrf(State(s): S, headers: HeaderMap) -> Response {
         Json(json!({ "csrf_token": token })),
     )
         .into_response()
+}
+
+/// Content-Security-Policy for every response the API serves. The app shell
+/// itself is served by the fronting web server (nginx on the VPS, Caddy in
+/// the one-package install), which must send this same header: the API
+/// never serves the shell, so it cannot vouch for it directly. No
+/// 'unsafe-inline' and no 'unsafe-eval' anywhere: the shell carries no
+/// inline script, handler or style (see apps/web/public/early.js). The hosts
+/// are the ones the shell actually loads: Turnstile (script + challenge
+/// frame) and Google Fonts (stylesheet + font files). Umami analytics is
+/// deliberately not allowlisted: its script host is deployment-specific
+/// and analytics stays off unless an operator configures it; enabling it
+/// needs its host added here and in the fronting server's header.
+/// frame-src carries 'self' for the mail body's srcdoc fallback (a srcdoc
+/// frame inherits the app origin, and without 'self' the policy would blank
+/// it). The fronting server's header must additionally allow the
+/// deployment's mail-content origin, so the separate-origin mail iframe
+/// (one-time token URL) can load: the API serves no framed document, so
+/// this const does not name that host.
+pub(crate) const CSP_HEADER_VALUE: &str = "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-src 'self' https://challenges.cloudflare.com; object-src 'none'; base-uri 'self'; form-action 'self'";
+
+/// Stamps the CSP header on API responses. The one-time HTML mail body is
+/// excluded: it is a mail document rendered on the separate mail-content
+/// origin, and this policy would strip its inline styles. (The fronting
+/// server proxies that route to the mail-content host, whose own header
+/// already governs it.)
+async fn csp_headers(req: Request, next: Next) -> Response {
+    let is_html_body = req.uri().path().ends_with("/html-body");
+    let mut res = next.run(req).await;
+    if !is_html_body {
+        res.headers_mut().insert(
+            header::CONTENT_SECURITY_POLICY,
+            axum::http::HeaderValue::from_static(CSP_HEADER_VALUE),
+        );
+    }
+    res
 }
 
 /// Unsafe methods need a matching CSRF header+cookie, unless authenticated by a bearer
@@ -2015,6 +2052,62 @@ mod password_reset_webhook_tests {
             assert_eq!(response.status(), StatusCode::ACCEPTED, "{path} must serve");
             relay.task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn csp_header_is_set_on_api_responses_but_not_on_mail_bodies() {
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        // The middleware on its own: the policy must be the strict one
+        // (no 'unsafe-inline', no 'unsafe-eval'), and the one-time HTML
+        // mail body must never carry it (it renders on the separate
+        // mail-content origin, where this policy would strip its styles).
+        let app = Router::new()
+            .route("/health", get(|| async { "OK" }))
+            .route(
+                "/api/v1/mailboxes/mb/messages/m/html-body",
+                get(|| async { "<p>mail</p>" }),
+            )
+            .layer(middleware::from_fn(csp_headers));
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        let csp = res
+            .headers()
+            .get(header::CONTENT_SECURITY_POLICY)
+            .expect("CSP header on API responses")
+            .to_str()
+            .unwrap();
+        assert_eq!(csp, CSP_HEADER_VALUE);
+        assert!(csp.contains("default-src 'self'"), "{csp}");
+        assert!(
+            csp.contains("frame-src 'self'"),
+            "the mail srcdoc fallback needs 'self' in frame-src: {csp}"
+        );
+        assert!(
+            !csp.contains("unsafe-inline") && !csp.contains("unsafe-eval"),
+            "{csp}"
+        );
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/v1/mailboxes/mb/messages/m/html-body")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            res.headers().get(header::CONTENT_SECURITY_POLICY).is_none(),
+            "the mail body must not carry the app-shell policy"
+        );
     }
 
     #[tokio::test]

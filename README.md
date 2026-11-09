@@ -28,6 +28,10 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - **Separate HTML-mail origin** — HTML bodies can render in an isolated
   origin behind one-time tokens instead of the app origin (see
   [`docs/separate-mail-origin.md`](docs/separate-mail-origin.md)).
+- **Content-Security-Policy** — the app shell ships a strict CSP header
+  (no inline script, handler or style; Turnstile and Google Fonts hosts
+  allowlisted) from the fronting server, and the API stamps the same
+  policy on its own responses.
 
 ## Documentation
 

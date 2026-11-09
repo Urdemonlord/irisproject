@@ -56,6 +56,16 @@
 		X-Frame-Options "DENY"
 		Referrer-Policy "strict-origin-when-cross-origin"
 		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		# App shell policy: no inline script, handler or style anywhere in
+		# the shell (see apps/web/public/early.js). The hosts are the ones the
+		# shell actually loads: Turnstile (script + challenge frame), Google
+		# Fonts (stylesheet + font files), and the separate mail-content
+		# origin (the one-time-token mail iframe) plus 'self' for the
+		# mail body's srcdoc fallback. Keep in sync with CSP_HEADER_VALUE
+		# in apps/api/src/main.rs, which stamps the same policy on API
+		# responses (without the content host: the API serves no framed
+		# document).
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-src 'self' https://challenges.cloudflare.com https://@CONTENT_HOST@; object-src 'none'; base-uri 'self'; form-action 'self'"
 		-Server
 	}
 }
