@@ -181,9 +181,11 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `IRIS_INTEGRATION_EMAIL_FROM` | (empty) | Fixed sender for the transactional email API; leave blank to disable |
 | `IRIS_INTEGRATION_EMAIL_ENABLED` | `false` | Explicit opt-in for integration email delivery |
 | `IRIS_INTEGRATION_APPS` | (unset) | JSON registry of apps allowed to send transactional email; when unset, a built-in example registry is used — see `apps/api/src/integration_apps.rs` |
-| `RESEND_API_KEY` | (empty) | When set, mail to other domains is relayed through Resend |
+| `RESEND_API_KEY` | (empty) | When set, mail to other domains is relayed through Resend (first in the failover chain) |
 | `IRIS_RESEND_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
-| `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus `RESEND_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
+| `BREVO_API_KEY` | (empty) | When set, Brevo is the second provider in the failover chain, tried when Resend answers with an HTTP error |
+| `IRIS_BREVO_API_URL` | (empty) | Local fake relay override; accepted only outside `production` and only on localhost |
+| `IRIS_PASSWORD_RESET_SERVICE_TOKEN`, `IRIS_PASSWORD_RESET_EMAIL_FROM`, `IRIS_PASSWORD_RESET_EMAIL_TO`, `IRIS_PASSWORD_RESET_PUBLIC_ORIGIN` | (empty) | Optional password-reset webhook for a trusted companion app; all must be set (plus a relay key, `RESEND_API_KEY` or `BREVO_API_KEY`) for the endpoint to answer. Deprecated `IRIS_TIMELESS_*` / `TIMELESS_PUBLIC_ORIGIN` names still work as fallback — see "Password-reset webhook" below |
 | `MAIL_CONTENT_ORIGIN` | (empty) | Separate origin serving HTML mail bodies (bare `https://host`, no path); empty = same-origin srcdoc frame |
 | `IRIS_ADMIN_EMAILS` | (empty) | Comma-separated emails allowed to see the read-only admin dashboard (`#/admin`); empty = nobody is an admin, every admin request answers 403 |
 
@@ -240,8 +242,8 @@ message from `IRIS_PASSWORD_RESET_EMAIL_FROM` to the fixed recipient
 `IRIS_PASSWORD_RESET_EMAIL_TO` (never taken from the request), containing
 a link to `https://<IRIS_PASSWORD_RESET_PUBLIC_ORIGIN>/admin/reset#token=<token>`.
 The endpoint answers `202 {"accepted": true}`; `401` for a wrong or
-missing bearer token, `503` while any of the four variables (or the relay,
-`RESEND_API_KEY`) is unset, `400` for a malformed token, `502` when
+missing bearer token, `503` while any of the four variables (or a relay
+key) is unset, `400` for a malformed token, `502` when
 delivery fails. It is opt-in: with any variable unset the route still
 exists but always answers `503`.
 

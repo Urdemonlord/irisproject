@@ -14,6 +14,13 @@ pub mod dmarc;
 pub enum MailError {
     #[error("mail server unavailable: {0}")]
     Unavailable(String),
+    /// The relay answered with an HTTP error (auth failure, rate
+    /// limit, server error): a definitive refusal, so another relay
+    /// may succeed. Transport errors (no HTTP response at all) stay
+    /// `Unavailable`: the outcome is unknown there, and retrying
+    /// elsewhere could double-send.
+    #[error("relay failed: {0}")]
+    RelayFailed(String),
     #[error("authentication failed")]
     Auth,
     #[error("not found")]
@@ -2337,11 +2344,9 @@ impl ResendClient {
         let v: Value = resp.json().await.unwrap_or(Value::Null);
         match status {
             200..=299 => Ok(v["id"].as_str().unwrap_or_default().to_string()),
-            401 | 403 => Err(MailError::Unavailable(format!(
-                "relay auth failed: {}",
-                v["message"]
-            ))),
-            429 | 500.. => Err(MailError::Unavailable(format!(
+            // A definitive HTTP refusal: another relay may succeed, so
+            // this maps to `RelayFailed`, not `Unavailable`.
+            401 | 403 | 429 | 500.. => Err(MailError::RelayFailed(format!(
                 "relay HTTP {status}: {}",
                 v["message"]
             ))),
@@ -2395,6 +2400,210 @@ fn resend_json(c: &Compose) -> Value {
     v
 }
 
+/// Outbound relay over Brevo's HTTP API (`POST /v3/smtp/email`), the
+/// second provider in the failover chain. Same `send` shape as
+/// `ResendClient`. Brevo's API differs in three places, all verified
+/// against the Brevo API reference
+/// (developers.brevo.com/reference/send-transac-email): auth is an
+/// `api-key` header (not Bearer), a single send answers 201 with
+/// `{"messageId": "..."}`, and the body takes `sender`/`to`/
+/// `subject`/`textContent` plus optional `cc`, `bcc`, `attachment`
+/// (`{content, name}` base64) and `headers`.
+#[derive(Clone)]
+pub struct BrevoClient {
+    api_key: String,
+    endpoint: String,
+    http: reqwest::Client,
+}
+
+impl BrevoClient {
+    pub fn new(api_key: String) -> Self {
+        Self::with_endpoint(api_key, "https://api.brevo.com/v3/smtp/email".to_string())
+    }
+
+    /// Creates a client for a configured non-production relay endpoint.
+    pub fn with_endpoint(api_key: String, endpoint: String) -> Self {
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(20))
+            .build()
+            .expect("reqwest client");
+        Self {
+            api_key,
+            endpoint,
+            http,
+        }
+    }
+
+    pub async fn send(&self, c: &Compose) -> Result<String, MailError> {
+        let resp = self
+            .http
+            .post(&self.endpoint)
+            .header("api-key", &self.api_key)
+            .json(&brevo_json(c))
+            .send()
+            .await
+            .map_err(|e| MailError::Unavailable(e.to_string()))?;
+        let status = resp.status().as_u16();
+        let v: Value = resp.json().await.unwrap_or(Value::Null);
+        match status {
+            200..=299 => Ok(v["messageId"].as_str().unwrap_or_default().to_string()),
+            // 402 is Brevo's "credits exhausted": a definitive refusal,
+            // so it fails over like 401/403/429/5xx.
+            401 | 402 | 403 | 429 | 500.. => Err(MailError::RelayFailed(format!(
+                "relay HTTP {status}: {}",
+                v["message"]
+            ))),
+            _ => Err(MailError::Rejected(
+                v["message"]
+                    .as_str()
+                    .unwrap_or("relay refused the message")
+                    .to_string(),
+            )),
+        }
+    }
+}
+
+fn brevo_json(c: &Compose) -> Value {
+    // Brevo takes recipient objects, not bare strings, and `sender`
+    // as an object; the body is plain text (`textContent`), since
+    // `Compose` carries no HTML. Standard headers (In-Reply-To,
+    // References) are left out: Brevo's API accepts custom headers
+    // only, so threading headers would not survive the relay.
+    let mut v = json!({
+        "sender": {"email": c.from},
+        "to": c.to.iter().map(|t| json!({"email": t})).collect::<Vec<_>>(),
+        "subject": c.subject,
+        "textContent": c.text,
+    });
+    if !c.cc.is_empty() {
+        v["cc"] = json!(c.cc.iter().map(|t| json!({"email": t})).collect::<Vec<_>>());
+    }
+    if !c.bcc.is_empty() {
+        v["bcc"] = json!(c
+            .bcc
+            .iter()
+            .map(|t| json!({"email": t}))
+            .collect::<Vec<_>>());
+    }
+    if !c.attachments.is_empty() {
+        // Brevo's format: base64 content + name per attachment.
+        v["attachment"] = json!(c
+            .attachments
+            .iter()
+            .map(|a| json!({
+                "content": BASE64.encode(&a.bytes),
+                "name": a.name,
+            }))
+            .collect::<Vec<_>>());
+    }
+    v
+}
+
+/// One outbound relay provider. The name is the value stored in the
+/// `provider` column of `integration_email_requests`.
+#[derive(Clone)]
+pub enum Relay {
+    Resend(ResendClient),
+    Brevo(BrevoClient),
+}
+
+impl Relay {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Relay::Resend(_) => "resend",
+            Relay::Brevo(_) => "brevo",
+        }
+    }
+
+    pub async fn send(&self, c: &Compose) -> Result<String, MailError> {
+        match self {
+            Relay::Resend(client) => client.send(c).await,
+            Relay::Brevo(client) => client.send(c).await,
+        }
+    }
+}
+
+/// Receipt for a delivered message: which relay sent it, and the id
+/// that relay assigned.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RelayReceipt {
+    pub provider: &'static str,
+    pub message_id: String,
+}
+
+/// Ordered outbound relays with failover: tries each provider in
+/// order and returns the first success. Fails over ONLY on a
+/// definitive HTTP refusal (`MailError::RelayFailed`): a transport
+/// error (`Unavailable`) leaves the outcome unknown, so retrying
+/// elsewhere could double-send, and a permanent refusal
+/// (`Rejected`) would fail on every provider.
+#[derive(Clone)]
+pub struct RelayChain {
+    providers: Vec<Relay>,
+}
+
+impl RelayChain {
+    pub fn new(providers: Vec<Relay>) -> Self {
+        Self { providers }
+    }
+
+    /// Provider names in try order, for the admin summary.
+    pub fn provider_names(&self) -> Vec<&'static str> {
+        self.providers.iter().map(|p| p.name()).collect()
+    }
+
+    /// The provider that produced a chain error, read from the
+    /// "{provider}: " prefix the chain folds into every error it
+    /// returns. `None` when the error did not come from this chain.
+    pub fn provider_of_error(&self, err: &MailError) -> Option<&'static str> {
+        let inner = match err {
+            MailError::Rejected(s) | MailError::Unavailable(s) | MailError::RelayFailed(s) => s,
+            _ => return None,
+        };
+        self.providers.iter().find_map(|p| {
+            inner
+                .strip_prefix(&format!("{}: ", p.name()))
+                .map(|_| p.name())
+        })
+    }
+
+    pub async fn send(&self, c: &Compose) -> Result<RelayReceipt, MailError> {
+        let mut last_err: Option<MailError> = None;
+        for provider in &self.providers {
+            match provider.send(c).await {
+                Ok(message_id) => {
+                    return Ok(RelayReceipt {
+                        provider: provider.name(),
+                        message_id,
+                    });
+                }
+                Err(err @ MailError::RelayFailed(_)) => {
+                    last_err = Some(wrap_with_provider(provider, err));
+                }
+                Err(err) => {
+                    // Transport error or permanent refusal: the outcome
+                    // is unknown or would fail everywhere, so stop here.
+                    return Err(wrap_with_provider(provider, err));
+                }
+            }
+        }
+        Err(last_err.expect("a relay chain always tries at least one provider"))
+    }
+}
+
+/// Fold the provider name into an error's message, so the reason
+/// stored for a failed send names the relay that produced it and
+/// `provider_of_error` can read it back.
+fn wrap_with_provider(provider: &Relay, err: MailError) -> MailError {
+    let name = provider.name();
+    match err {
+        MailError::Rejected(detail) => MailError::Rejected(format!("{name}: {detail}")),
+        MailError::Unavailable(detail) => MailError::Unavailable(format!("{name}: {detail}")),
+        MailError::RelayFailed(detail) => MailError::RelayFailed(format!("{name}: {detail}")),
+        other => other,
+    }
+}
+
 #[cfg(test)]
 mod resend_tests {
     use super::*;
@@ -2440,6 +2649,63 @@ mod resend_tests {
         assert_eq!(atts.len(), 1);
         assert_eq!(atts[0]["filename"], "hello.txt");
         // Resend wants base64 content; it must decode back to the raw bytes.
+        let decoded = BASE64
+            .decode(atts[0]["content"].as_str().expect("base64 string"))
+            .expect("valid base64");
+        assert_eq!(decoded, b"hello");
+    }
+}
+
+#[cfg(test)]
+mod brevo_tests {
+    use super::*;
+
+    #[test]
+    fn brevo_payload() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@gmail.com".into()],
+            cc: vec!["d@y.id".into()],
+            bcc: vec!["c@y.id".into()],
+            subject: "Re: hi".into(),
+            text: "t".into(),
+            in_reply_to: Some("m1@x".into()),
+            references: vec!["m0@x".into(), "m1@x".into()],
+            ..Default::default()
+        };
+        let v = brevo_json(&c);
+        // Brevo takes recipient objects, not bare strings.
+        assert_eq!(v["sender"]["email"], "a@x.id");
+        assert_eq!(v["to"][0]["email"], "b@gmail.com");
+        assert_eq!(v["cc"][0]["email"], "d@y.id");
+        assert_eq!(v["bcc"][0]["email"], "c@y.id");
+        assert_eq!(v["subject"], "Re: hi");
+        assert_eq!(v["textContent"], "t");
+        // Standard threading headers are not sent: Brevo's API
+        // accepts custom headers only.
+        assert!(v.get("headers").is_none());
+        assert!(v.get("attachment").is_none());
+    }
+
+    #[test]
+    fn brevo_payload_with_attachments() {
+        let c = Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@gmail.com".into()],
+            subject: "files".into(),
+            text: "t".into(),
+            attachments: vec![ComposeAttachment {
+                name: "hello.txt".into(),
+                content_type: "text/plain".into(),
+                bytes: b"hello".to_vec(),
+            }],
+            ..Default::default()
+        };
+        let v = brevo_json(&c);
+        let atts = v["attachment"].as_array().expect("attachment array");
+        assert_eq!(atts.len(), 1);
+        assert_eq!(atts[0]["name"], "hello.txt");
+        // Brevo wants base64 content; it must decode back to the raw bytes.
         let decoded = BASE64
             .decode(atts[0]["content"].as_str().expect("base64 string"))
             .expect("valid base64");
