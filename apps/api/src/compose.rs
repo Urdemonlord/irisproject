@@ -18,7 +18,7 @@ use iris_config::limits::{
     MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
 };
 use iris_mail::{Compose, ComposeAttachment, FOLDER_ROLES};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::json;
 
 pub(crate) fn folder_role(name: &str) -> Result<&'static str, ApiError> {
@@ -137,38 +137,38 @@ pub(crate) async fn delete_message(
     Ok(StatusCode::NO_CONTENT.into_response())
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize, Serialize, Default, Clone)]
 pub(crate) struct ComposeBody {
     #[serde(default)]
-    to: Vec<String>,
+    pub(crate) to: Vec<String>,
     #[serde(default)]
-    cc: Vec<String>,
+    pub(crate) cc: Vec<String>,
     #[serde(default)]
-    bcc: Vec<String>,
+    pub(crate) bcc: Vec<String>,
     #[serde(default)]
-    subject: String,
+    pub(crate) subject: String,
     #[serde(default)]
-    text: String,
-    in_reply_to: Option<String>,
+    pub(crate) text: String,
+    pub(crate) in_reply_to: Option<String>,
     #[serde(default)]
-    references: Vec<String>,
+    pub(crate) references: Vec<String>,
     /// Existing draft this replaces (deleted on save/send).
-    draft_id: Option<String>,
+    pub(crate) draft_id: Option<String>,
     /// Files to attach: base64-encoded content, decoded and size-checked in
     /// `build()`. Kept as JSON (no multipart anywhere in this codebase).
     #[serde(default)]
-    attachments: Vec<AttachmentBody>,
+    pub(crate) attachments: Vec<AttachmentBody>,
 }
 
 /// One attachment as the web sends it: base64 content + metadata.
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize, Clone)]
 pub(crate) struct AttachmentBody {
     #[serde(default)]
-    name: String,
+    pub(crate) name: String,
     #[serde(default)]
-    content_type: String,
+    pub(crate) content_type: String,
     #[serde(default)]
-    data: String,
+    pub(crate) data: String,
 }
 
 fn clean_list(v: &[String]) -> Result<Vec<String>, ApiError> {
@@ -248,7 +248,10 @@ fn clean_attachments(v: &[AttachmentBody]) -> Result<Vec<ComposeAttachment>, Api
     Ok(out)
 }
 
-fn build(u: &CurrentUser, b: ComposeBody) -> Result<(Compose, Option<String>), ApiError> {
+pub(crate) fn build(
+    u: &CurrentUser,
+    b: ComposeBody,
+) -> Result<(Compose, Option<String>), ApiError> {
     if b.subject.len() > MAX_SUBJECT || b.text.len() > MAX_BODY || b.subject.contains(['\r', '\n'])
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
@@ -296,7 +299,7 @@ pub(crate) async fn save_draft(
 }
 
 /// First recipient outside our own domains, if any.
-fn first_external<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
+pub(crate) fn first_external<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
     c.to.iter()
         .chain(&c.cc)
         .chain(&c.bcc)
@@ -307,31 +310,18 @@ fn first_external<'a>(s: &AppState, c: &'a Compose) -> Option<&'a str> {
         .map(String::as_str)
 }
 
-pub(crate) async fn send(
-    State(s): S,
-    Extension(u): Extension<CurrentUser>,
-    Path(mailbox_id): Path<String>,
-    Json(b): Json<ComposeBody>,
-) -> ApiResult {
-    let account = owned_account(&s, &u, &mailbox_id).await?;
-    let (c, draft) = build(&u, b)?;
-    if c.to.is_empty() && c.cc.is_empty() && c.bcc.is_empty() {
-        return Err(ApiError(StatusCode::BAD_REQUEST, "no_recipients"));
-    }
-    let external = first_external(&s, &c).is_some();
-    if external && s.relay.is_none() && !s.config.send_external {
-        return Err(ApiError(
-            StatusCode::UNPROCESSABLE_ENTITY,
-            "external_sending_disabled",
-        ));
-    }
-
-    let subject = auth::hash_token(&format!("send:{}", u.user_id));
+/// Reserve one slot of the hourly send cap, atomically: the single INSERT
+/// is an atomic statement under SQLite's write lock, so two concurrent
+/// sends cannot both pass the cap (TOCTOU). `false` means the user is at
+/// the cap. The reservation happens at dispatch time, in the sweeper, not
+/// at queue time: a queued send must not consume a slot it may never use
+/// (the user can still undo it).
+pub(crate) async fn reserve_send_slot(
+    pool: &sqlx::SqlitePool,
+    user_id: &str,
+) -> Result<bool, sqlx::Error> {
+    let subject = auth::hash_token(&format!("send:{user_id}"));
     let since = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
-    // Reserve a slot atomically BEFORE delivery so two concurrent sends
-    // cannot both pass the hourly cap (TOCTOU). The single INSERT is an
-    // atomic statement under SQLite's write lock: the second request sees
-    // the first's committed row and gets 0 rows_affected -> 429.
     let reserved = sqlx::query(
         "INSERT INTO rate_limit_events (id, subject_hash, action, occurred_at, outcome) \
          SELECT ?, ?, 'send', ?, 'allowed' \
@@ -343,49 +333,41 @@ pub(crate) async fn send(
     .bind(&subject)
     .bind(&since)
     .bind(SENDS_PER_HOUR)
-    .execute(&s.pool)
+    .execute(pool)
     .await?;
-    if reserved.rows_affected() == 0 {
-        return Err(ApiError(StatusCode::TOO_MANY_REQUESTS, "too_many_sends"));
-    }
+    Ok(reserved.rows_affected() > 0)
+}
 
-    // The Sent copy and the rate-limit row are bookkeeping *after* delivery:
-    // failing either must never turn an already-delivered message into an
-    // error (a client retry would double-send) or silently drop the Sent
-    // copy. The relay branch therefore reports the copy outcome honestly
-    // (`sent_copy: false`) while still answering success; the JMAP branch
-    // files Sent atomically with submission, so its copy always holds.
-    let sent_copy = match (&s.relay, external) {
-        // Other domains go out through the relay (it also delivers our local recipients via MX);
-        // the copy for Sent is filed afterwards. A failed copy doesn't undo a sent message.
-        (Some(relay), true) => {
-            relay.send(&c).await?;
-            match s
-                .jmap
-                .store_sent(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
-                .await
-            {
-                Ok(()) => true,
-                Err(e) => {
-                    tracing::error!("sent via relay but Sent copy failed: {e}");
-                    false
-                }
-            }
-        }
-        _ => {
-            s.jmap
-                .send(&u.creds.user, &u.creds.pass, &account, &c, draft.as_deref())
-                .await?;
-            true
-        }
-    };
-    // Best effort only: the message is already delivered, so a failed
-    // bookkeeping insert must not fail the request (and invite a retry
-    // that would double-send). Cost: this one send is not counted
-    // against the hourly limit.
-    // (Reservation now happens atomically before delivery, so this is
-    // no longer needed.)
-    Ok(Json(json!({ "sent": true, "sent_copy": sent_copy })).into_response())
+/// Queue a compose send for the undo window instead of dispatching it:
+/// the message goes out from the background sweeper once `send_at`
+/// passes, and the web offers Undo until then. Validation and the
+/// external-sending gate still fail fast here, so a request that could
+/// never send is refused at once; the hourly cap is enforced at dispatch
+/// time instead (see `reserve_send_slot`).
+pub(crate) async fn send(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+    Path(mailbox_id): Path<String>,
+    Json(b): Json<ComposeBody>,
+) -> ApiResult {
+    let account = owned_account(&s, &u, &mailbox_id).await?;
+    let (c, _draft) = build(&u, b.clone())?;
+    if c.to.is_empty() && c.cc.is_empty() && c.bcc.is_empty() {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "no_recipients"));
+    }
+    if first_external(&s, &c).is_some() && s.relay.is_none() && !s.config.send_external {
+        return Err(ApiError(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "external_sending_disabled",
+        ));
+    }
+    let queued = crate::pending_sends::queue(&s, &u, &mailbox_id, &account, b).await?;
+    Ok(Json(json!({
+        "pending": true,
+        "id": queued.id,
+        "send_at": queued.send_at,
+    }))
+    .into_response())
 }
 
 #[cfg(test)]

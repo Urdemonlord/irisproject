@@ -141,12 +141,20 @@ fn session_key(server_secret: &str, token: &str) -> LessSafeKey {
     LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &k).expect("32-byte key"))
 }
 
-pub fn seal(server_secret: &str, token: &str, plaintext: &str) -> String {
+/// Key for sealing values the server must open on its own later (pending
+/// sends): derived from the server secret alone, so no session token is
+/// needed at dispatch time. Distinct domain from `session_key`, so a
+/// session-sealed value can never be opened as a server-sealed one.
+fn server_key(server_secret: &str) -> LessSafeKey {
+    let k = Sha256::digest(format!("iris-pending-v1:{server_secret}").as_bytes());
+    LessSafeKey::new(UnboundKey::new(&CHACHA20_POLY1305, &k).expect("32-byte key"))
+}
+
+fn seal_with(key: &LessSafeKey, plaintext: &str) -> String {
     let mut nonce = [0u8; NONCE_LEN];
     SystemRandom::new().fill(&mut nonce).expect("rng");
     let mut buf = plaintext.as_bytes().to_vec();
-    session_key(server_secret, token)
-        .seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
+    key.seal_in_place_append_tag(Nonce::assume_unique_for_key(nonce), Aad::empty(), &mut buf)
         .expect("seal");
     nonce
         .iter()
@@ -155,7 +163,7 @@ pub fn seal(server_secret: &str, token: &str, plaintext: &str) -> String {
         .collect()
 }
 
-pub fn open(server_secret: &str, token: &str, sealed: &str) -> Option<String> {
+fn open_with(key: &LessSafeKey, sealed: &str) -> Option<String> {
     let bytes: Vec<u8> = (0..sealed.len())
         .step_by(2)
         .map(|i| u8::from_str_radix(sealed.get(i..i + 2)?, 16).ok())
@@ -166,10 +174,27 @@ pub fn open(server_secret: &str, token: &str, sealed: &str) -> Option<String> {
     let (nonce, ct) = bytes.split_at(NONCE_LEN);
     let mut ct = ct.to_vec();
     let nonce = Nonce::try_assume_unique_for_key(nonce).ok()?;
-    let pt = session_key(server_secret, token)
-        .open_in_place(nonce, Aad::empty(), &mut ct)
-        .ok()?;
+    let pt = key.open_in_place(nonce, Aad::empty(), &mut ct).ok()?;
     String::from_utf8(pt.to_vec()).ok()
+}
+
+pub fn seal(server_secret: &str, token: &str, plaintext: &str) -> String {
+    seal_with(&session_key(server_secret, token), plaintext)
+}
+
+pub fn open(server_secret: &str, token: &str, sealed: &str) -> Option<String> {
+    open_with(&session_key(server_secret, token), sealed)
+}
+
+/// Seal a value the background dispatcher opens later without a session
+/// token (a pending send's mail credential). The sealed row lives at most
+/// until dispatch, undo, or the retry deadline, and is deleted with it.
+pub fn seal_server(server_secret: &str, plaintext: &str) -> String {
+    seal_with(&server_key(server_secret), plaintext)
+}
+
+pub fn open_server(server_secret: &str, sealed: &str) -> Option<String> {
+    open_with(&server_key(server_secret), sealed)
 }
 
 pub fn set_cookie(token: &str, secure: bool) -> String {
@@ -215,6 +240,19 @@ mod tests {
         assert_eq!(open("other", &tok, &s), None); // other server secret
         assert_eq!(open("srv", &tok, &s[..s.len() - 2]), None); // tampered
         assert_ne!(s, seal("srv", &tok, "app_secret")); // random nonce
+    }
+
+    #[test]
+    fn server_seal_roundtrip_and_binding() {
+        let s = seal_server("srv", "app_secret");
+        assert_eq!(open_server("srv", &s).as_deref(), Some("app_secret"));
+        assert_eq!(open_server("other", &s), None); // other server secret
+        assert_eq!(open_server("srv", &s[..s.len() - 2]), None); // tampered
+        assert_ne!(s, seal_server("srv", "app_secret")); // random nonce
+                                                         // The two sealings are different domains: neither opens the other's values.
+        let session_sealed = seal("srv", "tok", "app_secret");
+        assert_eq!(open_server("srv", &session_sealed), None);
+        assert_eq!(open("srv", "tok", &s), None);
     }
 
     #[test]
