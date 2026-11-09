@@ -58,6 +58,13 @@ echo "== Caddy routing (plain HTTP must redirect to HTTPS)"
 need "Caddy redirects http to https" sh -c "curl -fsS -m 5 -o /dev/null -w '%{http_code}' -H 'Host: $MAIL_HOST' http://127.0.0.1/ | grep -q 308"
 
 echo "== HTTPS web UI (temporary tls internal override, no real DNS)"
+# The shipped config already gets local-issuer certificates for a
+# .local domain from automatic HTTPS, so this override is belt and
+# braces; keep it, it is what the Linux smoke test does too.
+# First rule out the two silent failure modes directly: a missing
+# web root and a wrong root path in the rendered Caddyfile.
+need "web dist index.html exists at the served root" test -f /usr/local/share/iris/dist/index.html
+need "Caddyfile serves the macOS web root" grep -q "root \* /usr/local/share/iris/dist" /etc/caddy/Caddyfile
 cp /etc/caddy/Caddyfile /tmp/Caddyfile.shipped
 # Insert "tls internal" as the first directive of the mail vhost. It
 # must go inside the existing block: a second block for the same host
@@ -81,17 +88,31 @@ PYEOF
 # must not leave the override behind (it would break the next run).
 if /usr/local/bin/caddy reload --config /etc/caddy/Caddyfile --adapter caddyfile 2>/dev/null; then
   sleep 3
-  need "web UI loads over https" sh -c "curl -fsS -m 5 -k --resolve '$MAIL_HOST:443:127.0.0.1' 'https://$MAIL_HOST/' | grep -q 'IRIS'"
+  # Diagnose out loud on failure: a bare need() hides whether curl
+  # failed to connect, got an HTTP error, or got a page without IRIS.
+  if curl -fsS -m 5 -k --resolve "$MAIL_HOST:443:127.0.0.1" "https://$MAIL_HOST/" | grep -q 'IRIS'; then
+    ok "web UI loads over https"
+  else
+    bad "web UI loads over https"
+    echo "--- https diagnostics (status, first 300 bytes of body):"
+    curl -sk -m 5 -o /tmp/https-body.txt -w 'https_status=%{http_code}\n' --resolve "$MAIL_HOST:443:127.0.0.1" "https://$MAIL_HOST/" || true
+    head -c 300 /tmp/https-body.txt; echo
+    echo "--- presented certificate:"
+    openssl s_client -connect 127.0.0.1:443 -servername "$MAIL_HOST" </dev/null 2>/dev/null | grep -E 'subject=|issuer=|Verify return code' || true
+  fi
   # iris-health verifies the certificate chain, which cannot exist for
   # a .local name without real DNS. Trust Caddy's local CA in the
   # system keychain (test-only) and run the full health check while the
   # internal issuer is active; on a real server the same checks pass
   # against the Let's Encrypt certificate.
+  # openssl does not read the macOS keychain, so hand it the local
+  # root directly: without SSL_CERT_FILE its TLS check can never pass
+  # against an internal certificate.
   if [ -f /var/lib/caddy/caddy/pki/authorities/local/root.crt ]; then
-    security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /var/lib/caddy/caddy/pki/authorities/local/root.crt
+    security add-trusted-cert -d -r trustRoot -k /Library/Keychains/System.keychain /var/lib/caddy/caddy/pki/authorities/local/root.crt || echo "WARN: security add-trusted-cert failed (curl may not trust the local CA)"
     # Show the sub-check output on failure: iris-health's own output
     # is the only way to tell which piece failed.
-    if /usr/local/sbin/iris-health > /tmp/iris-health.out 2>&1; then
+    if SSL_CERT_FILE=/var/lib/caddy/caddy/pki/authorities/local/root.crt /usr/local/sbin/iris-health > /tmp/iris-health.out 2>&1; then
       ok "iris-health passes"
     else
       bad "iris-health passes"
