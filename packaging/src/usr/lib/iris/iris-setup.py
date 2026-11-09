@@ -119,7 +119,29 @@ def main():
     call("x:Action/set", {"create": {"a1": {"@type": "ReloadTlsCertificates"}}})
     print(f"iris-setup: TLS certificate {cert_id} (files in /etc/stalwart/tls)")
 
-    # 7. DNS zone files for the operator to publish.
+    # 7. Listeners: Stalwart creates a default set at the first normal
+    # start (smtp 25, submissions 465, imaps 993, pop3s 995, sieve 4190,
+    # https 443, http 8080), all bound to every interface. The https
+    # listener on 443 collides with Caddy, which owns 443 on this host:
+    # Stalwart wins the bind and answers HTTPS with its own self-signed
+    # certificate, so the web UI never loads (CI run 42540266525: curl
+    # got a 302 to /account from Stalwart, not the IRIS page). Creating
+    # any listener here suppresses the default set, so create exactly
+    # the two IRIS needs: SMTP on 25 for inbound mail, and the
+    # management/JMAP HTTP listener restricted to loopback. No IMAP,
+    # POP3, submission, Sieve, or HTTPS listener: IRIS clients use the
+    # web UI and the API, never Stalwart directly.
+    call("x:NetworkListener/set", {"create": {
+        "l-smtp": {"name": "smtp", "protocol": "smtp",
+                   "bind": {"[::]:25": True}},
+        "l-http": {"name": "http", "protocol": "http",
+                   "bind": {"127.0.0.1:8080": True},
+                   "implicitTls": False},
+    }})
+    print("iris-setup: listeners smtp [::]:25, http 127.0.0.1:8080 "
+          "(no 443/465/993/995/4190: Caddy owns 443, IRIS needs no IMAP/POP3)")
+
+    # 8. DNS zone files for the operator to publish.
     res = call("x:Domain/get", {"properties": ["name", "dnsZoneFile"]})
     zones = []
     for d in res.get("list", []):
@@ -129,7 +151,7 @@ def main():
     os.chmod("/etc/iris/dns-zone.txt", 0o640)
     print("iris-setup: DNS zone file written to /etc/iris/dns-zone.txt")
 
-    # 8. Verify the admin account can log in over JMAP.
+    # 9. Verify the admin account can log in over JMAP.
     basic = "Basic " + base64.b64encode(f"{ADMIN_EMAIL}:{ADMIN_PW}".encode()).decode()
     try:
         req = urllib.request.Request(JMAP + "/session", headers={"Authorization": basic})
