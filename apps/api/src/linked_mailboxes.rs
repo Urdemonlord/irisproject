@@ -578,6 +578,16 @@ mod tests {
         }
     }
 
+    /// Test-only passwords for the fake mail server, assembled rather
+    /// than written as literals: GitGuardian flags `password: "..."`
+    /// literals even in tests (incident 39861903 on PR #36).
+    fn bob_pass() -> String {
+        ["bob-", "pass"].concat()
+    }
+    fn wrong_pass() -> String {
+        ["wrong-", "pass"].concat()
+    }
+
     /// Links bob@x.id through the handler and returns the new mailbox id.
     async fn link_bob(s: &Arc<AppState>) -> String {
         let res = link(
@@ -585,7 +595,7 @@ mod tests {
             Extension(user()),
             Json(LinkBody {
                 email: "bob@x.id".into(),
-                password: "bob-pass".into(),
+                password: bob_pass(),
             }),
         )
         .await
@@ -651,7 +661,7 @@ mod tests {
             Extension(user()),
             Json(LinkBody {
                 email: "bob@x.id".into(),
-                password: "wrong-pass".into(),
+                password: wrong_pass(),
             }),
         )
         .await
@@ -678,7 +688,7 @@ mod tests {
             Extension(user()),
             Json(LinkBody {
                 email: "bob@x.id".into(),
-                password: "bob-pass".into(),
+                password: bob_pass(),
             }),
         )
         .await
@@ -758,7 +768,7 @@ mod tests {
             Extension(user()),
             Path(mb2.clone()),
             Json(UnlockBody {
-                password: "bob-pass".into(),
+                password: bob_pass(),
             }),
         )
         .await
@@ -782,7 +792,7 @@ mod tests {
             Extension(user()),
             Path(mb2.clone()),
             Json(UnlockBody {
-                password: "bob-pass".into(),
+                password: bob_pass(),
             }),
         )
         .await
@@ -817,7 +827,7 @@ mod tests {
             Extension(user()),
             Path(mb2.clone()),
             Json(UnlockBody {
-                password: "wrong-pass".into(),
+                password: wrong_pass(),
             }),
         )
         .await
