@@ -47,13 +47,13 @@ with SHA-256 checks on the downloaded tarballs.
 ## Install
 
 ```sh
-curl -fsSL https://github.com/Urdemonlord/irisproject/releases/download/v0.3.0/install.sh | sudo sh
+curl -fsSL https://github.com/Urdemonlord/irisproject/releases/download/v0.4.0/install.sh | sudo sh
 ```
 
 Or download the `.deb` from the release and run it:
 
 ```sh
-sudo dpkg -i iris-mail-stack_0.3.0_amd64.deb
+sudo dpkg -i iris-mail-stack_0.4.0_amd64.deb
 ```
 
 The installer asks for your domain (or set `IRIS_DOMAIN` first), then
@@ -65,7 +65,7 @@ DMARC records for your domain. Publish those in your DNS panel.
 Non-interactive install:
 
 ```sh
-sudo IRIS_DOMAIN=example.com IRIS_ADMIN_EMAIL=admin@example.com dpkg -i iris-mail-stack_0.3.0_amd64.deb
+sudo IRIS_DOMAIN=example.com IRIS_ADMIN_EMAIL=admin@example.com dpkg -i iris-mail-stack_0.4.0_amd64.deb
 ```
 
 To pick the admin password instead of a generated one, set
@@ -76,8 +76,8 @@ A portable tarball of the same payload is attached to each release.
 On a system without dpkg, unpack it as root and run `./install.sh`:
 
 ```sh
-tar xzf iris-mail-stack-0.3.0.tar.gz
-cd iris-mail-stack-0.3.0
+tar xzf iris-mail-stack-0.4.0.tar.gz
+cd iris-mail-stack-0.4.0
 sudo ./install.sh example.com
 ```
 
@@ -88,8 +88,8 @@ The same stack as a tarball for macOS 14 and later, Apple Silicon
 formula yet; the tarball is the install.
 
 ```sh
-tar xzf iris-mail-stack-0.3.0-macos-arm64.tar.gz
-cd iris-mail-stack-0.3.0-macos-arm64
+tar xzf iris-mail-stack-0.4.0-macos-arm64.tar.gz
+cd iris-mail-stack-0.4.0-macos-arm64
 sudo ./install.sh example.com
 ```
 
@@ -165,7 +165,7 @@ restarts the services. `/etc/iris`, `/var/lib/iris` and
 `/var/lib/stalwart` are kept, so accounts, mail and settings survive.
 
 ```sh
-sudo dpkg -i iris-mail-stack_0.3.0_amd64.deb
+sudo dpkg -i iris-mail-stack_0.4.0_amd64.deb
 ```
 
 ## Uninstall
@@ -207,8 +207,8 @@ sudo dpkg -P iris-mail-stack
 It verifies the pinned tarball checksums, builds IRIS from this repo
 checkout (building it if needed), assembles the package tree, runs
 `bash -n`, `py_compile` and `systemd-analyze verify`, and writes
-`build/iris-mail-stack_0.3.0_amd64.deb` and
-`build/iris-mail-stack-0.3.0.tar.gz`.
+`build/iris-mail-stack_0.4.0_amd64.deb` and
+`build/iris-mail-stack-0.4.0.tar.gz`.
 
 macOS tarballs are built on a Mac (or a macOS CI runner), one per arch:
 
@@ -222,8 +222,8 @@ It verifies the pinned macOS tarball checksums in
 `versions-macos.env`, builds IRIS for `aarch64-apple-darwin` and
 `x86_64-apple-darwin`, assembles the trees, runs `bash -n`,
 `py_compile` and `plutil -lint`, and writes
-`build/macos/iris-mail-stack-0.3.0-macos-arm64.tar.gz` and
-`build/macos/iris-mail-stack-0.3.0-macos-amd64.tar.gz`.
+`build/macos/iris-mail-stack-0.4.0-macos-arm64.tar.gz` and
+`build/macos/iris-mail-stack-0.4.0-macos-amd64.tar.gz`.
 
 ## Real install test
 

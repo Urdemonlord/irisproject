@@ -12,7 +12,7 @@
 class IrisMailStack < Formula
   desc "Self-hosted mail stack: IRIS webmail + Stalwart + Caddy, one install"
   homepage "https://github.com/Urdemonlord/irisproject"
-  version "0.3.0"
+  version "0.4.0"
   license all_of: ["MIT", "Apache-2.0"]
 
   depends_on macos: ">= :sonoma"
