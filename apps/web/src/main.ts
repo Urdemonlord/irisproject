@@ -2742,6 +2742,12 @@ type AdminSummary = {
   }
 }
 
+type AuditEvent = {
+  id: string; user_id: string | null; actor_email: string; action: string
+  target_type: string | null; target_id: string | null; detail: Record<string, unknown>; ip: string | null; created_at: string
+}
+type AuditPage = { events: AuditEvent[]; next_before: string | null }
+
 /** Admin dashboard: users, quotas, delivery status, and the actions
  * an admin can take on them. The server gates every admin endpoint,
  * so a non-admin only ever sees the "not an admin" notice below,
@@ -3004,6 +3010,48 @@ async function renderAdmin() {
         btn('btn btn-ghost btn-sm', 'Edit', undefined, { onclick: () => startEditApp(a) }),
         btn('btn btn-ghost btn-sm', 'Delete', undefined, { onclick: () => void deleteApp(a) })),
     ])
+    // Audit trail. Loads after the dashboard renders, so a failure
+    // here never takes the whole page down; the section shows a note
+    // instead. Filters are exact action names and actor emails (or
+    // user ids); Load more follows the server cursor.
+    let auditEvents: AuditEvent[] = []
+    let auditNext: string | null = null
+    const auditWrap = h('div', {})
+    const auditAction = h('input', { type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'login.success', 'aria-label': 'Filter by action' }) as HTMLInputElement
+    const auditUser = h('input', { type: 'text', autocomplete: 'off', spellcheck: false, placeholder: 'actor email or user id', 'aria-label': 'Filter by user' }) as HTMLInputElement
+    const auditDetail = (d: Record<string, unknown>) => { const s = JSON.stringify(d); return s === '{}' ? '—' : s }
+    const drawAudit = () => {
+      auditWrap.replaceChildren(
+        auditEvents.length
+          ? table(['Time', 'Actor', 'Action', 'Target', 'Detail'], auditEvents.map((e) => [
+            fmtDate(e.created_at), e.actor_email, e.action,
+            e.target_type && e.target_id ? `${e.target_type} ${e.target_id}` : '—',
+            auditDetail(e.detail),
+          ]))
+          : h('p', { className: 'muted' }, 'No audit events match.'),
+        ...(auditNext ? [h('div', { className: 'load-more' },
+          h('span', { className: 'load-more-count' }, `Showing ${auditEvents.length}`),
+          btn('btn btn-secondary btn-sm', 'Load more', undefined, { onclick: () => { void loadAudit() } }))] : []))
+    }
+    const loadAudit = async (reset = false) => {
+      if (reset) { auditEvents = []; auditNext = null }
+      const params = new URLSearchParams({ limit: '50' })
+      if (auditNext) params.set('before', auditNext)
+      if (auditAction.value.trim()) params.set('action', auditAction.value.trim())
+      if (auditUser.value.trim()) params.set('user', auditUser.value.trim())
+      try {
+        const page = await api<AuditPage>(`/api/v1/admin/audit?${params.toString()}`)
+        auditEvents = [...auditEvents, ...page.events]
+        auditNext = page.next_before
+        drawAudit()
+      } catch {
+        auditWrap.replaceChildren(h('p', { className: 'muted' }, 'Could not load the audit trail. Try again later.'))
+      }
+    }
+    const auditFilters = h('div', { className: 'org-form' },
+      h('div', { className: 'field' }, h('label', {}, 'Action'), auditAction),
+      h('div', { className: 'field' }, h('label', {}, 'User'), auditUser),
+      btn('btn btn-secondary btn-sm', 'Filter', undefined, { onclick: () => { void loadAudit(true) } }))
     body.replaceChildren(title, intro,
       h('div', { className: 'admin-stats' },
         stat('Users', String(s.users.total)),
@@ -3067,7 +3115,10 @@ async function renderAdmin() {
               [`Delete ${t.address}?`, 'The address stops working right away and its messages will be deleted. You cannot undo this.', 'Delete address'],
               `/api/v1/admin/temp-inboxes/${t.id}/delete`, `${t.address} deleted`) }),
           ]))]
-          : [h('p', { className: 'muted' }, 'No active temp inboxes right now.')])))
+          : [h('p', { className: 'muted' }, 'No active temp inboxes right now.')])),
+      section('Audit trail', 'Who did what, when. Logins, sends, admin actions, key and mailbox changes. Reads are never recorded, and rows are kept forever.',
+        auditFilters, auditWrap))
+    void loadAudit()
 
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }

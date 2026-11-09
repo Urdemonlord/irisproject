@@ -285,6 +285,7 @@ async fn deliver(s: &AppState, row: &PendingRow) -> Result<(), String> {
         },
         session_id: String::new(),
         session_token: String::new(),
+        ip: String::new(),
         mailbox_creds: Vec::new(),
     };
     let Ok((c, draft)) = compose::build(&user.email, body) else {
@@ -374,6 +375,7 @@ mod tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![(
                 "mb1".to_string(),
                 Creds {
