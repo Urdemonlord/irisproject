@@ -13,7 +13,6 @@ export IRIS_DOMAIN IRIS_ADMIN_EMAIL IRIS_ADMIN_PASSWORD
 
 ditto usr /usr
 ditto etc /etc
-ditto srv /srv
 ditto var /var
 ditto Library /Library
 chmod 755 /usr/local/bin/stalwart /usr/local/bin/caddy /usr/local/bin/iris-api

@@ -90,7 +90,9 @@ done
 # Layout mirrors the Linux package, with macOS differences:
 # /usr/lib is SIP-protected, so the installer scripts live in
 # /usr/local/lib/iris; services are launchd plists in
-# /Library/LaunchDaemons, not systemd units.
+# /Library/LaunchDaemons, not systemd units; and the web dist lives
+# in /usr/local/share/iris/dist, because the macOS root volume is
+# read-only and /srv cannot be created at all.
 for arch in $WANT; do
   case "$arch" in
     arm64) TARGET=aarch64-apple-darwin; S_ASSET=$STALWART_ARM64_ASSET; C_ASSET=$CADDY_ARM64_ASSET ;;
@@ -100,7 +102,7 @@ for arch in $WANT; do
   rm -rf "$ROOT"
   mkdir -p "$ROOT/usr/local/bin" "$ROOT/usr/local/sbin" "$ROOT/usr/local/lib/iris" "$ROOT/usr/local/share/iris"
   mkdir -p "$ROOT/etc/iris" "$ROOT/etc/stalwart/tls" "$ROOT/etc/caddy"
-  mkdir -p "$ROOT/srv/iris/dist"
+  mkdir -p "$ROOT/usr/local/share/iris/dist"
   mkdir -p "$ROOT/var/lib/iris" "$ROOT/var/lib/stalwart" "$ROOT/var/log/stalwart" "$ROOT/var/lib/caddy" "$ROOT/var/log/caddy"
   mkdir -p "$ROOT/Library/LaunchDaemons"
 
@@ -111,8 +113,8 @@ for arch in $WANT; do
   chmod 755 "$ROOT/usr/local/bin/stalwart" "$ROOT/usr/local/bin/caddy" "$ROOT/usr/local/bin/iris-api"
 
   # Web dist (normalize modes: tarballs preserve them).
-  cp -R "$WEB_DIST/." "$ROOT/srv/iris/dist/"
-  chmod -R a+rX "$ROOT/srv/iris/dist"
+  cp -R "$WEB_DIST/." "$ROOT/usr/local/share/iris/dist/"
+  chmod -R a+rX "$ROOT/usr/local/share/iris/dist"
 
   # Stalwart store config (the installer fixes ownership to
   # root:stalwart 640 on every run).

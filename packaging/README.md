@@ -117,11 +117,13 @@ Differences from the Linux package, all forced by macOS:
 | Env file loading | systemd `EnvironmentFile` | the api and cleanup jobs run through `/usr/local/lib/iris/iris-api-launch.sh`, which exports `/etc/iris/iris.env` |
 
 Everything else is the same: paths (`/etc/iris`, `/etc/stalwart`,
-`/etc/caddy`, `/srv/iris/dist`, `/var/lib/*`), the Caddyfile, the
+`/etc/caddy`, `/var/lib/*`), the Caddyfile, the
 provisioning script (`iris-setup.py`, shared verbatim), the cert sync
 (`iris-cert-sync`, shared verbatim), and the health check
 (`iris-health`, one line adapted: macOS LibreSSL `s_client` has no
-`-brief` flag).
+`-brief` flag). The web dist is the one path that moves:
+`/usr/local/share/iris/dist` instead of `/srv/iris/dist`, because the
+macOS root volume is read-only and `/srv` cannot be created.
 
 Upgrade: unpack the new tarball and run `./install.sh` again. It
 replaces the binaries and the web app, reloads the launchd jobs, and
@@ -135,7 +137,7 @@ for job in im.meowlabs.iris-stalwart im.meowlabs.iris-api im.meowlabs.iris-caddy
   sudo launchctl bootout "system/$job" 2>/dev/null || true
 done
 sudo rm /Library/LaunchDaemons/im.meowlabs.iris-*.plist
-sudo rm -rf /usr/local/bin/{iris-api,stalwart,caddy} /usr/local/sbin/{iris-health,iris-cert-sync} /usr/local/lib/iris /usr/local/share/iris /srv/iris /etc/iris /etc/stalwart /etc/caddy
+sudo rm -rf /usr/local/bin/{iris-api,stalwart,caddy} /usr/local/sbin/{iris-health,iris-cert-sync} /usr/local/lib/iris /usr/local/share/iris /etc/iris /etc/stalwart /etc/caddy
 # Delete mail and data too (irreversible):
 sudo rm -rf /var/lib/iris /var/lib/stalwart /var/log/stalwart /var/lib/caddy /var/log/caddy
 sudo dscl . -delete /Users/iris; sudo dscl . -delete /Groups/iris

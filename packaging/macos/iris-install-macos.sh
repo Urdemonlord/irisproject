@@ -96,7 +96,7 @@ ensure_user caddy /var/lib/caddy
 
 mkdir -p /etc/iris /etc/stalwart/tls /etc/caddy
 mkdir -p /var/lib/iris /var/lib/stalwart /var/log/stalwart /var/lib/caddy /var/log/caddy
-mkdir -p /srv/iris/dist
+mkdir -p /usr/local/share/iris/dist
 chown iris:iris /var/lib/iris
 chown stalwart:stalwart /var/lib/stalwart /var/log/stalwart
 chown caddy:caddy /var/lib/caddy /var/log/caddy
@@ -117,9 +117,13 @@ chown root:stalwart /etc/stalwart/config.json
 chmod 640 /etc/stalwart/config.json
 
 # --- Caddyfile (rendered once from the shipped template) ----------------
+# The template is shared with Linux; the third substitution moves the
+# web root from /srv/iris/dist (Linux) to /usr/local/share/iris/dist:
+# the macOS root volume is read-only and /srv cannot be created.
 if [ ! -f /etc/caddy/Caddyfile ]; then
   sed -e "s|@MAIL_HOST@|$MAIL_HOST|g" \
       -e "s|@CONTENT_HOST@|$CONTENT_HOST|g" \
+      -e "s|/srv/iris/dist|/usr/local/share/iris/dist|g" \
       /usr/local/share/iris/Caddyfile.template > /etc/caddy/Caddyfile
   chmod 644 /etc/caddy/Caddyfile
   log "wrote /etc/caddy/Caddyfile for $MAIL_HOST"
