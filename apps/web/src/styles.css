@@ -161,7 +161,10 @@ button:disabled { cursor: not-allowed; }
 /* ---------- App shell ---------- */
 /* Pinned to the visible viewport so the page itself never scrolls (mobile address bar can't push the top bar away). */
 .app-shell { position: fixed; inset: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); background: var(--iris-bg) var(--iris-texture-paper); }
-.app-main { min-height: 0; display: flex; }
+/* Grid items default to min-width: auto, so without this the app column
+ * grows to the widest unbreakable content (message previews are nowrap)
+ * and the right side of the app slides off-screen on phones. */
+.app-main { min-height: 0; min-width: 0; display: flex; }
 .app-main > .mail-layout { flex: 1; }
 
 /* Boot loader (index.html) */
@@ -217,7 +220,7 @@ button.account-chip:hover { background: var(--iris-cream-raised); color: var(--i
 .mailbox-dialog input[aria-invalid="true"] { border-color: var(--iris-danger); }
 
 /* ---------- Mail layout ---------- */
-.mail-layout { min-height: 0; display: grid; grid-template-columns: var(--iris-sidebar-width) var(--iris-list-width) minmax(0, 1fr); }
+.mail-layout { min-height: 0; min-width: 0; display: grid; grid-template-columns: var(--iris-sidebar-width) var(--iris-list-width) minmax(0, 1fr); }
 .mail-layout.has-rail { grid-template-columns: var(--iris-sidebar-width) var(--iris-list-width) minmax(0, 1fr) 260px; }
 .sidebar { display: flex; flex-direction: column; gap: var(--iris-space-1); padding: var(--iris-space-4) var(--iris-space-3); border-right: var(--iris-rule-ink); overflow-y: auto; }
 .nav-section { font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-graphite); padding: var(--iris-space-4) var(--iris-space-3) var(--iris-space-2); }
@@ -493,11 +496,16 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
   .nav-item { width: 48px; height: 48px; padding: 0; justify-content: center; }
   .nav-label, .nav-section, .sidebar-footer { display: none; }
   .nav-count { position: absolute; top: 4px; right: 4px; margin: 0; }
-  .topbar .brand-sub, .synced, .account-chip { display: none; }
+  .topbar .brand-sub, .synced { display: none; }
   .brand-mark { font-size: var(--iris-text-h4); }
   .reader { padding: var(--iris-space-6); }
   .reader-subject { font-size: var(--iris-text-h3); }
 }
+
+/* Bottom nav for pages without the mail sidebar: phones only.
+ * (Base rule must sit BEFORE the phone media query below, or its
+ * display:none would override the query's display:flex.) */
+.mobile-nav { display: none; }
 
 /* ---------- Responsive: phone ---------- */
 @media (max-width: 767px) {
@@ -521,6 +529,19 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
   .topbar-search { order: 3; flex: 1 0 100%; height: 40px; }
   .topbar .btn .btn-label { display: none; }
 
+  /* Account chip: icon-only on phones so the Mailboxes dialog stays
+   *  reachable (it is the only entry point to multi-mailbox). */
+  .account-chip { padding: 0 var(--iris-space-2); }
+  .account-chip .account-email { display: none; }
+
+  /* Bottom nav for pages without the mail sidebar (Organize, DMARC,
+   *  Admin): same destinations as the mailbox bottom bar. */
+  .mobile-nav { display: flex; position: fixed; left: 0; right: 0; bottom: 0; z-index: 40; background: var(--iris-surface); border-top: var(--iris-rule-ink); padding-bottom: env(safe-area-inset-bottom); }
+  .mobile-nav .nav-item { flex: 1; width: auto; max-width: 180px; height: 56px; flex-direction: column; gap: 2px; justify-content: center; }
+  .mobile-nav .nav-item[aria-current="page"]::before { left: 0; right: 0; top: 0; bottom: auto; width: auto; height: 3px; }
+  .mobile-nav .nav-label { display: inline; font-size: var(--iris-text-xs); }
+  .organize-inner, .admin-inner { padding-bottom: calc(var(--iris-space-10) + 72px); }
+
   /* One pane at a time, bottom tab bar */
   .mail-layout, .mail-layout.has-rail { display: flex; flex-direction: column; }
   .sidebar { order: 9; flex-direction: row; justify-content: space-around; padding: 0 var(--iris-space-2) env(safe-area-inset-bottom); border-right: 0; border-top: var(--iris-rule-ink); background: var(--iris-surface); overflow: visible; }
@@ -532,8 +553,7 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
   .reader { flex: 1; padding: var(--iris-space-4); }
   .reader-back { display: inline-flex; height: 44px; }
   .mail-layout[data-view="list"] .reader,
-  .mail-layout[data-view="reader"] .list-pane,
-  .mail-layout[data-view="reader"] .sidebar { display: none; }
+  .mail-layout[data-view="reader"] .list-pane { display: none; }
   .reader-subject { font-size: var(--iris-text-h4); }
   .mail-frame { min-height: 70vh; }
   .pane-head { min-height: 56px; }
@@ -822,7 +842,6 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 @media (max-width: 767px) {
   .org-form { grid-template-columns: 1fr; }
   .org-section { padding: var(--iris-space-4); }
-  .organize-top .account-chip { display: none; }
 }
 
 /* ---------- Admin dashboard ---------- */
