@@ -37,6 +37,7 @@ mod filters;
 mod html_body;
 mod integration_apps;
 mod integration_keys;
+mod linked_mailboxes;
 mod notify;
 mod organize;
 mod pending_sends;
@@ -89,6 +90,39 @@ pub(crate) struct CurrentUser {
     pub(crate) user_id: String,
     pub(crate) email: String,
     pub(crate) creds: Creds,
+    /// The session behind this request: its row id and raw token. The
+    /// link/unlock handlers need both: a new app password is sealed
+    /// with the token and stored against the session row.
+    pub(crate) session_id: String,
+    pub(crate) session_token: String,
+    /// Unsealed per-mailbox credentials for this session:
+    /// (mailbox_id, creds), primary first. A linked mailbox with no
+    /// entry here is linked but not unlocked in this session.
+    pub(crate) mailbox_creds: Vec<(String, Creds)>,
+}
+
+impl CurrentUser {
+    /// Credentials for one mailbox, or `None` when the mailbox is linked
+    /// but its app password was never minted for this session.
+    pub(crate) fn creds_for(&self, mailbox_id: &str) -> Option<&Creds> {
+        self.mailbox_creds
+            .iter()
+            .find(|(id, _)| id == mailbox_id)
+            .map(|(_, c)| c)
+    }
+}
+
+/// Credentials for a mailbox the user owns and unlocked this session.
+/// The primary mailbox always has credentials (the session was built on
+/// them); a linked mailbox without them answers 403 `mailbox_locked`,
+/// so the web can offer the unlock prompt instead of signing the user
+/// out (a 401 here would look like a dead session).
+pub(crate) fn mailbox_creds<'a>(
+    u: &'a CurrentUser,
+    mailbox_id: &str,
+) -> Result<&'a Creds, ApiError> {
+    u.creds_for(mailbox_id)
+        .ok_or(ApiError(StatusCode::FORBIDDEN, "mailbox_locked"))
 }
 
 pub(crate) type S = State<Arc<AppState>>;
@@ -267,6 +301,15 @@ async fn main() {
         )
         .route("/auth/logout", post(logout))
         .route("/api/v1/mailboxes", get(mailboxes))
+        .route("/api/v1/mailboxes/link", post(linked_mailboxes::link))
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/unlock",
+            post(linked_mailboxes::unlock),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/unlink",
+            post(linked_mailboxes::unlink),
+        )
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
         .route("/api/v1/mailboxes/:mailbox_id/events", get(mailbox_events))
         .route(
@@ -825,6 +868,33 @@ async fn revoke_by_token(s: &AppState, token: &str) {
             tracing::warn!("app password revoke failed (expires on its own): {e}");
         }
     }
+    // Linked mailboxes unlocked in this session hold their own app
+    // passwords: destroy each, then drop the rows. Other sessions of
+    // the same user keep theirs (their rows belong to their session).
+    let linked: Vec<(String, String, String)> = sqlx::query_as(
+        "SELECT pm.email_address, c.mail_credential_sealed, c.mail_credential_id \
+         FROM session_mailbox_credentials c JOIN permanent_mailboxes pm ON pm.id=c.mailbox_id \
+         WHERE c.session_id=?",
+    )
+    .bind(&id)
+    .fetch_all(&s.pool)
+    .await
+    .unwrap_or_default();
+    for (mb_email, mb_sealed, mb_cred_id) in linked {
+        if let Some(pass) = auth::open(&s.config.session_secret, token, &mb_sealed) {
+            if let Err(e) = s
+                .jmap
+                .destroy_app_password(&mb_email, &pass, &mb_cred_id)
+                .await
+            {
+                tracing::warn!("linked app password revoke failed (expires on its own): {e}");
+            }
+        }
+    }
+    let _ = sqlx::query("DELETE FROM session_mailbox_credentials WHERE session_id=?")
+        .bind(&id)
+        .execute(&s.pool)
+        .await;
 }
 
 async fn require_session(
@@ -864,6 +934,42 @@ async fn require_session(
         user: email.clone(),
         pass,
     };
+    // Per-mailbox credentials for this session: the primary first, then
+    // every linked mailbox unlocked in this session (unsealed with the
+    // same token). A linked mailbox with no row here stays locked until
+    // the user unlocks it with its password.
+    let mut by_mailbox = Vec::new();
+    if let Ok(Some(primary_id)) = sqlx::query_scalar::<_, String>(
+        "SELECT id FROM permanent_mailboxes WHERE user_id=? AND email_address=?",
+    )
+    .bind(&user_id)
+    .bind(&email)
+    .fetch_optional(&s.pool)
+    .await
+    {
+        by_mailbox.push((primary_id, creds.clone()));
+    }
+    if let Ok(linked) = sqlx::query_as::<_, (String, String, String)>(
+        "SELECT c.mailbox_id, c.mail_credential_sealed, pm.email_address \
+         FROM session_mailbox_credentials c JOIN permanent_mailboxes pm ON pm.id=c.mailbox_id \
+         WHERE c.session_id=?",
+    )
+    .bind(&session_id)
+    .fetch_all(&s.pool)
+    .await
+    {
+        for (mb_id, sealed, mb_email) in linked {
+            if let Some(pass) = auth::open(&s.config.session_secret, token, &sealed) {
+                by_mailbox.push((
+                    mb_id,
+                    Creds {
+                        user: mb_email,
+                        pass,
+                    },
+                ));
+            }
+        }
+    }
     let _ = sqlx::query("UPDATE auth_sessions SET last_seen_at=? WHERE id=?")
         .bind(auth::now())
         .bind(&session_id)
@@ -873,6 +979,9 @@ async fn require_session(
         user_id,
         email,
         creds,
+        session_id,
+        session_token: token.to_string(),
+        mailbox_creds: by_mailbox,
     });
     next.run(req).await
 }
@@ -908,9 +1017,45 @@ async fn mailboxes(State(s): S, Extension(u): Extension<CurrentUser>) -> ApiResu
     ).bind(&u.user_id).fetch_all(&s.pool).await?;
     let list: Vec<_> = rows
         .into_iter()
-        .map(|(id, email, status)| json!({"id": id, "email_address": email, "status": status}))
+        .map(|(id, email, status)| {
+            json!({
+                "id": id,
+                "email_address": email,
+                "status": status,
+                // The primary is the mailbox this login signed in with;
+                // it can never be unlinked. `unlocked` tells the web
+                // whether this session holds the mailbox's app password.
+                "is_primary": email == u.email,
+                "unlocked": u.creds_for(&id).is_some(),
+            })
+        })
         .collect();
     Ok(Json(json!({ "mailboxes": list })).into_response())
+}
+
+/// A mailbox the user owns: its mail-server account id and its address.
+/// Compose also needs the address for the From header; most handlers
+/// only need the account id (see `owned_account`).
+pub(crate) struct OwnedMailbox {
+    pub(crate) account_id: String,
+    pub(crate) email: String,
+}
+
+pub(crate) async fn owned_mailbox(
+    s: &AppState,
+    u: &CurrentUser,
+    mailbox_id: &str,
+) -> Result<OwnedMailbox, ApiError> {
+    sqlx::query_as::<_, (String, String)>(
+        "SELECT mail_server_account_id, email_address FROM permanent_mailboxes \
+         WHERE id=? AND user_id=? AND status='active'",
+    )
+    .bind(mailbox_id)
+    .bind(&u.user_id)
+    .fetch_optional(&s.pool)
+    .await?
+    .map(|(account_id, email)| OwnedMailbox { account_id, email })
+    .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))
 }
 
 /// Ownership check: returns the mail-server account id only if the mailbox belongs to the user.
@@ -919,9 +1064,7 @@ pub(crate) async fn owned_account(
     u: &CurrentUser,
     mailbox_id: &str,
 ) -> Result<String, ApiError> {
-    sqlx::query_scalar("SELECT mail_server_account_id FROM permanent_mailboxes WHERE id=? AND user_id=? AND status='active'")
-        .bind(mailbox_id).bind(&u.user_id).fetch_optional(&s.pool).await?
-        .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))
+    Ok(owned_mailbox(s, u, mailbox_id).await?.account_id)
 }
 
 /// Fixed-window limiter for authenticated message reads, reusing the same
@@ -1024,6 +1167,7 @@ async fn list_messages(
     Query(p): Query<Page>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     check_read_limit(&s, &u).await?;
     let limit = p
         .limit
@@ -1040,8 +1184,8 @@ async fn list_messages(
     let (messages, total) = s
         .jmap
         .list_view(
-            &u.creds.user,
-            &u.creds.pass,
+            &creds.user,
+            &creds.pass,
             &account,
             view,
             ListPage {
@@ -1063,13 +1207,14 @@ async fn get_thread(
     Path((mailbox_id, thread_id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&thread_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let t = s
         .jmap
-        .get_thread(&u.creds.user, &u.creds.pass, &account, &thread_id)
+        .get_thread(&creds.user, &creds.pass, &account, &thread_id)
         .await?;
     Ok(Json(json!({ "thread": t })).into_response())
 }
@@ -1091,9 +1236,10 @@ async fn mailbox_events(
     Path(mailbox_id): Path<String>,
 ) -> Result<Response, ApiError> {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     let rx = s
         .mail_watch
-        .subscribe(&s.jmap, &u.creds, &account, &u.user_id, &mailbox_id)
+        .subscribe(&s.jmap, creds, &account, &u.user_id, &mailbox_id)
         .await?;
     // `x-accel-buffering: no` keeps nginx (and other buffering proxies)
     // from holding the stream until it ends, which for SSE is never.
@@ -1120,13 +1266,14 @@ async fn get_message(
     Path((mailbox_id, message_id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let m = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .get_message(&creds.user, &creds.pass, &account, &message_id)
         .await?;
     Ok(Json(json!({ "message": m })).into_response())
 }
@@ -1288,15 +1435,16 @@ async fn get_message_raw(
     Path((mailbox_id, message_id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let m = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .get_message(&creds.user, &creds.pass, &account, &message_id)
         .await?;
-    raw_response(&s, &u.creds.user, &u.creds.pass, &account, &m).await
+    raw_response(&s, &creds.user, &creds.pass, &account, &m).await
 }
 
 /// Body for minting a one-time HTML render URL.
@@ -1334,13 +1482,14 @@ async fn mint_html_body_token(
         ));
     }
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&message_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let m = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .get_message(&creds.user, &creds.pass, &account, &message_id)
         .await?;
     let html = m
         .html_body
@@ -1398,23 +1547,16 @@ async fn get_attachment(
     Path((mailbox_id, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let m = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .get_message(&creds.user, &creds.pass, &account, &message_id)
         .await?;
-    attachment_response(
-        &s,
-        &u.creds.user,
-        &u.creds.pass,
-        &account,
-        &m,
-        &attachment_id,
-    )
-    .await
+    attachment_response(&s, &creds.user, &creds.pass, &account, &m, &attachment_id).await
 }
 
 async fn get_attachment_preview(
@@ -1423,23 +1565,16 @@ async fn get_attachment_preview(
     Path((mailbox_id, message_id, attachment_id)): Path<(String, String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     if !valid_message_id(&message_id) || !valid_part_id(&attachment_id) {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
     check_read_limit(&s, &u).await?;
     let m = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, &account, &message_id)
+        .get_message(&creds.user, &creds.pass, &account, &message_id)
         .await?;
-    attachment_preview_response(
-        &s,
-        &u.creds.user,
-        &u.creds.pass,
-        &account,
-        &m,
-        &attachment_id,
-    )
-    .await
+    attachment_preview_response(&s, &creds.user, &creds.pass, &account, &m, &attachment_id).await
 }
 
 #[cfg(test)]
@@ -2314,6 +2449,9 @@ mod read_limit_tests {
                 user: id.to_string(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            mailbox_creds: vec![],
         }
     }
 
@@ -2812,6 +2950,17 @@ mod handler_integration_tests {
                 user: "alice@example.com".into(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            // The test mailbox `mbx-1` (see `state()` below) is unlocked
+            // for this session, the way the middleware would load it.
+            mailbox_creds: vec![(
+                "mbx-1".to_string(),
+                Creds {
+                    user: "alice@example.com".into(),
+                    pass: "secret".into(),
+                },
+            )],
         }
     }
 

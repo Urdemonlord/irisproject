@@ -12,8 +12,8 @@
 //! another user. The scan only ever uses the signed-in user's own JMAP
 //! credentials, like every other mailbox read.
 use crate::{
-    check_read_limit, owned_account, sanitized_filename, ApiError, ApiResult, AppState,
-    CurrentUser, S,
+    check_read_limit, mailbox_creds, owned_account, sanitized_filename, ApiError, ApiResult,
+    AppState, Creds, CurrentUser, S,
 };
 use axum::{
     extract::{Path, State},
@@ -129,14 +129,15 @@ async fn store_report(
 /// the message is simply not a report.
 async fn import_message(
     s: &AppState,
-    u: &CurrentUser,
+    creds: &Creds,
+    user_id: &str,
     mailbox_id: &str,
     account: &str,
     m: &MessageSummary,
 ) -> Result<bool, ApiError> {
     let detail = s
         .jmap
-        .get_message(&u.creds.user, &u.creds.pass, account, &m.id)
+        .get_message(&creds.user, &creds.pass, account, &m.id)
         .await?;
     for a in &detail.attachments {
         if a.size > MAX_DMARC_SCAN_ATTACHMENT_BYTES || !looks_like_report(&a.name, &a.content_type)
@@ -146,8 +147,8 @@ async fn import_message(
         let bytes = s
             .jmap
             .download_blob_bytes(
-                &u.creds.user,
-                &u.creds.pass,
+                &creds.user,
+                &creds.pass,
                 account,
                 &a.blob_id,
                 &sanitized_filename(&a.name),
@@ -161,7 +162,7 @@ async fn import_message(
             Ok(r) => r,
             Err(_) => continue,
         };
-        return store_report(&s.pool, &u.user_id, mailbox_id, &m.id, &report)
+        return store_report(&s.pool, user_id, mailbox_id, &m.id, &report)
             .await
             .map_err(ApiError::from);
     }
@@ -178,6 +179,7 @@ pub(crate) async fn scan(
     Path(mailbox_id): Path<String>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     check_read_limit(&s, &u).await?;
     let known: HashSet<String> = sqlx::query_scalar(
         "SELECT message_id FROM dmarc_reports WHERE user_id = ? AND mailbox_id = ?",
@@ -190,12 +192,7 @@ pub(crate) async fn scan(
     .collect();
     let candidates = s
         .jmap
-        .list_attachment_messages(
-            &u.creds.user,
-            &u.creds.pass,
-            &account,
-            MAX_DMARC_SCAN_MESSAGES,
-        )
+        .list_attachment_messages(&creds.user, &creds.pass, &account, MAX_DMARC_SCAN_MESSAGES)
         .await?;
     let mut scanned = 0;
     let mut imported = 0;
@@ -206,7 +203,7 @@ pub(crate) async fn scan(
             continue;
         }
         scanned += 1;
-        match import_message(&s, &u, &mailbox_id, &account, m).await {
+        match import_message(&s, creds, &u.user_id, &mailbox_id, &account, m).await {
             Ok(true) => imported += 1,
             Ok(false) => skipped += 1,
             Err(e) => {

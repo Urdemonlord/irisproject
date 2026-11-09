@@ -327,6 +327,9 @@ mod tests {
                 user: id.to_string(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            mailbox_creds: vec![],
         }
     }
 

@@ -921,6 +921,9 @@ mod tests {
                 user: email.to_string(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            mailbox_creds: vec![],
         }
     }
 
@@ -1143,6 +1146,9 @@ mod tests {
                 user: "admin@example.test".into(),
                 pass: "secret".into(),
             },
+            session_id: "sess-1".into(),
+            session_token: "tok-1".into(),
+            mailbox_creds: vec![],
         }
     }
 

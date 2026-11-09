@@ -1,8 +1,8 @@
 //! Folders, message actions (move / read / delete), drafts and sending.
 use crate::email_address::valid_compose_address;
 use crate::{
-    check_read_limit, owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser,
-    S,
+    check_read_limit, mailbox_creds, owned_account, owned_mailbox, valid_message_id, ApiError,
+    ApiResult, AppState, CurrentUser, S,
 };
 use axum::{
     extract::{Path, State},
@@ -43,11 +43,9 @@ pub(crate) async fn folders(
     Path(mailbox_id): Path<String>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     check_read_limit(&s, &u).await?;
-    let folders = s
-        .jmap
-        .folders(&u.creds.user, &u.creds.pass, &account)
-        .await?;
+    let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
     Ok(Json(json!({ "folders": folders })).into_response())
 }
 
@@ -66,13 +64,11 @@ pub(crate) async fn move_message(
     Json(b): Json<MoveBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&id)?;
     if let Some(target) = b.folder_id {
         message_id(&target)?;
-        let folders = s
-            .jmap
-            .folders(&u.creds.user, &u.creds.pass, &account)
-            .await?;
+        let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
         if !folders
             .iter()
             .any(|f| f.id == target && f.role == iris_mail::CUSTOM_ROLE)
@@ -80,7 +76,7 @@ pub(crate) async fn move_message(
             return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
         }
         s.jmap
-            .move_to_id(&u.creds.user, &u.creds.pass, &account, &id, &target)
+            .move_to_id(&creds.user, &creds.pass, &account, &id, &target)
             .await?;
         return Ok(StatusCode::NO_CONTENT.into_response());
     }
@@ -92,7 +88,7 @@ pub(crate) async fn move_message(
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_folder"));
     }
     s.jmap
-        .move_to(&u.creds.user, &u.creds.pass, &account, &id, role)
+        .move_to(&creds.user, &creds.pass, &account, &id, role)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -109,9 +105,10 @@ pub(crate) async fn set_seen(
     Json(b): Json<SeenBody>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&id)?;
     s.jmap
-        .set_seen(&u.creds.user, &u.creds.pass, &account, &id, b.seen)
+        .set_seen(&creds.user, &creds.pass, &account, &id, b.seen)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -123,16 +120,17 @@ pub(crate) async fn delete_message(
     Path((mailbox_id, id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     message_id(&id)?;
     let roles = s
         .jmap
-        .message_roles(&u.creds.user, &u.creds.pass, &account, &id)
+        .message_roles(&creds.user, &creds.pass, &account, &id)
         .await?;
     if !roles.iter().any(|r| r == "trash" || r == "drafts") {
         return Err(ApiError(StatusCode::CONFLICT, "move_to_trash_first"));
     }
     s.jmap
-        .destroy_one(&u.creds.user, &u.creds.pass, &account, &id)
+        .destroy_one(&creds.user, &creds.pass, &account, &id)
         .await?;
     Ok(StatusCode::NO_CONTENT.into_response())
 }
@@ -252,10 +250,10 @@ fn clean_attachments(v: &[AttachmentBody]) -> Result<Vec<ComposeAttachment>, Api
     Ok(out)
 }
 
-pub(crate) fn build(
-    u: &CurrentUser,
-    b: ComposeBody,
-) -> Result<(Compose, Option<String>), ApiError> {
+/// Builds the validated send/draft payload. `from` is the active
+/// mailbox's address, so a send from a linked mailbox carries that
+/// mailbox as its From, never the login (primary) address.
+pub(crate) fn build(from: &str, b: ComposeBody) -> Result<(Compose, Option<String>), ApiError> {
     if b.subject.len() > MAX_SUBJECT || b.text.len() > MAX_BODY || b.subject.contains(['\r', '\n'])
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
@@ -294,7 +292,7 @@ pub(crate) fn build(
         message_id(d)?;
     }
     let c = Compose {
-        from: u.email.clone(),
+        from: from.to_string(),
         to,
         cc,
         bcc,
@@ -314,14 +312,15 @@ pub(crate) async fn save_draft(
     Path(mailbox_id): Path<String>,
     Json(b): Json<ComposeBody>,
 ) -> ApiResult {
-    let account = owned_account(&s, &u, &mailbox_id).await?;
-    let (c, replace) = build(&u, b)?;
+    let mb = owned_mailbox(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
+    let (c, replace) = build(&mb.email, b)?;
     let id = s
         .jmap
         .save_draft(
-            &u.creds.user,
-            &u.creds.pass,
-            &account,
+            &creds.user,
+            &creds.pass,
+            &mb.account_id,
             &c,
             replace.as_deref(),
         )
@@ -381,8 +380,9 @@ pub(crate) async fn send(
     Path(mailbox_id): Path<String>,
     Json(b): Json<ComposeBody>,
 ) -> ApiResult {
-    let account = owned_account(&s, &u, &mailbox_id).await?;
-    let (c, _draft) = build(&u, b.clone())?;
+    let mb = owned_mailbox(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
+    let (c, _draft) = build(&mb.email, b.clone())?;
     if c.to.is_empty() && c.cc.is_empty() && c.bcc.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "no_recipients"));
     }
@@ -392,7 +392,9 @@ pub(crate) async fn send(
             "external_sending_disabled",
         ));
     }
-    let queued = crate::pending_sends::queue(&s, &u, &mailbox_id, &account, b).await?;
+    let queued =
+        crate::pending_sends::queue(&s, &u, &mailbox_id, &mb.account_id, &mb.email, creds, b)
+            .await?;
     Ok(Json(json!({
         "pending": true,
         "id": queued.id,
@@ -432,15 +434,15 @@ mod tests {
         );
     }
 
-    fn test_user() -> CurrentUser {
-        CurrentUser {
-            user_id: "u1".into(),
-            email: "me@x.id".into(),
-            creds: crate::Creds {
-                user: "me@x.id".into(),
-                pass: "secret".into(),
-            },
-        }
+    #[test]
+    fn from_is_the_active_mailbox_address() {
+        // Compose sends from the active mailbox, never the login
+        // (primary) address: a linked mailbox's mail carries that
+        // mailbox as its From.
+        let (c, _) = build("bob@x.id", body_with(vec![])).expect("valid compose");
+        assert_eq!(c.from, "bob@x.id");
+        let (c, _) = build("me@x.id", body_with(vec![])).expect("valid compose");
+        assert_eq!(c.from, "me@x.id");
     }
 
     fn att(name: &str, content_type: &str, bytes: &[u8]) -> AttachmentBody {
@@ -460,7 +462,7 @@ mod tests {
     }
 
     fn invalid(b: ComposeBody) {
-        let err = build(&test_user(), b).expect_err("must be rejected");
+        let err = build("me@x.id", b).expect_err("must be rejected");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "invalid_attachment");
     }
@@ -468,7 +470,7 @@ mod tests {
     #[test]
     fn attachments_happy_path() {
         let (c, _) = build(
-            &test_user(),
+            "me@x.id",
             body_with(vec![
                 att("notes.txt", "text/plain", b"hello"),
                 att("blob.bin", "", b"\x00\x01"),
@@ -531,7 +533,7 @@ mod tests {
         let mut b = body_with(vec![]);
         b.html = Some("<p>Hello <b>world</b></p><script>alert(1)</script>".into());
         b.text = String::new();
-        let (c, _) = build(&test_user(), b).expect("valid html compose");
+        let (c, _) = build("me@x.id", b).expect("valid html compose");
         assert_eq!(c.html.as_deref(), Some("<p>Hello <b>world</b></p>"));
         assert_eq!(c.text, "Hello world");
     }
@@ -541,7 +543,7 @@ mod tests {
         let mut b = body_with(vec![]);
         b.html = Some("<script>alert(1)</script>".into());
         b.text = String::new();
-        let (c, _) = build(&test_user(), b).expect("valid compose");
+        let (c, _) = build("me@x.id", b).expect("valid compose");
         assert_eq!(c.html, None);
         assert_eq!(c.text, "");
     }
@@ -551,7 +553,7 @@ mod tests {
         let mut b = body_with(vec![]);
         b.html = Some("<p>Rich</p>".into());
         b.text = "Typed".into();
-        let (c, _) = build(&test_user(), b).expect("valid compose");
+        let (c, _) = build("me@x.id", b).expect("valid compose");
         assert_eq!(c.text, "Typed");
         assert_eq!(c.html.as_deref(), Some("<p>Rich</p>"));
     }
@@ -560,7 +562,7 @@ mod tests {
     fn oversize_html_is_rejected() {
         let mut b = body_with(vec![]);
         b.html = Some("x".repeat(MAX_COMPOSE_HTML_BYTES + 1));
-        let err = build(&test_user(), b).expect_err("must be rejected");
+        let err = build("me@x.id", b).expect_err("must be rejected");
         assert_eq!(err.0, StatusCode::BAD_REQUEST);
         assert_eq!(err.1, "invalid_request");
     }

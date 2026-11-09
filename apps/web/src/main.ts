@@ -788,8 +788,11 @@ function viewMeta(v: MailView): { label: string; icon: string; empty: [string, s
   }
 }
 
-/** Signed-in account, kept while switching folders so each switch skips two requests. `is_admin` only decides whether the Admin nav link shows; the server gates the admin endpoints. */
-let account: { email: string; mb: string; is_admin: boolean } | null = null
+/** A mailbox linked to this login, as the list endpoint returns it. */
+type LinkedMailbox = { id: string; email_address: string; is_primary: boolean; unlocked: boolean }
+
+/** Signed-in account, kept while switching folders so each switch skips two requests. `is_admin` only decides whether the Admin nav link shows; the server gates the admin endpoints. `boxes` is every mailbox linked to this login, primary first; `mb` is the active one. */
+let account: { email: string; mb: string; is_admin: boolean; boxes: LinkedMailbox[] } | null = null
 
 const sendErrors: Record<string, string> = {
   external_sending_disabled: 'IRIS can only send to local addresses for now. Sending to other domains isn’t set up yet.',
@@ -1204,12 +1207,17 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
 
   const status = h('span', { className: 'compose-status', 'aria-live': 'polite' })
   const error = h('div', { className: 'form-error', role: 'alert' })
+  // With several mailboxes linked, say which one this sends from. With
+  // one mailbox the composer reads exactly as before.
+  const fromLine = (account?.boxes.length ?? 0) > 1
+    ? h('p', { className: 'compose-from' }, `From: ${activeBox()?.email_address ?? account?.email ?? ''}`)
+    : null
   const send = h('button', { type: 'button', className: 'btn btn-primary' }, icon('send'), h('span', { className: 'btn-label' }, 'Send')) as HTMLButtonElement
   const discard = btn('btn btn-ghost btn-icon-sm', 'Discard draft', 'trash')
   const closeBtn = btn('btn btn-ghost btn-icon-sm', 'Close (saves draft)', 'close')
   const panel = h('section', { className: 'composer', role: 'dialog', ariaLabel: d.title ?? 'New message' },
     h('header', { className: 'composer-head' }, h('h2', {}, d.title ?? 'New message'), status, closeBtn),
-    h('div', { className: 'composer-fields' }, to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
+    h('div', { className: 'composer-fields' }, ...(fromLine ? [fromLine] : []), to.row, to.err, cc.row, cc.err, bcc.row, bcc.err, subject.row),
     attachBox,
     modeRow,
     rich.wrap,
@@ -1343,11 +1351,132 @@ async function ensureAccount() {
   if (!account) {
     const [session, { mailboxes }] = await Promise.all([
       api<{ email: string; is_admin?: boolean }>('/api/v1/session'),
-      api<{ mailboxes: { id: string }[] }>('/api/v1/mailboxes'),
+      api<{ mailboxes: LinkedMailbox[] }>('/api/v1/mailboxes'),
     ])
-    account = { email: session.email, mb: mailboxes[0]?.id ?? '', is_admin: session.is_admin === true }
+    account = { email: session.email, mb: mailboxes[0]?.id ?? '', is_admin: session.is_admin === true, boxes: mailboxes }
   }
   return account
+}
+
+/** Re-reads the linked mailboxes from the server (after link/unlink/unlock). If the active mailbox is gone, falls back to the first one. */
+async function refreshBoxes() {
+  if (!account) return
+  const { mailboxes } = await api<{ mailboxes: LinkedMailbox[] }>('/api/v1/mailboxes')
+  account.boxes = mailboxes
+  if (!mailboxes.some((b) => b.id === account!.mb)) account.mb = mailboxes[0]?.id ?? ''
+}
+
+const activeBox = () => account?.boxes.find((b) => b.id === account!.mb)
+
+/** Makes `id` the active mailbox everywhere: closes the live stream and the composer, drops the cached lists and folders, and re-renders the current view. */
+async function switchMailbox(id: string) {
+  if (!account || account.mb === id) return
+  account.mb = id
+  await reswitch()
+}
+
+/** Drops the live stream, the composer and the cached lists, then re-renders the current view for the mailbox `account.mb` already points at. */
+async function reswitch() {
+  mailStream?.close(); mailStream = null
+  clearMailCache()
+  org = { folders: [], labels: [] }
+  await closeComposer?.()
+  route()
+}
+
+const mailboxErrors: Record<string, string> = {
+  invalid_credentials: 'The email or password is wrong. Check them and try again.',
+  mailbox_already_linked: 'That mailbox is already linked to an IRIS account.',
+  invalid_request: 'Enter a valid email address and a password.',
+  already_unlocked: 'That mailbox is already unlocked.',
+  cannot_unlink_primary: 'The primary mailbox cannot be unlinked.',
+  not_found: 'It no longer exists. Reload the page and try again.',
+  mail_server_error: errorText.mail_server_error,
+  mail_server_unavailable: errorText.mail_server_unavailable,
+  network: errorText.network,
+}
+const mailboxError = (err: unknown) => mailboxErrors[(err as HttpError).code] ?? 'Something went wrong. Try again.'
+
+/** Mailbox switcher dialog: switch, unlock, unlink, and add a mailbox. A locked mailbox asks for its password here; a wrong password shows inline and never signs the user out. */
+async function manageMailboxes() {
+  if (!account) return
+  await refreshBoxes()
+  const list = h('div', { className: 'mailbox-list' })
+  const err = h('p', { className: 'field-error', role: 'alert' })
+  const emailInput = h('input', { type: 'email', autocomplete: 'username', spellcheck: false, placeholder: 'name@example.com', 'aria-label': 'Mailbox email' }) as HTMLInputElement
+  const passInput = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Mailbox password', 'aria-label': 'Mailbox password' }) as HTMLInputElement
+  const addBtn = h('button', { type: 'button', className: 'btn btn-primary' }, h('span', { className: 'btn-label' }, 'Add mailbox')) as HTMLButtonElement
+  const closeBtn = h('button', { type: 'button', className: 'btn btn-secondary' }, h('span', { className: 'btn-label' }, 'Close'))
+  const d = h('dialog', { className: 'confirm mailbox-dialog' },
+    h('h2', {}, 'Mailboxes'),
+    h('p', { className: 'muted' }, 'Switch between your linked mailboxes, or add another one.'),
+    list,
+    h('div', { className: 'mailbox-add' },
+      h('div', { className: 'field' }, h('label', {}, 'Add a mailbox'), emailInput, passInput, err),
+      h('div', { className: 'confirm-actions' }, addBtn)),
+    h('div', { className: 'confirm-actions' }, closeBtn)) as HTMLDialogElement
+  const done = () => { d.close(); d.remove() }
+  closeBtn.onclick = done
+  d.addEventListener('cancel', (e) => { e.preventDefault(); done() })
+  const draw = () => {
+    const boxes = account!.boxes
+    list.replaceChildren(...boxes.map((b) => {
+      const active = b.id === account!.mb
+      const tagText = active ? 'Active' : b.is_primary ? 'Primary' : b.unlocked ? '' : 'Locked'
+      const row = h('div', { className: 'mailbox-row' },
+        icon('mail', 'icon'), h('span', { className: 'mailbox-email', title: b.email_address }, b.email_address),
+        ...(tagText ? [h('span', { className: 'mailbox-tag' }, tagText)] : []))
+      const unlockErr = h('p', { className: 'field-error', role: 'alert' })
+      if (!b.unlocked) {
+        const pw = h('input', { type: 'password', autocomplete: 'current-password', placeholder: 'Password for this mailbox', 'aria-label': `Password for ${b.email_address}` }) as HTMLInputElement
+        const unlockBtn = h('button', { type: 'button', className: 'btn btn-secondary btn-sm' }, h('span', { className: 'btn-label' }, 'Unlock')) as HTMLButtonElement
+        unlockBtn.onclick = async () => {
+          const restore = busy(unlockBtn, 'Unlocking…')
+          try {
+            await api(`/api/v1/mailboxes/${encodeURIComponent(b.id)}/unlock`, { method: 'POST', body: JSON.stringify({ password: pw.value }) })
+            await refreshBoxes(); draw()
+          } catch (e) { restore(); unlockErr.textContent = mailboxError(e); pw.setAttribute('aria-invalid', 'true'); pw.focus() }
+        }
+        pw.oninput = () => { unlockErr.textContent = ''; pw.removeAttribute('aria-invalid') }
+        row.append(h('div', { className: 'mailbox-unlock' }, pw, unlockBtn, unlockErr))
+      } else if (!active) {
+        const switchBtn = h('button', { type: 'button', className: 'btn btn-secondary btn-sm' }, h('span', { className: 'btn-label' }, 'Switch')) as HTMLButtonElement
+        switchBtn.onclick = async () => { done(); await switchMailbox(b.id) }
+        row.append(switchBtn)
+      }
+      if (!b.is_primary) {
+        const unlinkBtn = h('button', { type: 'button', className: 'btn btn-ghost btn-sm' }, h('span', { className: 'btn-label' }, 'Unlink')) as HTMLButtonElement
+        unlinkBtn.onclick = async () => {
+          const ok = await confirmDialog(`Unlink ${b.email_address}?`, 'Only the IRIS-side data for this mailbox is removed. Mail on the server stays untouched.', 'Unlink')
+          if (!ok) return
+          try {
+            await api(`/api/v1/mailboxes/${encodeURIComponent(b.id)}/unlink`, { method: 'POST' })
+            const wasActive = b.id === account!.mb
+            await refreshBoxes()
+            // refreshBoxes already moved `mb` to the first box; the
+            // stream, composer and caches still point at the old one.
+            if (wasActive) { done(); await reswitch(); return }
+            draw()
+          } catch (e) { err.textContent = mailboxError(e) }
+        }
+        row.append(unlinkBtn)
+      }
+      return row
+    }))
+  }
+  addBtn.onclick = async () => {
+    const restore = busy(addBtn, 'Adding…')
+    try {
+      await api('/api/v1/mailboxes/link', { method: 'POST', body: JSON.stringify({ email: emailInput.value, password: passInput.value }) })
+      restore()
+      await refreshBoxes(); draw()
+      emailInput.value = ''; passInput.value = ''; err.textContent = ''
+      toast('Mailbox added')
+    } catch (e) { restore(); err.textContent = mailboxError(e); emailInput.setAttribute('aria-invalid', 'true'); emailInput.focus() }
+  }
+  draw()
+  document.body.append(d)
+  d.showModal()
 }
 
 /** Refreshes `org` (folders with counts + labels). Returns the folder list. */
@@ -1441,6 +1570,9 @@ const newFolderDialog = (base: string) => promptDialog({
 
 async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const { email, mb, is_admin } = await ensureAccount()
+  // The chip shows the active mailbox, and opens the switcher. With one
+  // mailbox linked it reads exactly as before.
+  const activeEmail = activeBox()?.email_address ?? email
   const folder = view.kind === 'role' ? view.role : null
   const key = viewKey(view)
   let meta = viewMeta(view)
@@ -1485,7 +1617,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       searchTimer = window.setTimeout(() => { void load() }, 300)
     }),
     h('div', { className: 'topbar-right' }, synced,
-      h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email)),
+      h('button', { type: 'button', className: 'account-chip', title: activeEmail, onclick: () => { manageMailboxes().catch(() => toast('Could not load mailboxes. Try again.')) } }, icon('account'), h('span', { className: 'account-email' }, activeEmail)),
       logout))
 
   const folderTabs = h('nav', { className: 'folder-tabs', ariaLabel: 'Folders' }, ...FOLDERS.map((f) =>
@@ -2315,7 +2447,7 @@ async function renderTempStart(note = '') {
   stopTemp()
   setPage({ title: 'Free temporary email', description: 'Get a free disposable email address in one click. Receive-only, no sign-up, deleted automatically after 1 hour.', path: '/#/temp' })
   if (!account) {
-    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true, boxes: [] } } catch { account = null }
   }
   const loggedIn = !!account
   const status = h('div', { className: 'form-error', role: 'alert' }, ...(note ? [icon('alert'), note] : []))
@@ -2387,7 +2519,7 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
   // Resolve auth state so the topbar reflects a logged-in session instead of
   // always showing "Sign in" (issue: logged-in users saw "Sign in" on /#/temp).
   if (!account) {
-    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true } } catch { account = null }
+    try { const s = await api<{ email: string; is_admin?: boolean }>('/api/v1/session'); account = { email: s.email, mb: '', is_admin: s.is_admin === true, boxes: [] } } catch { account = null }
   }
   const loggedIn = !!account
   const auth = { headers: { authorization: `Bearer ${inbox.access_token}` } }

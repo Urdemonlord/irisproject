@@ -7,7 +7,8 @@
 //! the database change is undone, so the stored rules and the running
 //! script stay the same.
 use crate::{
-    organize, owned_account, valid_message_id, ApiError, ApiResult, AppState, CurrentUser, S,
+    mailbox_creds, organize, owned_account, valid_message_id, ApiError, ApiResult, AppState, Creds,
+    CurrentUser, S,
 };
 use axum::{
     extract::{Path, State},
@@ -133,24 +134,20 @@ pub(crate) async fn target_in_use(
 /// Rebuilds and installs the mailbox's Sieve script from the stored rules.
 async fn sync(
     s: &AppState,
-    u: &CurrentUser,
+    creds: &Creds,
     account: &str,
     mailbox_id: &str,
 ) -> Result<(), ApiError> {
     let rules = rules(s, mailbox_id).await?;
     let mut names = HashMap::new();
     if rules.iter().any(|r| r.action == "move") {
-        for f in s
-            .jmap
-            .folders(&u.creds.user, &u.creds.pass, account)
-            .await?
-        {
+        for f in s.jmap.folders(&creds.user, &creds.pass, account).await? {
             names.insert(f.id, f.name);
         }
     }
     let script = sieve_script(&rules, &names);
     s.jmap
-        .put_filter_script(&u.creds.user, &u.creds.pass, account, script.as_deref())
+        .put_filter_script(&creds.user, &creds.pass, account, script.as_deref())
         .await?;
     Ok(())
 }
@@ -180,6 +177,7 @@ pub(crate) async fn create(
     Json(b): Json<NewRule>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     // Held across validation, the insert and the Sieve install: the
     // install must read the rule set this insert just wrote, with no
     // concurrent filter change or label/folder delete in between.
@@ -210,10 +208,7 @@ pub(crate) async fn create(
             }
             // Only Archive, Trash or a custom folder: filling Inbox is what
             // no filter does, and Sent/Drafts are not for incoming mail.
-            let folders = s
-                .jmap
-                .folders(&u.creds.user, &u.creds.pass, &account)
-                .await?;
+            let folders = s.jmap.folders(&creds.user, &creds.pass, &account).await?;
             let ok = folders.iter().any(|f| {
                 f.id == id && ["archive", "trash", CUSTOM_ROLE].contains(&f.role.as_str())
             });
@@ -243,7 +238,7 @@ pub(crate) async fn create(
     if r.rows_affected() == 0 {
         return Err(ApiError(StatusCode::CONFLICT, "too_many_filters"));
     }
-    if let Err(e) = sync(&s, &u, &account, &mailbox_id).await {
+    if let Err(e) = sync(&s, creds, &account, &mailbox_id).await {
         sqlx::query("DELETE FROM mail_filters WHERE id=?")
             .bind(&id)
             .execute(&s.pool)
@@ -266,6 +261,7 @@ pub(crate) async fn delete(
     Path((mailbox_id, id)): Path<(String, String)>,
 ) -> ApiResult {
     let account = owned_account(&s, &u, &mailbox_id).await?;
+    let creds = mailbox_creds(&u, &mailbox_id)?;
     // Held across the delete and the Sieve install: same reason as in
     // `create`, so a concurrent change cannot install a stale script.
     let _guard = s.organize_lock.lock().await;
@@ -283,7 +279,7 @@ pub(crate) async fn delete(
         .bind(&id)
         .execute(&s.pool)
         .await?;
-    if let Err(e) = sync(&s, &u, &account, &mailbox_id).await {
+    if let Err(e) = sync(&s, creds, &account, &mailbox_id).await {
         sqlx::query(
             "INSERT INTO mail_filters (id, mailbox_id, field, value, action, target, created_at) VALUES (?,?,?,?,?,?,?)",
         )
