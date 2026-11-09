@@ -1,0 +1,36 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>im.meowlabs.iris-caddy</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/caddy</string>
+		<string>run</string>
+		<string>--config</string>
+		<string>/etc/caddy/Caddyfile</string>
+		<string>--adapter</string>
+		<string>caddyfile</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/caddy</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>XDG_DATA_HOME</key>
+		<string>/var/lib/caddy</string>
+		<key>XDG_CONFIG_HOME</key>
+		<string>/etc/caddy</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>3</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/caddy/caddy.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/caddy/caddy.log</string>
+</dict>
+</plist>

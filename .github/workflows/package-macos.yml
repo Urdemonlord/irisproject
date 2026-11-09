@@ -1,0 +1,92 @@
+# macOS package - build the official IRIS macOS tarballs and smoke-test
+# the install on a GitHub macOS runner. No deploy, no secrets: the test
+# domain is iris-test.local and the runner is throwaway.
+# Release upload stays manual, like the Linux assets: download the
+# tarballs from this run's artifacts and `gh release upload` them.
+name: macOS package
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/macos/**'
+      - 'packaging/src/usr/lib/iris/iris-setup.py'
+      - 'packaging/src/usr/local/sbin/iris-cert-sync'
+      - 'packaging/src/usr/share/iris/Caddyfile.template'
+      - '.github/workflows/package-macos.yml'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: macos-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build macOS tarballs
+    runs-on: macos-15
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Add macOS targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: apps/web
+      - name: Build macOS packages
+        # Invoked via bash on purpose: the git executable bit does not
+        # survive every push path (see PR #25 for the Linux scripts).
+        run: bash build-macos.sh
+        working-directory: packaging/macos
+      - name: Upload tarballs
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-mail-stack-macos
+          path: packaging/macos/build/macos/*.tar.gz
+          if-no-files-found: error
+
+  test:
+    name: Smoke-test the macOS install
+    runs-on: macos-15
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download tarballs
+        uses: actions/download-artifact@v4
+        with:
+          name: iris-mail-stack-macos
+          path: /tmp/iris-macos-test
+      - name: Install the arm64 tarball (test domain)
+        run: |
+          cd /tmp/iris-macos-test
+          tar -xzf iris-mail-stack-*-macos-arm64.tar.gz
+          cd iris-mail-stack-*-macos-arm64
+          sudo ./install.sh iris-test.local
+      - name: Run the smoke test
+        run: sudo bash check-macos.sh
+        working-directory: packaging/macos
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          sudo launchctl print system/im.meowlabs.iris-api || true
+          sudo launchctl print system/im.meowlabs.iris-stalwart || true
+          sudo launchctl print system/im.meowlabs.iris-caddy || true
+          echo "--- stalwart log:"; sudo tail -n 100 /var/log/stalwart/stalwart.log || true
+          echo "--- api log:"; sudo tail -n 100 /var/lib/iris/iris-api.log || true
+          echo "--- caddy log:"; sudo tail -n 100 /var/log/caddy/caddy.log || true
+          echo "--- setup log:"; sudo tail -n 100 /var/log/stalwart/setup.log || true

@@ -33,6 +33,9 @@ logs/
 # One-package install (Debian/Ubuntu) build outputs
 packaging/build/
 
+# macOS package build outputs
+packaging/macos/build/
+
 # Secrets
 .env*
 !.env.example

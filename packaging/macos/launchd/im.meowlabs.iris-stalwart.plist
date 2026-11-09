@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>im.meowlabs.iris-stalwart</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/bin/stalwart</string>
+		<string>--config</string>
+		<string>/etc/stalwart/config.json</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/stalwart</string>
+	<key>EnvironmentVariables</key>
+	<dict>
+		<key>SSL_CERT_FILE</key>
+		<string>/etc/ssl/cert.pem</string>
+	</dict>
+	<key>RunAtLoad</key>
+	<true/>
+	<key>KeepAlive</key>
+	<true/>
+	<key>ThrottleInterval</key>
+	<integer>3</integer>
+	<key>StandardOutPath</key>
+	<string>/var/log/stalwart/stalwart.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/log/stalwart/stalwart.log</string>
+</dict>
+</plist>

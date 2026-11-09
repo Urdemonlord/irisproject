@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>im.meowlabs.iris-cleanup</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/usr/local/lib/iris/iris-api-launch.sh</string>
+		<string>/usr/local/bin/iris-api</string>
+		<string>cleanup-once</string>
+	</array>
+	<key>WorkingDirectory</key>
+	<string>/var/lib/iris</string>
+	<key>UserName</key>
+	<string>iris</string>
+	<key>GroupName</key>
+	<string>iris</string>
+	<key>StartInterval</key>
+	<integer>900</integer>
+	<key>StandardOutPath</key>
+	<string>/var/lib/iris/cleanup.log</string>
+	<key>StandardErrorPath</key>
+	<string>/var/lib/iris/cleanup.log</string>
+</dict>
+</plist>
