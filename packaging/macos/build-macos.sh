@@ -60,7 +60,11 @@ done
 # Built from this repo checkout. A release build must run from the
 # release tag (packaging/VERSION must equal the tag version), so refuse
 # a dirty tree: a package must never silently bundle uncommitted changes.
-[ -z "$(git -C "$IRIS_PROJECT" status --porcelain)" ] || { echo "irisproject tree is dirty; commit or stash before building a package"; exit 1; }
+# Tracked files only (--untracked-files=no): the downloads this script
+# just fetched live in packaging/macos/build/, and build outputs
+# (target/, dist/) are untracked too; counting them would make the
+# check fail on its own work.
+[ -z "$(git -C "$IRIS_PROJECT" status --porcelain --untracked-files=no)" ] || { echo "irisproject tree is dirty; commit or stash before building a package"; exit 1; }
 WEB_DIST="$IRIS_PROJECT/apps/web/dist"
 if [ ! -f "$WEB_DIST/index.html" ]; then
   echo "== building web dist (this takes a few minutes)"
