@@ -46,11 +46,11 @@ for arch in $WANT; do
   esac
   if [ ! -f "$DOWNLOADS/$S_ASSET" ]; then
     echo "== downloading stalwart $arch ($S_ASSET)"
-    curl -fsSL "https://github.com/stalwartlabs/stalwart/releases/download/v$STALWART_VERSION/$S_ASSET" -o "$DOWNLOADS/$S_ASSET"
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/stalwartlabs/stalwart/releases/download/v$STALWART_VERSION/$S_ASSET" -o "$DOWNLOADS/$S_ASSET"
   fi
   if [ ! -f "$DOWNLOADS/$C_ASSET" ]; then
     echo "== downloading caddy $arch ($C_ASSET)"
-    curl -fsSL "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$C_ASSET" -o "$DOWNLOADS/$C_ASSET"
+    curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$C_ASSET" -o "$DOWNLOADS/$C_ASSET"
   fi
   echo "$S_SHA  $DOWNLOADS/$S_ASSET" | shasum -a 256 -c -
   echo "$C_SHA  $DOWNLOADS/$C_ASSET" | shasum -a 256 -c -
