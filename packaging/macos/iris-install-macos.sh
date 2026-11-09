@@ -102,6 +102,12 @@ chown stalwart:stalwart /var/lib/stalwart /var/log/stalwart
 chown caddy:caddy /var/lib/caddy /var/log/caddy
 chmod 750 /var/lib/iris /var/lib/stalwart /var/log/stalwart /var/lib/caddy /var/log/caddy
 chmod 750 /etc/iris /etc/stalwart
+# macOS-only: launchd has no EnvironmentFile, so iris-api-launch.sh
+# (running as user iris) must read /etc/iris/iris.env itself. The
+# directory must therefore be group iris, or the daemon cannot even
+# traverse it and dies with "iris.env missing". (On Linux systemd
+# reads the EnvironmentFile as root, so the same layout works there.)
+chown root:iris /etc/iris
 chown root:stalwart /etc/stalwart /etc/stalwart/tls
 chmod 750 /etc/stalwart/tls
 

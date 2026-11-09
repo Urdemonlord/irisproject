@@ -35,6 +35,7 @@ need "iris-cert-sync loaded" launchctl print system/im.meowlabs.iris-cert-sync
 
 echo "== files and config"
 need "plists are root-owned (launchd refuses foreign-owned plists)" sh -c 'test "$(stat -f %Su /Library/LaunchDaemons/im.meowlabs.iris-api.plist)" = root'
+need "iris user can read /etc/iris/iris.env (launchd has no EnvironmentFile)" sh -c 'sudo -u iris test -r /etc/iris/iris.env'
 need "api plist runs as the iris user" sh -c 'grep -q "<key>UserName</key>" /Library/LaunchDaemons/im.meowlabs.iris-api.plist && grep -A1 "<key>UserName</key>" /Library/LaunchDaemons/im.meowlabs.iris-api.plist | grep -q "<string>iris</string>"'
 need "stalwart runs as root by design (no UserName in plist)" sh -c '! grep -q UserName /Library/LaunchDaemons/im.meowlabs.iris-stalwart.plist'
 need "caddy runs as root by design (no UserName in plist)" sh -c '! grep -q UserName /Library/LaunchDaemons/im.meowlabs.iris-caddy.plist'
