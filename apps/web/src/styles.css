@@ -583,7 +583,7 @@ div.form-error:not(:empty) { background: var(--iris-vermilion-wash); padding: va
 
 /* ---------- Folders, compose, actions ---------- */
 .compose-btn { width: 100%; height: 44px; margin-bottom: var(--iris-space-2); font-size: var(--iris-text-base); }
-.nav-mail, .folder-tabs, .fab { display: none; }
+.nav-mail, .nav-organize, .folder-tabs, .fab { display: none; }
 .draft-tag { flex: none; font-family: var(--iris-font-mono); font-size: var(--iris-text-label); letter-spacing: var(--iris-tracking-label); text-transform: uppercase; color: var(--iris-vermilion); font-weight: 600; }
 .msg-clip { color: var(--iris-graphite); }
 .btn-danger { background: var(--iris-danger); color: var(--iris-cream); border-color: var(--iris-danger); }
@@ -688,6 +688,18 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 @media (max-width: 767px) {
   .compose-btn, .sidebar .nav-folder { display: none; }
   .nav-mail { display: flex; }
+  .nav-organize { display: flex; }
+  /* Phone bottom bar order matches mobileNav: Mail, Temp, Organize, DMARC, Admin. */
+  .sidebar .nav-mail { order: 1; }
+  .sidebar .nav-temp { order: 2; }
+  .sidebar .nav-organize { order: 3; }
+  .sidebar .nav-dmarc { order: 4; }
+  .sidebar .nav-admin { order: 5; }
+  /* The temp start page has the section nav on phones now; lift the
+   * footer content above the fixed bar. (Padding on main cannot move
+   * the footer: the shell is min-height 100dvh and main is flex:1, so
+   * the slack absorbs it. Padding the footer itself moves its links.) */
+  #app:has(> .mobile-nav) > .site-footer { padding-bottom: calc(var(--iris-space-4) + 72px); }
   .folder-tabs { display: flex; gap: var(--iris-space-1); overflow-x: auto; scrollbar-width: none; padding: var(--iris-space-2) var(--iris-space-3); border-bottom: var(--iris-rule-hair); background: var(--iris-surface); flex: none; }
   .folder-tabs::-webkit-scrollbar { display: none; }
   .folder-tab { flex: none; display: inline-flex; align-items: center; gap: 6px; height: 34px; padding: 0 var(--iris-space-3); border: 1px solid var(--iris-rule); border-radius: 999px; font-size: var(--iris-text-sm); font-weight: 500; color: var(--iris-text-secondary); text-decoration: none; }
@@ -864,3 +876,15 @@ dialog.confirm h2 { font-family: var(--iris-font-display); font-weight: 800; fon
 .admin-secret[hidden] { display: none; }
 .admin-secret-row { display: flex; gap: var(--iris-space-2); align-items: center; }
 .admin-secret-row input { flex: 1; height: 42px; padding: 0 var(--iris-space-3); border: 1.5px solid var(--iris-stone); border-radius: var(--iris-radius-1); background: var(--iris-cream-raised); color: var(--iris-text); font-family: var(--iris-font-mono); font-size: var(--iris-text-sm); }
+
+/* ---------- Phones: instant navigation ---------- */
+/* The pane-head fade and the staggered message rows made every tap look
+ * like the old page was lingering under the new one on a slow phone.
+ * This block must stay AFTER the Motion rules above: same specificity,
+ * later wins. */
+@media (max-width: 767px) {
+  .pane-head, .temp-list-head, .expiry-rail,
+  .message-list.stagger .msg-item,
+  .mail-layout[data-view="list"] .list-pane,
+  .reader-body > * { animation: none; }
+}

@@ -1641,6 +1641,13 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
     h('a', { href: folderHash(f.role), className: 'folder-tab', ...(f.role === folder ? { 'aria-current': 'page' } : {}) }, f.label, tabCounts.get(f.role)!)), nav.tabs)
 
   const idle = () => emptyState('mail', 'No message selected', 'Choose a message from the list to read it here.')
+  // Phone bottom-bar items: the sidebar becomes a fixed bottom bar on
+  // phones, and these classes order it Mail, Temp, Organize, DMARC, Admin
+  // (same as mobileNav). The Organize item is phone-only.
+  const dmarcNav = navItem('#/dmarc', 'shield', 'DMARC reports'); dmarcNav.classList.add('nav-dmarc')
+  const tempNav = navItem('#/temp', 'timer', 'Temporary inbox'); tempNav.classList.add('nav-temp')
+  const orgNavItem = navItem('#/organize', 'filter', 'Organize'); orgNavItem.classList.add('nav-organize')
+  const adminNav = navItem('#/admin', 'account', 'Admin'); adminNav.classList.add('nav-admin')
   const ui = mailShell({
     topbar,
     nav: [
@@ -1653,11 +1660,12 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       }),
       nav.starred,
       nav.sidebar,
-      navItem('#/dmarc', 'shield', 'DMARC reports'),
+      dmarcNav,
       h('a', { href: viewHash(view), className: 'nav-item nav-mail', 'aria-current': 'page' }, icon('mail'), h('span', { className: 'nav-label' }, 'Mail')),
       navSection('Temporary'),
-      navItem('#/temp', 'timer', 'Temporary inbox'),
-      ...(is_admin ? [navSection('Admin'), navItem('#/admin', 'account', 'Admin')] : []),
+      tempNav,
+      orgNavItem,
+      ...(is_admin ? [navSection('Admin'), adminNav] : []),
       footerLinks('sidebar-footer'),
     ],
     listTop: [h('header', { className: 'pane-head' }, title, unreadChip, refresh), folderTabs],
@@ -2494,7 +2502,11 @@ async function renderTempStart(note = '') {
         h('li', {}, icon('shield'), h('span', {}, 'Not for sensitive or long-term mail.'))),
       status,
       h('div', { className: 'sticky-cta' }, create),
-      h('p', { className: 'auth-alt' }, loggedIn ? h('a', { href: '#/', className: 'link' }, 'Go to your mailbox →') : h('span', {}, 'Have an account? ', h('a', { href: '#/', className: 'link' }, 'Sign in →'))))),
+      h('p', { className: 'auth-alt' }, loggedIn ? h('a', { href: '#/', className: 'link' }, 'Go to your mailbox →') : h('span', {}, 'Have an account? ', h('a', { href: '#/', className: 'link' }, 'Sign in →')))));
+  // Logged-in users get the section nav too: the temp start page is a
+  // simple page with no sidebar, so without this the Temp tab is a dead
+  // end on phones (only "Go to your mailbox" leads out).
+  if (loggedIn) app.append(mobileNav('temp', account?.is_admin === true))
   create.focus({ preventScroll: true })
 }
 
