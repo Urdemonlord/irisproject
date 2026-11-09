@@ -305,6 +305,7 @@ mod tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 password_reset_service_token: String::new(),
@@ -312,6 +313,7 @@ mod tests {
                 password_reset_email_to: String::new(),
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
             },
         })

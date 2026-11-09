@@ -51,6 +51,10 @@ pub struct Config {
     pub send_external: bool,
     /// Resend API key; when set, mail to other domains is relayed through Resend.
     pub resend_api_key: String,
+    /// Brevo API key; when set, Brevo is the second provider in the
+    /// outbound relay chain (after Resend), tried when Resend answers
+    /// with a definitive HTTP refusal.
+    pub brevo_api_key: String,
     /// Fixed sender identity for the Iris transactional-email API.
     pub integration_email_from: String,
     /// Explicit opt-in for integration email delivery; defaults to disabled.
@@ -75,6 +79,9 @@ pub struct Config {
     pub password_reset_public_origin: String,
     /// Relay endpoint; production is pinned to the official Resend endpoint.
     pub resend_api_url: String,
+    /// Brevo relay endpoint; production is pinned to the official
+    /// Brevo endpoint, mirroring `resend_api_url`.
+    pub brevo_api_url: String,
     /// Separate origin that serves HTML mail bodies (e.g.
     /// `https://mail-content.example.com`). Empty = disabled: the web keeps
     /// rendering HTML mail in a same-origin srcdoc iframe. Only used to
@@ -97,6 +104,8 @@ impl Config {
         let env = std::env::var("IRIS_ENV").unwrap_or_else(|_| "development".to_string());
         let resend_api_url =
             resend_api_endpoint(&env, std::env::var("IRIS_RESEND_API_URL").ok().as_deref());
+        let brevo_api_url =
+            brevo_api_endpoint(&env, std::env::var("IRIS_BREVO_API_URL").ok().as_deref());
         let turnstile_siteverify_url = turnstile_siteverify_endpoint(
             &env,
             std::env::var("TURNSTILE_SITEVERIFY_URL").ok().as_deref(),
@@ -140,6 +149,7 @@ impl Config {
             send_external: std::env::var("SEND_EXTERNAL")
                 .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true")),
             resend_api_key: std::env::var("RESEND_API_KEY").unwrap_or_default(),
+            brevo_api_key: std::env::var("BREVO_API_KEY").unwrap_or_default(),
             integration_email_from: std::env::var("IRIS_INTEGRATION_EMAIL_FROM")
                 .unwrap_or_default(),
             integration_email_enabled: std::env::var("IRIS_INTEGRATION_EMAIL_ENABLED")
@@ -161,6 +171,7 @@ impl Config {
                 std::env::var("TIMELESS_PUBLIC_ORIGIN").ok(),
             ),
             resend_api_url,
+            brevo_api_url,
             mail_content_origin: normalize_mail_content_origin(
                 std::env::var("MAIL_CONTENT_ORIGIN").ok().as_deref(),
             ),
@@ -338,6 +349,23 @@ fn resend_api_endpoint(env: &str, override_url: Option<&str>) -> String {
     }
 }
 
+/// Brevo relay endpoint. Mirrors `resend_api_endpoint`: production
+/// is pinned to Brevo's official send endpoint, so a misconfigured
+/// deploy can never POST the secret key to an arbitrary host.
+fn brevo_api_endpoint(env: &str, override_url: Option<&str>) -> String {
+    const BREVO_URL: &str = "https://api.brevo.com/v3/smtp/email";
+    if env.eq_ignore_ascii_case("production") {
+        return BREVO_URL.to_string();
+    }
+    match override_url
+        .map(str::trim)
+        .filter(|url| is_local_http_endpoint(url))
+    {
+        Some(url) => url.to_string(),
+        None => BREVO_URL.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +384,35 @@ mod tests {
             resend_api_endpoint("development", Some("http://127.0.0.1:8765")),
             "http://127.0.0.1:8765"
         );
+    }
+
+    #[test]
+    fn brevo_production_ignores_local_relay_override() {
+        assert_eq!(
+            brevo_api_endpoint("production", Some("http://127.0.0.1:8765")),
+            "https://api.brevo.com/v3/smtp/email"
+        );
+    }
+
+    #[test]
+    fn brevo_development_uses_configured_local_relay_override() {
+        assert_eq!(
+            brevo_api_endpoint("development", Some("http://127.0.0.1:8765")),
+            "http://127.0.0.1:8765"
+        );
+    }
+
+    #[test]
+    fn brevo_rejects_localhost_userinfo_tricks_that_target_remote_hosts() {
+        for url in [
+            "http://localhost:8765@attacker.invalid/smtp/email",
+            "http://127.0.0.1:8765@attacker.invalid/smtp/email",
+        ] {
+            assert_eq!(
+                brevo_api_endpoint("development", Some(url)),
+                "https://api.brevo.com/v3/smtp/email"
+            );
+        }
     }
 
     #[test]

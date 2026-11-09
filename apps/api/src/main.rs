@@ -19,8 +19,8 @@ use iris_config::limits::{
 };
 use iris_config::Config;
 use iris_mail::{
-    extract_text_attachment, valid_label, Attachment, Compose, JmapClient, ListPage, MailError,
-    MessageDetail, ResendClient, View,
+    extract_text_attachment, valid_label, Attachment, BrevoClient, Compose, JmapClient, ListPage,
+    MailError, MessageDetail, Relay, RelayChain, ResendClient, View,
 };
 use serde::Deserialize;
 use serde_json::json;
@@ -63,8 +63,9 @@ pub(crate) struct AppState {
     /// task per subscribed mailbox, started on first subscribe and
     /// stopped when the last tab disconnects (see `notify`).
     mail_watch: notify::MailWatch,
-    /// Outbound relay for other domains (None = only local domains can be reached).
-    relay: Option<ResendClient>,
+    /// Outbound relay chain for other domains (None = only local
+    /// domains can be reached). Tries Resend first, then Brevo.
+    relay: Option<RelayChain>,
     /// Integration apps registry, loaded from the database at startup
     /// and refreshed by the admin app endpoints after every mutation,
     /// so the send path and key creation always see the current
@@ -126,8 +127,9 @@ impl From<MailError> for ApiError {
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
             MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
             MailError::NotEmpty => ApiError(StatusCode::CONFLICT, "folder_not_empty"),
-            // The mail server could not be reached at all.
-            MailError::Unavailable(_) => {
+            // The mail server could not be reached at all, or every
+            // relay in the chain answered with an error.
+            MailError::Unavailable(_) | MailError::RelayFailed(_) => {
                 ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable")
             }
             // The mail server answered, but with something unexpected
@@ -196,12 +198,25 @@ async fn main() {
             .build()
             .expect("reqwest client"),
         mail_watch: notify::MailWatch::from_limits(),
-        relay: (!config.resend_api_key.is_empty()).then(|| {
-            ResendClient::with_endpoint(
-                config.resend_api_key.clone(),
-                config.resend_api_url.clone(),
-            )
-        }),
+        relay: {
+            // One provider per configured key, in try order: Resend
+            // first, Brevo second. No relay at all when neither key
+            // is set, so only local domains can be reached.
+            let mut providers = Vec::new();
+            if !config.resend_api_key.is_empty() {
+                providers.push(Relay::Resend(ResendClient::with_endpoint(
+                    config.resend_api_key.clone(),
+                    config.resend_api_url.clone(),
+                )));
+            }
+            if !config.brevo_api_key.is_empty() {
+                providers.push(Relay::Brevo(BrevoClient::with_endpoint(
+                    config.brevo_api_key.clone(),
+                    config.brevo_api_url.clone(),
+                )));
+            }
+            (!providers.is_empty()).then(|| RelayChain::new(providers))
+        },
         registry: tokio::sync::RwLock::new(registry_apps),
         config: config.clone(),
     });
@@ -1524,7 +1539,7 @@ mod password_reset_webhook_tests {
             organize_lock: tokio::sync::Mutex::new(()),
             jmap: JmapClient::new("http://127.0.0.1:9".into()),
             http: reqwest::Client::new(),
-            relay,
+            relay: relay.map(|client| RelayChain::new(vec![Relay::Resend(client)])),
             registry: tokio::sync::RwLock::new(integration_apps::default_registry()),
             html_bodies: html_body::HtmlBodyStore::new(),
             mail_watch: notify::MailWatch::from_limits(),
@@ -1545,6 +1560,7 @@ mod password_reset_webhook_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: true,
                 password_reset_service_token: service_key.into(),
@@ -1552,6 +1568,7 @@ mod password_reset_webhook_tests {
                 password_reset_email_to: recipient.into(),
                 password_reset_public_origin: origin.into(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
                 admin_emails: Vec::new(),
             },
@@ -2263,6 +2280,7 @@ mod read_limit_tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 password_reset_service_token: String::new(),
@@ -2270,6 +2288,7 @@ mod read_limit_tests {
                 password_reset_email_to: String::new(),
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
                 admin_emails: Vec::new(),
             },
@@ -2738,7 +2757,7 @@ mod handler_integration_tests {
             organize_lock: tokio::sync::Mutex::new(()),
             jmap: JmapClient::new(jmap.base_url.clone()),
             http: reqwest::Client::new(),
-            relay,
+            relay: relay.map(|client| RelayChain::new(vec![Relay::Resend(client)])),
             registry: tokio::sync::RwLock::new(integration_apps::default_registry()),
             html_bodies: html_body::HtmlBodyStore::new(),
             mail_watch: notify::MailWatch::from_limits(),
@@ -2759,6 +2778,7 @@ mod handler_integration_tests {
                 send_local_domains: vec!["example.com".into()],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 password_reset_service_token: String::new(),
@@ -2766,6 +2786,7 @@ mod handler_integration_tests {
                 password_reset_email_to: String::new(),
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
                 admin_emails: Vec::new(),
             },

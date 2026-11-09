@@ -56,6 +56,7 @@ type RecentRequestRow = (
     String,
     Option<String>,
     Option<String>,
+    Option<String>,
     String,
 );
 /// One row of the integration-keys list: id, app, status, daily limit,
@@ -169,19 +170,29 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
     }
     let recent_rows: Vec<RecentRequestRow> =
         sqlx::query_as(
-            "SELECT r.id, k.app_id, r.template_id, r.status, r.provider_message_id, r.error_message, r.created_at FROM integration_email_requests r JOIN integration_keys k ON k.key_id=r.key_id ORDER BY r.created_at DESC LIMIT 20",
+            "SELECT r.id, k.app_id, r.template_id, r.status, r.provider, r.provider_message_id, r.error_message, r.created_at FROM integration_email_requests r JOIN integration_keys k ON k.key_id=r.key_id ORDER BY r.created_at DESC LIMIT 20",
         )
         .fetch_all(&s.pool)
         .await?;
     let recent: Vec<_> = recent_rows
         .into_iter()
         .map(
-            |(id, app_id, template_id, status, provider_message_id, error_message, created_at)| {
+            |(
+                id,
+                app_id,
+                template_id,
+                status,
+                provider,
+                provider_message_id,
+                error_message,
+                created_at,
+            )| {
                 json!({
                     "id": id,
                     "app_id": app_id,
                     "template_id": template_id,
                     "status": status,
+                    "provider": provider,
                     "provider_message_id": provider_message_id,
                     "error_message": error_message,
                     "created_at": created_at,
@@ -309,6 +320,11 @@ pub(crate) async fn summary(State(s): S, Extension(u): Extension<CurrentUser>) -
             },
             "integration_email_enabled": s.config.integration_email_enabled,
             "relay_configured": s.relay.is_some(),
+            "relay_providers": s
+                .relay
+                .as_ref()
+                .map(|relay| relay.provider_names())
+                .unwrap_or_default(),
         },
         "delivery": {
             "transactional_last_24h": last_24h,
@@ -882,6 +898,7 @@ mod tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: String::new(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: false,
                 password_reset_service_token: String::new(),
@@ -889,6 +906,7 @@ mod tests {
                 password_reset_email_to: String::new(),
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
                 admin_emails,
             },

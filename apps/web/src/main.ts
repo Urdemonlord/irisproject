@@ -2410,12 +2410,13 @@ type AdminSummary = {
     organize: { max_labels: number; max_custom_folders: number; max_filters: number }
     integration_email_enabled: boolean
     relay_configured: boolean
+    relay_providers: string[]
   }
   delivery: {
     transactional_last_24h: Record<string, number>
     transactional_last_7d: Record<string, number>
     transactional_per_app_last_7d: Record<string, Record<string, number>>
-    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider_message_id: string | null; error_message: string | null; created_at: string }[]
+    transactional_recent: { id: string; app_id: string; template_id: string; status: string; provider: string | null; provider_message_id: string | null; error_message: string | null; created_at: string }[]
     integration_keys: { key_id: string; app_id: string; status: string; daily_send_limit: number; last_used_at: string | null; expires_at: string | null }[]
     integration_apps: { id: string; host: string; templates: string[] }[]
     user_sends_last_24h: number
@@ -2715,14 +2716,14 @@ async function renderAdmin() {
           ['Custom folders', String(s.quotas.organize.max_custom_folders)],
           ['Filters', String(s.quotas.organize.max_filters)],
           ['Transactional email', s.quotas.integration_email_enabled ? 'enabled' : 'disabled'],
-          ['Outbound relay', s.quotas.relay_configured ? 'configured' : 'not configured'],
+          ['Outbound relay', s.quotas.relay_providers.length ? s.quotas.relay_providers.join(', ') : 'not configured'],
         ])),
       section('Delivery', 'Transactional email is the API that lets companion apps send auth mail. User sends are counted in aggregate only; individual sends are not attributed.',
         h('p', { className: 'muted' }, `Last 24h: ${countsText(t24)}`),
         h('p', { className: 'muted' }, `Last 7 days: ${countsText(s.delivery.transactional_last_7d)}`),
         table(['App', 'Accepted', 'Failed', 'Sending', 'Unknown'], perAppRows.length ? perAppRows : [['—', '0', '0', '0', '0']]),
-        table(['Time', 'App', 'Template', 'Status', 'Provider id', 'Error'], s.delivery.transactional_recent.map((r) => [
-          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider_message_id ?? '—', r.error_message ?? '—',
+        table(['Time', 'App', 'Template', 'Status', 'Provider', 'Provider id', 'Error'], s.delivery.transactional_recent.map((r) => [
+          fmtDate(r.created_at), r.app_id, r.template_id, r.status, r.provider ?? '—', r.provider_message_id ?? '—', r.error_message ?? '—',
         ])),
         table(['App', 'Status', 'Daily limit', 'Last used', 'Expires', 'Actions'], s.delivery.integration_keys.map((k) => [
           k.app_id, k.status, String(k.daily_send_limit), k.last_used_at ? fmtDate(k.last_used_at) : '—', k.expires_at ? fmtDate(k.expires_at) : '—',

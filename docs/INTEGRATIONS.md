@@ -5,8 +5,9 @@ IRIS: email verification, password reset, and sign-in links. That is
 all it sends. It is not a bulk mailer, and it does not send mail on
 behalf of anyone except a registered companion app.
 
-Delivery goes through the configured outbound relay (Resend). Every
-message is sent from one fixed sender address,
+Delivery goes through the configured outbound relays, in order:
+Resend first, then Brevo when it is configured (see section 7).
+Every message is sent from one fixed sender address,
 `IRIS_INTEGRATION_EMAIL_FROM`. Recipients are never stored in plain
 text, only as hashes, and the request body a caller sends is at most
 8 KiB.
@@ -220,8 +221,9 @@ fresh idempotency key.
 ### A send answers 503 `delivery_disabled`
 
 Integration email is not enabled on this IRIS host. The operator must
-set `IRIS_INTEGRATION_EMAIL_ENABLED=true`, `RESEND_API_KEY`, and a
-valid `IRIS_INTEGRATION_EMAIL_FROM`, then restart the API.
+set `IRIS_INTEGRATION_EMAIL_ENABLED=true`, a valid
+`IRIS_INTEGRATION_EMAIL_FROM`, and at least one relay key
+(`RESEND_API_KEY` or `BREVO_API_KEY`), then restart the API.
 
 ### A send answers 409 `idempotency_conflict`
 
@@ -245,3 +247,28 @@ Requests that failed before this release carry no reason, because no
 reason was stored then. New failures store the relay reason. If a
 recent failure still shows no reason, it failed before the relay
 was reached or the relay returned no message.
+
+## 7. Relay failover
+
+IRIS sends through a chain of outbound relays, in order: Resend
+first, then Brevo. Configure either or both with `RESEND_API_KEY`
+and `BREVO_API_KEY`; the chain exists when at least one key is set,
+and a Brevo-only setup sends through Brevo alone. In production the
+endpoints are pinned to the official ones (`api.resend.com` and
+`api.brevo.com`); outside production, `IRIS_RESEND_API_URL` and
+`IRIS_BREVO_API_URL` accept a local test endpoint, the same way.
+
+Failover happens only when a relay definitively refuses with an HTTP
+error (bad credentials, rate limit, server error). It never happens
+when the outcome is unknown: a transport error with no HTTP response
+means the message may already be accepted, so retrying elsewhere
+could send it twice. It also never happens on a permanent refusal
+(a bad recipient fails on every provider), which answers 422
+`failed` at once. A 2xx answer with no provider id is recorded as
+`unknown`, not retried.
+
+The Delivery section of the admin dashboard shows which relay
+delivered each request (Provider column) and which relays are
+configured (Quotas section). The Brevo account must verify the
+sender address or domain, the same as Resend: an unverified sender
+is refused with 400. Brevo's free tier allows 300 sends per day.

@@ -113,7 +113,7 @@ fn send_response(status: StatusCode, request_id: &str, delivery_status: &str) ->
 }
 
 /// Cap a stored relay reason so a hostile or chatty relay cannot bloat
-/// the requests table. 500 chars is far more than any Resend message.
+/// the requests table. 500 chars is far more than any relay message.
 fn cap_reason(reason: &str) -> String {
     if reason.chars().count() > 500 {
         reason.chars().take(500).collect()
@@ -241,38 +241,17 @@ pub async fn send(
         ));
     };
     match relay.send(&message).await {
-        Ok(provider_id) if !provider_id.trim().is_empty() => {
-            sqlx::query("UPDATE integration_email_requests SET status='accepted',provider_message_id=?,updated_at=? WHERE id=?")
-                .bind(provider_id).bind(auth::now()).bind(&request_id).execute(&state.pool).await
+        Ok(receipt) if !receipt.message_id.trim().is_empty() => {
+            sqlx::query("UPDATE integration_email_requests SET status='accepted',provider=?,provider_message_id=?,updated_at=? WHERE id=?")
+                .bind(receipt.provider).bind(receipt.message_id).bind(auth::now()).bind(&request_id).execute(&state.pool).await
                 ?;
             send_response(StatusCode::ACCEPTED, &request_id, "accepted")
         }
-        // The relay refused the message: store its reason so the failure
-        // is diagnosable from the admin dashboard instead of a bare
-        // `failed` status with no cause.
-        Err(iris_mail::MailError::Rejected(detail)) => {
-            let reason = cap_reason(&detail);
-            tracing::warn!(
-                request_id = %request_id,
-                app_id = %principal.app_id,
-                template_id = %body.template_id,
-                reason = %reason,
-                "transactional email rejected by relay"
-            );
-            sqlx::query(
-                "UPDATE integration_email_requests SET status='failed',error_message=?,updated_at=? WHERE id=?",
-            )
-            .bind(&reason)
-            .bind(auth::now())
-            .bind(&request_id)
-            .execute(&state.pool)
-            .await?;
-            send_response(StatusCode::UNPROCESSABLE_ENTITY, &request_id, "failed")
-        }
-        Ok(_) => {
+        Ok(receipt) => {
             // The relay answered 2xx with no provider id: nothing was
             // proven delivered, so the request stays `unknown` and the
-            // reason is stored the same way.
+            // reason is stored the same way. The provider is known
+            // (it answered), so it is recorded too.
             let reason = "relay returned an empty provider id";
             tracing::warn!(
                 request_id = %request_id,
@@ -282,8 +261,9 @@ pub async fn send(
                 "transactional email relay returned no provider id"
             );
             sqlx::query(
-                "UPDATE integration_email_requests SET status='unknown',error_message=?,updated_at=? WHERE id=?",
+                "UPDATE integration_email_requests SET status='unknown',provider=?,error_message=?,updated_at=? WHERE id=?",
             )
+            .bind(receipt.provider)
             .bind(reason)
             .bind(auth::now())
             .bind(&request_id)
@@ -292,23 +272,55 @@ pub async fn send(
             send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
         }
         Err(err) => {
-            let reason = cap_reason(&err.to_string());
-            tracing::warn!(
-                request_id = %request_id,
-                app_id = %principal.app_id,
-                template_id = %body.template_id,
-                reason = %reason,
-                "transactional email relay error"
-            );
-            sqlx::query(
-                "UPDATE integration_email_requests SET status='unknown',error_message=?,updated_at=? WHERE id=?",
-            )
-            .bind(&reason)
-            .bind(auth::now())
-            .bind(&request_id)
-            .execute(&state.pool)
-            .await?;
-            send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
+            // Which relay the error came from (the last one attempted),
+            // for the `provider` column; `None` when the error was not
+            // produced by this chain.
+            let provider = relay.provider_of_error(&err);
+            match err {
+                // The relay refused the message: store its reason so the failure
+                // is diagnosable from the admin dashboard instead of a bare
+                // `failed` status with no cause.
+                iris_mail::MailError::Rejected(detail) => {
+                    let reason = cap_reason(&detail);
+                    tracing::warn!(
+                        request_id = %request_id,
+                        app_id = %principal.app_id,
+                        template_id = %body.template_id,
+                        reason = %reason,
+                        "transactional email rejected by relay"
+                    );
+                    sqlx::query(
+                        "UPDATE integration_email_requests SET status='failed',provider=?,error_message=?,updated_at=? WHERE id=?",
+                    )
+                    .bind(provider)
+                    .bind(&reason)
+                    .bind(auth::now())
+                    .bind(&request_id)
+                    .execute(&state.pool)
+                    .await?;
+                    send_response(StatusCode::UNPROCESSABLE_ENTITY, &request_id, "failed")
+                }
+                other => {
+                    let reason = cap_reason(&other.to_string());
+                    tracing::warn!(
+                        request_id = %request_id,
+                        app_id = %principal.app_id,
+                        template_id = %body.template_id,
+                        reason = %reason,
+                        "transactional email relay error"
+                    );
+                    sqlx::query(
+                        "UPDATE integration_email_requests SET status='unknown',provider=?,error_message=?,updated_at=? WHERE id=?",
+                    )
+                    .bind(provider)
+                    .bind(&reason)
+                    .bind(auth::now())
+                    .bind(&request_id)
+                    .execute(&state.pool)
+                    .await?;
+                    send_response(StatusCode::SERVICE_UNAVAILABLE, &request_id, "unknown")
+                }
+            }
         }
     }
 }
@@ -600,7 +612,7 @@ mod tests {
         }
     }
 
-    async fn relay_state(relay: iris_mail::ResendClient) -> (Arc<crate::AppState>, String) {
+    async fn relay_state(relay: iris_mail::RelayChain) -> (Arc<crate::AppState>, String) {
         use iris_config::Config;
         let pool = iris_database::init_pool("sqlite::memory:").await.unwrap();
         let generated = auth::generate_api_key();
@@ -641,6 +653,7 @@ mod tests {
                 send_local_domains: vec![],
                 send_external: false,
                 resend_api_key: "test-resend-key".into(),
+                brevo_api_key: String::new(),
                 integration_email_from: "no-reply@example.com".into(),
                 integration_email_enabled: true,
                 password_reset_service_token: String::new(),
@@ -648,6 +661,7 @@ mod tests {
                 password_reset_email_to: String::new(),
                 password_reset_public_origin: String::new(),
                 resend_api_url: String::new(),
+                brevo_api_url: String::new(),
                 mail_content_origin: String::new(),
                 admin_emails: Vec::new(),
             },
@@ -680,11 +694,11 @@ mod tests {
             r#"{"message":"recipient address rejected"}"#,
         )
         .await;
-        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
-            "test-key".into(),
-            relay.endpoint.clone(),
-        ))
-        .await;
+        let (state, token) =
+            relay_state(iris_mail::RelayChain::new(vec![iris_mail::Relay::Resend(
+                iris_mail::ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()),
+            )]))
+            .await;
         let resp = send(
             State(state.clone()),
             send_headers(&token, "rej-001"),
@@ -694,14 +708,16 @@ mod tests {
         .expect("a relay rejection answers, it does not raise");
         assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
         relay.task.abort();
-        let row: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='rej-001'",
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, error_message FROM integration_email_requests WHERE idempotency_key='rej-001'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
         assert_eq!(row.0, "failed");
-        assert_eq!(row.1.as_deref(), Some("recipient address rejected"));
+        // The reason names the relay that refused it.
+        assert_eq!(row.1.as_deref(), Some("resend"));
+        assert_eq!(row.2.as_deref(), Some("resend: recipient address rejected"));
     }
 
     #[tokio::test]
@@ -711,11 +727,11 @@ mod tests {
             r#"{"message":"relay exploded"}"#,
         )
         .await;
-        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
-            "test-key".into(),
-            relay.endpoint.clone(),
-        ))
-        .await;
+        let (state, token) =
+            relay_state(iris_mail::RelayChain::new(vec![iris_mail::Relay::Resend(
+                iris_mail::ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()),
+            )]))
+            .await;
         let resp = send(
             State(state.clone()),
             send_headers(&token, "unk-001"),
@@ -725,18 +741,20 @@ mod tests {
         .expect("a relay error answers, it does not raise");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         relay.task.abort();
-        let row: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='unk-001'",
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, error_message FROM integration_email_requests WHERE idempotency_key='unk-001'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
         assert_eq!(row.0, "unknown");
+        assert_eq!(row.1.as_deref(), Some("resend"));
         // The relay formats the Resend message value as JSON, so the
-        // stored reason keeps its quotes.
+        // stored reason keeps its quotes; the chain prefixes the relay
+        // that produced the error.
         assert_eq!(
-            row.1.as_deref(),
-            Some("mail server unavailable: relay HTTP 500: \"relay exploded\"")
+            row.2.as_deref(),
+            Some("relay failed: resend: relay HTTP 500: \"relay exploded\"")
         );
     }
 
@@ -745,10 +763,9 @@ mod tests {
         // The app exists only in the database (registered from the
         // dashboard), never in the env seed or the example registry.
         let relay = fake_relay_capturing("200 OK", r#"{"id":"prov-1"}"#).await;
-        let (state, _) = relay_state(iris_mail::ResendClient::with_endpoint(
-            "test-key".into(),
-            relay.endpoint.clone(),
-        ))
+        let (state, _) = relay_state(iris_mail::RelayChain::new(vec![iris_mail::Relay::Resend(
+            iris_mail::ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()),
+        )]))
         .await;
         let now = auth::now();
         sqlx::query("INSERT INTO integration_apps (id, host, created_at) VALUES ('dbapp','dbapp.example.com',?)")
@@ -789,14 +806,15 @@ mod tests {
         assert!(text.contains("Verify via DB App"));
         assert!(text.contains("Open this link to verify."));
         assert!(text.contains("https://dbapp.example.com/verify?token=abc"));
-        let row: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, provider_message_id FROM integration_email_requests WHERE idempotency_key='db-001'",
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, provider_message_id FROM integration_email_requests WHERE idempotency_key='db-001'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
         assert_eq!(row.0, "accepted");
-        assert_eq!(row.1.as_deref(), Some("prov-1"));
+        assert_eq!(row.1.as_deref(), Some("resend"));
+        assert_eq!(row.2.as_deref(), Some("prov-1"));
         // And the same send to the example host is refused for this
         // app: the host rule follows the database row.
         let body = SendEmailBody {
@@ -818,11 +836,11 @@ mod tests {
     #[tokio::test]
     async fn empty_provider_id_stores_a_reason_and_stays_unknown() {
         let relay = fake_relay("200 OK", r#"{"id":""}"#).await;
-        let (state, token) = relay_state(iris_mail::ResendClient::with_endpoint(
-            "test-key".into(),
-            relay.endpoint.clone(),
-        ))
-        .await;
+        let (state, token) =
+            relay_state(iris_mail::RelayChain::new(vec![iris_mail::Relay::Resend(
+                iris_mail::ResendClient::with_endpoint("test-key".into(), relay.endpoint.clone()),
+            )]))
+            .await;
         let resp = send(
             State(state.clone()),
             send_headers(&token, "empty-001"),
@@ -832,16 +850,167 @@ mod tests {
         .expect("an empty provider id answers, it does not raise");
         assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
         relay.task.abort();
-        let row: (String, Option<String>) = sqlx::query_as(
-            "SELECT status, error_message FROM integration_email_requests WHERE idempotency_key='empty-001'",
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, error_message FROM integration_email_requests WHERE idempotency_key='empty-001'",
         )
         .fetch_one(&state.pool)
         .await
         .unwrap();
         assert_eq!(row.0, "unknown");
+        assert_eq!(row.1.as_deref(), Some("resend"));
         assert_eq!(
-            row.1.as_deref(),
+            row.2.as_deref(),
             Some("relay returned an empty provider id")
         );
+    }
+
+    fn failover_chain(resend: &FakeRelay, brevo: &CapturingRelay) -> iris_mail::RelayChain {
+        iris_mail::RelayChain::new(vec![
+            iris_mail::Relay::Resend(iris_mail::ResendClient::with_endpoint(
+                "test-key".into(),
+                resend.endpoint.clone(),
+            )),
+            iris_mail::Relay::Brevo(iris_mail::BrevoClient::with_endpoint(
+                "test-key".into(),
+                brevo.endpoint.clone(),
+            )),
+        ])
+    }
+
+    #[tokio::test]
+    async fn failover_on_rate_limit_sends_through_brevo() {
+        let resend = fake_relay("429 Too Many Requests", r#"{"message":"rate limited"}"#).await;
+        let brevo = fake_relay_capturing("201 Created", r#"{"messageId":"brevo-1"}"#).await;
+        let (state, token) = relay_state(failover_chain(&resend, &brevo)).await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "fo-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a failover send answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        resend.task.abort();
+        brevo.task.abort();
+        // Brevo received the rendered message: the failover really sent it.
+        let raw = brevo.captured.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("Verify your email"));
+        assert!(text.contains("https://alpha.example.com/verify?token=abc"));
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, provider_message_id FROM integration_email_requests WHERE idempotency_key='fo-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "accepted");
+        assert_eq!(row.1.as_deref(), Some("brevo"));
+        assert_eq!(row.2.as_deref(), Some("brevo-1"));
+    }
+
+    #[tokio::test]
+    async fn no_failover_on_rejection() {
+        let resend = fake_relay(
+            "400 Bad Request",
+            r#"{"message":"recipient address rejected"}"#,
+        )
+        .await;
+        let brevo = fake_relay_capturing("201 Created", r#"{"messageId":"brevo-1"}"#).await;
+        let (state, token) = relay_state(failover_chain(&resend, &brevo)).await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "nfr-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a relay rejection answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        resend.task.abort();
+        brevo.task.abort();
+        // Brevo was never called: a permanent refusal fails on every provider.
+        assert!(brevo.captured.lock().unwrap().is_empty());
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, error_message FROM integration_email_requests WHERE idempotency_key='nfr-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "failed");
+        assert_eq!(row.1.as_deref(), Some("resend"));
+        assert_eq!(row.2.as_deref(), Some("resend: recipient address rejected"));
+    }
+
+    #[tokio::test]
+    async fn no_failover_on_transport_error() {
+        // Resend points at a closed port: no HTTP response at all, so
+        // the outcome is unknown and the chain must not try Brevo.
+        let brevo = fake_relay_capturing("201 Created", r#"{"messageId":"brevo-1"}"#).await;
+        let (state, token) = relay_state(iris_mail::RelayChain::new(vec![
+            iris_mail::Relay::Resend(iris_mail::ResendClient::with_endpoint(
+                "test-key".into(),
+                "http://127.0.0.1:9".into(),
+            )),
+            iris_mail::Relay::Brevo(iris_mail::BrevoClient::with_endpoint(
+                "test-key".into(),
+                brevo.endpoint.clone(),
+            )),
+        ]))
+        .await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "nft-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a transport error answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+        brevo.task.abort();
+        assert!(brevo.captured.lock().unwrap().is_empty());
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, error_message FROM integration_email_requests WHERE idempotency_key='nft-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "unknown");
+        assert_eq!(row.1.as_deref(), Some("resend"));
+        assert!(row
+            .2
+            .as_deref()
+            .unwrap()
+            .starts_with("mail server unavailable: resend: "));
+    }
+
+    #[tokio::test]
+    async fn brevo_only_chain_sends() {
+        let brevo = fake_relay_capturing("201 Created", r#"{"messageId":"brevo-2"}"#).await;
+        let (state, token) =
+            relay_state(iris_mail::RelayChain::new(vec![iris_mail::Relay::Brevo(
+                iris_mail::BrevoClient::with_endpoint("test-key".into(), brevo.endpoint.clone()),
+            )]))
+            .await;
+        let resp = send(
+            State(state.clone()),
+            send_headers(&token, "bo-001"),
+            Json(send_body()),
+        )
+        .await
+        .expect("a Brevo-only send answers, it does not raise");
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        brevo.task.abort();
+        // Brevo's payload shape: sender object, recipient objects, textContent.
+        let raw = brevo.captured.lock().unwrap().clone();
+        let text = String::from_utf8_lossy(&raw);
+        assert!(text.contains("\"sender\":{\"email\":\"no-reply@example.com\"}"));
+        assert!(text.contains("\"textContent\""));
+        let row: (String, Option<String>, Option<String>) = sqlx::query_as(
+            "SELECT status, provider, provider_message_id FROM integration_email_requests WHERE idempotency_key='bo-001'",
+        )
+        .fetch_one(&state.pool)
+        .await
+        .unwrap();
+        assert_eq!(row.0, "accepted");
+        assert_eq!(row.1.as_deref(), Some("brevo"));
+        assert_eq!(row.2.as_deref(), Some("brevo-2"));
     }
 }
