@@ -10,7 +10,7 @@ type Contact = { id: string; name: string; email: string }
 
 const app = document.querySelector<HTMLDivElement>('#app')!
 
-// Requests started by the inline script in index.html before this bundle loaded.
+// Requests started by /early.js before this bundle loaded.
 declare global { interface Window { __early?: Record<string, Promise<Response>> } }
 function takeEarly(path: string) {
   const p = window.__early?.[path]
@@ -127,9 +127,9 @@ const CAT_EYES_OPEN = `
   <path d="M84 216C86 228 84 238 80 244M116 216C114 228 116 238 120 244" stroke="#F7F7F2" stroke-width="2" fill="none" stroke-linecap="round" opacity=".55"/>
   <g class="cat-eyes">
   <path d="M70 92Q83 79 96 92Q83 103 70 92Z" fill="#B83232"/>
-  <path class="pupil" d="M83 82.5C81 87 81 97 83 101C85 97 85 87 83 82.5Z" fill="#16130F" style="transform-box:fill-box;transform-origin:center;"/>
+  <path class="pupil" d="M83 82.5C81 87 81 97 83 101C85 97 85 87 83 82.5Z" fill="#16130F"/>
   <path d="M104 92Q117 79 130 92Q117 103 104 92Z" fill="#B83232"/>
-  <path class="pupil" d="M117 82.5C115 87 115 97 117 101C119 97 119 87 117 82.5Z" fill="#16130F" style="transform-box:fill-box;transform-origin:center;"/>
+  <path class="pupil" d="M117 82.5C115 87 115 97 117 101C119 97 119 87 117 82.5Z" fill="#16130F"/>
   </g>`
 const CAT_EYES_SHUT = `<path d="M71 92Q83 99 95 92M105 92Q117 99 129 92" stroke="#B83232" stroke-width="3" fill="none" stroke-linecap="round"/>`
 
