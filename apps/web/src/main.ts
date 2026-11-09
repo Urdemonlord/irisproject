@@ -340,6 +340,23 @@ const navItem = (href: string, ic: string, label: string, current = false, count
   h('a', { href, className: 'nav-item', ...(current ? { 'aria-current': 'page' } : {}) }, icon(ic), h('span', { className: 'nav-label' }, label), ...(count ? [count] : []))
 const navSection = (label: string) => h('div', { className: 'nav-section' }, label)
 
+/** Account chip: opens the Mailboxes dialog. A button everywhere (not a
+ *  plain label) so the multi-mailbox UI is reachable from every page,
+ *  including on phones where the chip is icon-only (see styles.css). */
+const accountChip = (email: string) =>
+  h('button', { type: 'button', className: 'account-chip', title: email, onclick: () => { manageMailboxes().catch(() => toast('Could not load mailboxes. Try again.')) } }, icon('account'), h('span', { className: 'account-email' }, email))
+
+/** Bottom navigation for pages without the mail sidebar (Organize, DMARC,
+ *  Admin). Same destinations as the mailbox bottom bar; only shown on
+ *  phones (see styles.css), where those pages otherwise have no nav. */
+const mobileNav = (current: string, isAdmin: boolean) =>
+  h('nav', { className: 'mobile-nav', ariaLabel: 'Sections' },
+    navItem('#/', 'inbox', 'Mailbox', current === 'mail'),
+    navItem('#/temp', 'timer', 'Temp', current === 'temp'),
+    navItem('#/organize', 'filter', 'Organize', current === 'organize'),
+    navItem('#/dmarc', 'shield', 'DMARC', current === 'dmarc'),
+    ...(isAdmin ? [navItem('#/admin', 'account', 'Admin', current === 'admin')] : []))
+
 function emptyState(ic: string, title: string, text: string) {
   return h('div', { className: 'empty' }, h('span', { className: 'empty-art' }, icon(ic, 'icon icon-xl')), h('p', { className: 'empty-title' }, title), h('p', { className: 'empty-text' }, text))
 }
@@ -1617,7 +1634,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
       searchTimer = window.setTimeout(() => { void load() }, 300)
     }),
     h('div', { className: 'topbar-right' }, synced,
-      h('button', { type: 'button', className: 'account-chip', title: activeEmail, onclick: () => { manageMailboxes().catch(() => toast('Could not load mailboxes. Try again.')) } }, icon('account'), h('span', { className: 'account-email' }, activeEmail)),
+      accountChip(activeEmail),
       logout))
 
   const folderTabs = h('nav', { className: 'folder-tabs', ariaLabel: 'Folders' }, ...FOLDERS.map((f) =>
@@ -2005,7 +2022,7 @@ async function renderOrganize() {
 
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
   const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
-    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+    h('div', { className: 'topbar-right' }, accountChip(email)))
   const folderList = h('ul', { className: 'org-list' })
   const labelList = h('ul', { className: 'org-list' })
   const filterList = h('ul', { className: 'org-list' })
@@ -2257,7 +2274,7 @@ async function renderOrganize() {
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
     section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
     section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm),
-    sigSection)))
+    sigSection)), mobileNav('organize', account?.is_admin === true))
   folderList.replaceChildren(skeleton(2))
   try {
     const [, f, ct, sg] = await Promise.all([loadOrg(base), api<{ filters: FilterRule[] }>(`${base}/filters`), api<{ contacts: Contact[] }>('/api/v1/contacts?limit=100'),
@@ -2291,7 +2308,7 @@ async function renderDmarc() {
 
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
   const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
-    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+    h('div', { className: 'topbar-right' }, accountChip(email)))
   const scanBtn = btn('btn btn-primary btn-sm', 'Scan inbox for reports', 'refresh') as HTMLButtonElement
   const stats = h('div', { className: 'dmarc-stats' })
   const domainList = h('ul', { className: 'org-list' })
@@ -2420,7 +2437,7 @@ async function renderDmarc() {
     h('div', { className: 'org-submit' }, scanBtn),
     section('Totals', 'Across all imported reports.', stats),
     section('By domain', 'Open a domain to see its reports and the sources that sent mail for it.', domainList),
-    section('Worst offenders', 'Sources with the most failed messages, across all domains.', offenderList))))
+    section('Worst offenders', 'Sources with the most failed messages, across all domains.', offenderList))), mobileNav('dmarc', account?.is_admin === true))
   stats.replaceChildren()
   await load()
 }
@@ -2614,7 +2631,7 @@ async function renderTempInbox(inbox: TempInbox, justCreated = false) {
     searchBox((q) => { query = q; draw() }),
     h('div', { className: 'topbar-right' },
       loggedIn
-        ? h('span', { className: 'account-chip', title: account!.email }, icon('account'), h('span', { className: 'account-email' }, account!.email))
+        ? accountChip(account!.email)
         : h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('account'), h('span', { className: 'btn-label' }, 'Sign in')),
       btn('btn btn-ghost btn-icon-sm', 'Discard address', 'close', { onclick: discard })))
 
@@ -2757,12 +2774,12 @@ async function renderAdmin() {
   setPage({ title: 'Admin', description: 'IRIS admin dashboard: users, quotas and delivery status.', path: '/', noindex: true })
   const back = h('a', { href: '#/', className: 'btn btn-ghost btn-sm' }, icon('back'), h('span', { className: 'btn-label' }, 'Back to mail'))
   const topbar = h('header', { className: 'topbar organize-top' }, brand(location.hostname), back,
-    h('div', { className: 'topbar-right' }, h('span', { className: 'account-chip', title: email }, icon('account'), h('span', { className: 'account-email' }, email))))
+    h('div', { className: 'topbar-right' }, accountChip(email)))
   const title = h('h1', { className: 'pane-title' }, 'Admin')
   const intro = h('p', { className: 'muted' }, 'Users, quotas and delivery status. Disable users, revoke sessions and keys, and delete temp inboxes.')
   const body = h('div', { className: 'admin-inner' })
   app.className = 'app-shell'
-  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, body))
+  app.replaceChildren(topbar, h('main', { className: 'app-main organize' }, body), mobileNav('admin', account?.is_admin === true))
   body.replaceChildren(title, intro, skeleton(4))
 
   const stat = (label: string, value: string) =>
