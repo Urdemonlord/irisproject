@@ -14,10 +14,10 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use iris_auth as auth;
 use iris_config::limits::{
     MAX_ATTACHMENT_NAME_CHARS, MAX_BODY, MAX_COMPOSE_ATTACHMENTS,
-    MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES, MAX_COMPOSE_ATTACHMENT_BYTES, MAX_HEADER_IDS,
-    MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
+    MAX_COMPOSE_ATTACHMENTS_TOTAL_BYTES, MAX_COMPOSE_ATTACHMENT_BYTES, MAX_COMPOSE_HTML_BYTES,
+    MAX_HEADER_IDS, MAX_HEADER_ID_LEN, MAX_RECIPIENTS, MAX_SUBJECT, SENDS_PER_HOUR,
 };
-use iris_mail::{Compose, ComposeAttachment, FOLDER_ROLES};
+use iris_mail::{html as mail_html, Compose, ComposeAttachment, FOLDER_ROLES};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
@@ -149,6 +149,10 @@ pub(crate) struct ComposeBody {
     pub(crate) subject: String,
     #[serde(default)]
     pub(crate) text: String,
+    /// Rich-text body, when the user composed in HTML mode. Sanitized
+    /// in `build()`; `None` means plain text only.
+    #[serde(default)]
+    pub(crate) html: Option<String>,
     pub(crate) in_reply_to: Option<String>,
     #[serde(default)]
     pub(crate) references: Vec<String>,
@@ -256,6 +260,32 @@ pub(crate) fn build(
     {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
+    // HTML is sanitized server-side before it is stored or sent, and the
+    // plain-text part is always present: when the user wrote HTML only,
+    // it is derived from the sanitized HTML; otherwise the typed text
+    // stands. A message that sanitizes down to nothing is plain text.
+    let html = match &b.html {
+        Some(h) if h.len() > MAX_COMPOSE_HTML_BYTES => {
+            return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+        }
+        Some(h) => {
+            let clean = mail_html::sanitize_html(h);
+            if clean.trim().is_empty() {
+                None
+            } else {
+                Some(clean)
+            }
+        }
+        None => None,
+    };
+    let text = if b.text.is_empty() {
+        match &html {
+            Some(h) => mail_html::html_to_text(h),
+            None => String::new(),
+        }
+    } else {
+        b.text
+    };
     let (to, cc, bcc) = (clean_list(&b.to)?, clean_list(&b.cc)?, clean_list(&b.bcc)?);
     if to.len() + cc.len() + bcc.len() > MAX_RECIPIENTS {
         return Err(ApiError(StatusCode::BAD_REQUEST, "too_many_recipients"));
@@ -269,7 +299,8 @@ pub(crate) fn build(
         cc,
         bcc,
         subject: b.subject,
-        text: b.text,
+        text,
+        html,
         in_reply_to: clean_ids(b.in_reply_to).into_iter().next(),
         references: clean_ids(b.references),
         attachments: clean_attachments(&b.attachments)?,
@@ -493,6 +524,45 @@ mod tests {
             "text/plain\r\nInjected: yes",
             b"x",
         )]));
+    }
+
+    #[test]
+    fn html_is_sanitized_and_text_derived_when_empty() {
+        let mut b = body_with(vec![]);
+        b.html = Some("<p>Hello <b>world</b></p><script>alert(1)</script>".into());
+        b.text = String::new();
+        let (c, _) = build(&test_user(), b).expect("valid html compose");
+        assert_eq!(c.html.as_deref(), Some("<p>Hello <b>world</b></p>"));
+        assert_eq!(c.text, "Hello world");
+    }
+
+    #[test]
+    fn html_script_only_becomes_plain_text() {
+        let mut b = body_with(vec![]);
+        b.html = Some("<script>alert(1)</script>".into());
+        b.text = String::new();
+        let (c, _) = build(&test_user(), b).expect("valid compose");
+        assert_eq!(c.html, None);
+        assert_eq!(c.text, "");
+    }
+
+    #[test]
+    fn typed_text_stands_when_html_present() {
+        let mut b = body_with(vec![]);
+        b.html = Some("<p>Rich</p>".into());
+        b.text = "Typed".into();
+        let (c, _) = build(&test_user(), b).expect("valid compose");
+        assert_eq!(c.text, "Typed");
+        assert_eq!(c.html.as_deref(), Some("<p>Rich</p>"));
+    }
+
+    #[test]
+    fn oversize_html_is_rejected() {
+        let mut b = body_with(vec![]);
+        b.html = Some("x".repeat(MAX_COMPOSE_HTML_BYTES + 1));
+        let err = build(&test_user(), b).expect_err("must be rejected");
+        assert_eq!(err.0, StatusCode::BAD_REQUEST);
+        assert_eq!(err.1, "invalid_request");
     }
 
     #[test]

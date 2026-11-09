@@ -59,6 +59,13 @@ pub const MAX_RECIPIENTS: usize = 50;
 pub const MAX_SUBJECT: usize = 998;
 /// Max body length in bytes.
 pub const MAX_BODY: usize = 1_000_000;
+/// Max composed HTML body length in bytes. Markup runs longer than the
+/// text it renders, so this is roomier than MAX_BODY, but it still has
+/// to fit inside MAX_COMPOSE_JSON_BYTES next to the attachments.
+pub const MAX_COMPOSE_HTML_BYTES: usize = 4_000_000;
+/// Max signature length in characters, per variant (plain text and
+/// HTML each). A signature is a sign-off, not a letter.
+pub const MAX_SIGNATURE_CHARS: usize = 10_000;
 /// Max threading header ids kept from In-Reply-To / References.
 pub const MAX_HEADER_IDS: usize = 20;
 /// Max length in bytes of one threading header id.
@@ -222,6 +229,8 @@ mod tests {
         assert_eq!(MAX_RECIPIENTS, 50);
         assert_eq!(MAX_SUBJECT, 998);
         assert_eq!(MAX_BODY, 1_000_000);
+        assert_eq!(MAX_COMPOSE_HTML_BYTES, 4_000_000);
+        assert_eq!(MAX_SIGNATURE_CHARS, 10_000);
         assert_eq!(MAX_HEADER_IDS, 20);
         assert_eq!(MAX_HEADER_ID_LEN, 250);
         assert_eq!(SENDS_PER_HOUR, 100);
