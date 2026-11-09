@@ -15,6 +15,14 @@ ditto usr /usr
 ditto etc /etc
 ditto var /var
 ditto Library /Library
+# ditto preserves the tarball's ownership (the user who built it, for
+# example the CI runner). System files must be root-owned: launchd
+# refuses to load a plist it does not own ("Bootstrap failed: 5:
+# Input/output error"), so fix ownership before configuring.
+chown root:wheel /usr/local/bin/stalwart /usr/local/bin/caddy /usr/local/bin/iris-api
+chown root:wheel /usr/local/sbin/iris-health /usr/local/sbin/iris-cert-sync
+chown -R root:wheel /usr/local/lib/iris /usr/local/share/iris
+chown root:wheel /Library/LaunchDaemons/im.meowlabs.iris-*.plist
 chmod 755 /usr/local/bin/stalwart /usr/local/bin/caddy /usr/local/bin/iris-api
 chmod 755 /usr/local/lib/iris/iris-api-launch.sh /usr/local/lib/iris/iris-install-macos.sh /usr/local/lib/iris/iris-setup.py
 chmod 755 /usr/local/sbin/iris-health /usr/local/sbin/iris-cert-sync
