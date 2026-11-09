@@ -39,6 +39,7 @@ mod integration_apps;
 mod integration_keys;
 mod notify;
 mod organize;
+mod pending_sends;
 mod temp;
 mod transactional_email;
 mod turnstile;
@@ -232,6 +233,7 @@ async fn main() {
         }
     }
     tokio::spawn(cleanup::run(state.clone()));
+    tokio::spawn(pending_sends::run(state.clone()));
 
     let protected = Router::new()
         .route("/api/v1/session", get(session))
@@ -359,6 +361,10 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/send",
             post(compose::send).layer(DefaultBodyLimit::max(MAX_COMPOSE_JSON_BYTES)),
+        )
+        .route(
+            "/api/v1/mailboxes/:mailbox_id/pending-sends/:id",
+            axum::routing::delete(pending_sends::undo),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
@@ -2852,32 +2858,60 @@ mod handler_integration_tests {
         json!({"id": id, "from": [{"email": "a@example.com"}], "to": [{"email": "alice@example.com"}], "subject": subject, "preview": "p", "receivedAt": "2026-11-04T00:00:00Z", "keywords": {"$seen": true}, "size": 100, "hasAttachment": false})
     }
 
-    /// Compose -> relay -> store_sent fails: the message is already
-    /// delivered, so the handler must still answer success, report the
-    /// failed copy honestly (`sent_copy: false`), and still log the send.
+    /// A queued send goes out from the sweeper, not the request: the
+    /// handler answers pending at once (no relay call, no rate-limit
+    /// row), and the dispatcher delivers it once due.
+    async fn make_due(pool: &SqlitePool, id: &str) {
+        sqlx::query("UPDATE pending_sends SET send_at='2000-01-01T00:00:00+00:00' WHERE id=?")
+            .bind(id)
+            .execute(pool)
+            .await
+            .unwrap();
+    }
+
+    async fn queue_send(s: &Arc<AppState>, to: &str) -> Value {
+        let resp = compose::send(
+            State(s.clone()),
+            Extension(user()),
+            Path("mbx-1".into()),
+            compose_body(to),
+        )
+        .await
+        .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let v = body_json(resp).await;
+        assert_eq!(v["pending"], true);
+        assert!(v["id"].is_string());
+        assert!(v["send_at"].is_string());
+        v
+    }
+
+    /// Compose -> queue -> sweep -> relay -> store_sent fails: the message
+    /// is already delivered, so the dispatcher deletes the row anyway and
+    /// logs the failed copy; the failed copy really was an Email/set into
+    /// Sent, not a skip.
     #[tokio::test]
-    async fn relay_send_reports_sent_copy_false_when_store_sent_fails() {
+    async fn relay_send_dispatches_from_queue_and_survives_failed_sent_copy() {
         let jmap = fake_jmap(JmapScript {
             email_set: EmailSet::NotCreated,
             ..Default::default()
         })
         .await;
         let s = test_state(&jmap, Some(relay(&jmap))).await;
-        let resp = compose::send(
-            State(s.clone()),
-            Extension(user()),
-            Path("mbx-1".into()),
-            compose_body("bob@example.test"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["sent"], true);
-        assert_eq!(v["sent_copy"], false);
+        let v = queue_send(&s, "bob@example.test").await;
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(send_count(&s.pool).await, 0);
+        let id = v["id"].as_str().unwrap();
+        make_due(&s.pool, id).await;
+        crate::pending_sends::sweep_once(&s).await.unwrap();
         assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 1);
         assert_eq!(send_count(&s.pool).await, 1);
-        // The failed copy really was an Email/set into Sent, not a skip.
+        let gone: Option<String> = sqlx::query_scalar("SELECT id FROM pending_sends WHERE id=?")
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, None);
         let reqs = jmap.requests.lock().unwrap();
         let set = reqs
             .iter()
@@ -2894,66 +2928,71 @@ mod handler_integration_tests {
     }
 
     #[tokio::test]
-    async fn relay_send_reports_sent_copy_true_when_store_sent_succeeds() {
+    async fn relay_send_dispatches_from_queue_with_sent_copy() {
         let jmap = fake_jmap(JmapScript::default()).await;
         let s = test_state(&jmap, Some(relay(&jmap))).await;
-        let resp = compose::send(
-            State(s.clone()),
-            Extension(user()),
-            Path("mbx-1".into()),
-            compose_body("bob@example.test"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["sent"], true);
-        assert_eq!(v["sent_copy"], true);
+        let v = queue_send(&s, "bob@example.test").await;
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(send_count(&s.pool).await, 0);
+        let id = v["id"].as_str().unwrap();
+        make_due(&s.pool, id).await;
+        crate::pending_sends::sweep_once(&s).await.unwrap();
         assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 1);
         assert_eq!(send_count(&s.pool).await, 1);
+        let gone: Option<String> = sqlx::query_scalar("SELECT id FROM pending_sends WHERE id=?")
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, None);
     }
 
-    /// The hourly send quota is enforced before any relay or JMAP call:
-    /// the 101st send in an hour is refused and nothing is delivered.
+    /// The hourly send quota is enforced at dispatch time, not queue time:
+    /// the 101st send in an hour still queues (nothing is delivered yet),
+    /// and the sweeper leaves it pending without touching the relay or JMAP.
     #[tokio::test]
-    async fn send_quota_refuses_at_cap_without_relay_or_jmap() {
+    async fn send_quota_at_cap_queues_but_never_dispatches() {
         let jmap = fake_jmap(JmapScript::default()).await;
         let s = test_state(&jmap, Some(relay(&jmap))).await;
         seed_sends(&s.pool, SENDS_PER_HOUR).await;
-        let err = compose::send(
-            State(s.clone()),
-            Extension(user()),
-            Path("mbx-1".into()),
-            compose_body("bob@example.com"),
-        )
-        .await
-        .expect_err("100 sends in the last hour must refuse the 101st");
-        assert_eq!(err.0, StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(err.1, "too_many_sends");
+        let v = queue_send(&s, "bob@example.com").await;
         assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
         assert!(jmap.requests.lock().unwrap().is_empty());
         assert_eq!(send_count(&s.pool).await, SENDS_PER_HOUR);
+        let id = v["id"].as_str().unwrap();
+        make_due(&s.pool, id).await;
+        crate::pending_sends::sweep_once(&s).await.unwrap();
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        assert!(jmap.requests.lock().unwrap().is_empty());
+        assert_eq!(send_count(&s.pool).await, SENDS_PER_HOUR);
+        let status: String = sqlx::query_scalar("SELECT status FROM pending_sends WHERE id=?")
+            .bind(id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(status, "pending");
     }
 
     /// A local recipient with no relay goes through JMAP submission, which
-    /// files Sent atomically: `sent_copy` is always true on that path.
+    /// files Sent atomically: the sweeper submits Email/set +
+    /// EmailSubmission/set in one batch once the row is due.
     #[tokio::test]
-    async fn local_send_via_jmap_files_sent_copy() {
+    async fn local_send_dispatches_from_queue_via_jmap() {
         let jmap = fake_jmap(JmapScript::default()).await;
         let s = test_state(&jmap, None).await;
-        let resp = compose::send(
-            State(s.clone()),
-            Extension(user()),
-            Path("mbx-1".into()),
-            compose_body("alice@example.com"),
-        )
-        .await
-        .unwrap();
-        assert_eq!(resp.status(), StatusCode::OK);
-        let v = body_json(resp).await;
-        assert_eq!(v["sent"], true);
-        assert_eq!(v["sent_copy"], true);
+        let v = queue_send(&s, "alice@example.com").await;
         assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        let id = v["id"].as_str().unwrap();
+        make_due(&s.pool, id).await;
+        crate::pending_sends::sweep_once(&s).await.unwrap();
+        assert_eq!(jmap.relay_calls.load(Ordering::SeqCst), 0);
+        assert_eq!(send_count(&s.pool).await, 1);
+        let gone: Option<String> = sqlx::query_scalar("SELECT id FROM pending_sends WHERE id=?")
+            .bind(id)
+            .fetch_optional(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(gone, None);
         let reqs = jmap.requests.lock().unwrap();
         let batch = reqs
             .iter()

@@ -11,7 +11,7 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
 - **Permanent mailboxes** — sign in with your mail-server account; five fixed
   folders (Inbox, Sent, Drafts, Archive, Trash), server-side search,
   plain-text compose with autosave drafts, reply/forward, attachments,
-  raw view, and DMARC report previews.
+  undo send (10 second window), raw view, and DMARC report previews.
 - **Temporary inboxes** — anonymous, receive-only addresses that live 1 hour,
   no sign-up. Web UI: `/#/temp`.
 - **Transactional email API** — scoped API keys let your own apps send

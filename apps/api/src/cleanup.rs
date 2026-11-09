@@ -50,6 +50,13 @@ pub async fn mark(pool: &SqlitePool) -> Result<u64, sqlx::Error> {
         .bind(ts(now - Duration::days(2)))
         .execute(pool)
         .await?;
+    // Failed undo-send rows (permanent refusal, retry deadline) are kept
+    // a day for forensics, then pruned; sent rows are deleted on dispatch
+    // and undone rows on undo, so this is the only pending-sends growth.
+    sqlx::query("DELETE FROM pending_sends WHERE status='failed' AND created_at<?")
+        .bind(ts(now - Duration::days(1)))
+        .execute(pool)
+        .await?;
     Ok(n)
 }
 
