@@ -82,7 +82,8 @@ pub(crate) async fn set(
     } else {
         (text, html)
     };
-    if text.is_empty() && html.trim().is_empty() {
+    let cleared = text.is_empty() && html.trim().is_empty();
+    if cleared {
         sqlx::query("DELETE FROM signatures WHERE user_id=? AND mailbox_id=?")
             .bind(&u.user_id)
             .bind(&mailbox_id)
@@ -101,6 +102,17 @@ pub(crate) async fn set(
         .execute(&s.pool)
         .await?;
     }
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::SIGNATURE_SAVE,
+        Some("mailbox"),
+        Some(&mailbox_id),
+        json!({"mailbox_id": mailbox_id, "cleared": cleared}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!(SignatureBody { text, html })).into_response())
 }
 
@@ -122,6 +134,7 @@ mod tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![],
         }
     }

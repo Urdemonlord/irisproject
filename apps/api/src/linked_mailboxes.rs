@@ -146,6 +146,17 @@ pub(crate) async fn link(
         destroy_minted(&s, &email, &app_secret, &cred_id).await;
         return Err(e.into());
     }
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::MAILBOX_LINK,
+        Some("mailbox"),
+        Some(&mailbox_id),
+        json!({"email": email}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({
         "id": mailbox_id,
         "email_address": email,
@@ -213,6 +224,17 @@ pub(crate) async fn unlock(
             .await;
         return Err(e.into());
     }
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::MAILBOX_UNLOCK,
+        Some("mailbox"),
+        Some(&mailbox_id),
+        json!({"email": mb.email}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({ "id": mailbox_id, "unlocked": true })).into_response())
 }
 
@@ -273,6 +295,17 @@ pub(crate) async fn unlink(
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::MAILBOX_UNLINK,
+        Some("mailbox"),
+        Some(&mailbox_id),
+        json!({"email": mb.email}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({ "id": mailbox_id, "unlinked": true })).into_response())
 }
 
@@ -568,6 +601,7 @@ mod tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![(
                 "mb1".to_string(),
                 Creds {

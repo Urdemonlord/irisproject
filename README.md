@@ -17,7 +17,9 @@ A self-hosted email platform combining permanent mailboxes and temporary inboxes
   can have its own signature, set on the Organize page. Link extra
   mail-server accounts to one login and switch between them from the
   account menu; each keeps its own folders, labels, filters and
-  signature, and compose always sends from the active mailbox.
+  signature, and compose always sends from the active mailbox. Admins
+  get an audit trail of logins, sends, and admin actions on the Admin
+  page; its rows are kept forever, with no retention prune.
 - **Temporary inboxes** — anonymous, receive-only addresses that live 1 hour,
   no sign-up. Web UI: `/#/temp`.
 - **Transactional email API** — scoped API keys let your own apps send

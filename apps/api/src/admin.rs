@@ -358,7 +358,7 @@ pub(crate) async fn disable_user(
     if u.user_id == id {
         return Err(ApiError(StatusCode::CONFLICT, "cannot_disable_self"));
     }
-    set_user_status(&s.pool, &id, "active", "disabled").await
+    set_user_status(&s.pool, &u, &id, "active", "disabled").await
 }
 
 /// Re-enable a disabled user. Login works again from this write on.
@@ -368,14 +368,20 @@ pub(crate) async fn enable_user(
     Path(id): Path<String>,
 ) -> ApiResult {
     require_admin(&s.config, &u.email)?;
-    set_user_status(&s.pool, &id, "disabled", "active").await
+    set_user_status(&s.pool, &u, &id, "disabled", "active").await
 }
 
 /// Shared disable/enable write: flip `status` from `from` to `to`.
 /// Unknown id answers 404; a user in any other status answers 409.
 /// The write is conditional on the old status, so a second click (or
 /// a second admin) hears 409 instead of silently succeeding.
-async fn set_user_status(pool: &sqlx::SqlitePool, id: &str, from: &str, to: &str) -> ApiResult {
+async fn set_user_status(
+    pool: &sqlx::SqlitePool,
+    actor: &CurrentUser,
+    id: &str,
+    from: &str,
+    to: &str,
+) -> ApiResult {
     let code = if to == "disabled" {
         "user_not_active"
     } else {
@@ -404,6 +410,21 @@ async fn set_user_status(pool: &sqlx::SqlitePool, id: &str, from: &str, to: &str
     if updated.rows_affected() == 0 {
         return Err(ApiError(StatusCode::CONFLICT, code));
     }
+    crate::audit::record(
+        pool,
+        Some(&actor.user_id),
+        &actor.email,
+        if to == "disabled" {
+            crate::audit::USER_DISABLE
+        } else {
+            crate::audit::USER_ENABLE
+        },
+        Some("user"),
+        Some(id),
+        json!({"email": email}),
+        Some(&actor.ip),
+    )
+    .await;
     Ok(Json(json!({ "id": id, "email": email, "status": to })).into_response())
 }
 
@@ -434,6 +455,17 @@ pub(crate) async fn revoke_user_sessions(
     .bind(auth::now())
     .execute(&s.pool)
     .await?;
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::SESSIONS_REVOKE,
+        Some("user"),
+        Some(&id),
+        json!({"revoked": revoked.rows_affected()}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({ "id": id, "revoked": revoked.rows_affected() })).into_response())
 }
 
@@ -467,6 +499,17 @@ pub(crate) async fn revoke_integration_key(
             "invalid_key_id" => ApiError(StatusCode::BAD_REQUEST, "invalid_key_id"),
             _ => ApiError(StatusCode::CONFLICT, "key_not_active"),
         })?;
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::KEY_REVOKE,
+        Some("integration_key"),
+        Some(&key_id),
+        json!({"app_id": app_id}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({ "key_id": key_id, "app_id": app_id, "status": "revoked" })).into_response())
 }
 
@@ -561,6 +604,19 @@ pub(crate) async fn create_integration_key(
     ))?;
     let stored_scopes: Vec<String> = serde_json::from_str(&scopes_json)
         .map_err(|_| ApiError(StatusCode::INTERNAL_SERVER_ERROR, "internal_error"))?;
+    // The secret is returned in this one response only; the trail
+    // records the key id and the app, never the secret.
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::KEY_CREATE,
+        Some("integration_key"),
+        Some(&generated.key_id),
+        json!({"app": body.app, "daily_limit": body.daily_limit, "expires_days": body.expires_days}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({
         "key_id": generated.key_id,
         "app": body.app,
@@ -855,6 +911,17 @@ pub(crate) async fn delete_temp_inbox(
     let Some(deleted_at) = crate::temp::mark_deletion_pending(&s.pool, &id).await? else {
         return Err(ApiError(StatusCode::CONFLICT, "temp_inbox_not_active"));
     };
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::TEMP_DELETE,
+        Some("temp_inbox"),
+        Some(&id),
+        json!({"address": address}),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({
         "id": id, "address": address, "status": "deleted", "deleted_at": deleted_at,
     }))
@@ -923,6 +990,7 @@ mod tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![],
         }
     }
@@ -1148,6 +1216,7 @@ mod tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![],
         }
     }

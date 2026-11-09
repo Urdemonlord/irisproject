@@ -395,6 +395,23 @@ pub(crate) async fn send(
     let queued =
         crate::pending_sends::queue(&s, &u, &mailbox_id, &mb.account_id, &mb.email, creds, b)
             .await?;
+    // The send happened (it sits in the undo queue now): record the
+    // mailbox and how many recipients it has, never the addresses.
+    crate::audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        crate::audit::MAIL_SEND,
+        Some("mailbox"),
+        Some(&mailbox_id),
+        json!({
+            "mailbox_id": mailbox_id,
+            "recipients": c.to.len() + c.cc.len() + c.bcc.len(),
+            "pending_id": queued.id,
+        }),
+        Some(&u.ip),
+    )
+    .await;
     Ok(Json(json!({
         "pending": true,
         "id": queued.id,

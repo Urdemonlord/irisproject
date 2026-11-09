@@ -28,6 +28,7 @@ use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
 
 mod admin;
+mod audit;
 mod cleanup;
 mod compose;
 mod contacts;
@@ -99,6 +100,10 @@ pub(crate) struct CurrentUser {
     /// (mailbox_id, creds), primary first. A linked mailbox with no
     /// entry here is linked but not unlocked in this session.
     pub(crate) mailbox_creds: Vec<(String, Creds)>,
+    /// Client IP as seen by the server (loopback requests trust
+    /// `X-Real-IP`, see `client_ip`). The audit trail records it with
+    /// each action; an empty string means the address was unavailable.
+    pub(crate) ip: String,
 }
 
 impl CurrentUser {
@@ -273,6 +278,7 @@ async fn main() {
     let protected = Router::new()
         .route("/api/v1/session", get(session))
         .route("/api/v1/admin/summary", get(admin::summary))
+        .route("/api/v1/admin/audit", get(audit::list))
         .route("/api/v1/admin/users/:id/disable", post(admin::disable_user))
         .route("/api/v1/admin/users/:id/enable", post(admin::enable_user))
         .route(
@@ -743,6 +749,17 @@ async fn login(
             sqlx::query("INSERT INTO rate_limit_events (id,subject_hash,action,occurred_at,outcome) VALUES (?,?,'login',?,'blocked')")
                 .bind(uuid::Uuid::new_v4().to_string()).bind(&ip_subject).bind(auth::now())
                 .execute(&s.pool).await?;
+            audit::record(
+                &s.pool,
+                None,
+                &email,
+                audit::LOGIN_FAILURE,
+                None,
+                None,
+                json!({}),
+                Some(&ip),
+            )
+            .await;
             return Err(ApiError(StatusCode::UNAUTHORIZED, "invalid_credentials"));
         }
         Err(e) => return Err(e.into()),
@@ -761,7 +778,7 @@ async fn login(
         .await?;
 
     let token = auth::new_token();
-    if let Err(e) = persist_login(
+    let user_id = match persist_login(
         &s,
         &email,
         &account_id,
@@ -772,13 +789,30 @@ async fn login(
     )
     .await
     {
-        // Don't leak a live app password when the session row never got written.
-        let _ = s
-            .jmap
-            .destroy_app_password(&email, &app_secret, &cred_id)
-            .await;
-        return Err(e);
-    }
+        Ok(user_id) => user_id,
+        Err(e) => {
+            // A disabled account is a failed login, not an infra error.
+            if e.1 == "account_disabled" {
+                audit::record(
+                    &s.pool,
+                    None,
+                    &email,
+                    audit::LOGIN_FAILURE,
+                    None,
+                    None,
+                    json!({"reason": "account_disabled"}),
+                    Some(&ip),
+                )
+                .await;
+            }
+            // Don't leak a live app password when the session row never got written.
+            let _ = s
+                .jmap
+                .destroy_app_password(&email, &app_secret, &cred_id)
+                .await;
+            return Err(e);
+        }
+    };
 
     // Session rotation: any session this browser already held is revoked, never reused.
     if let Some(old) = headers
@@ -788,6 +822,18 @@ async fn login(
     {
         revoke_by_token(&s, old).await;
     }
+
+    audit::record(
+        &s.pool,
+        Some(&user_id),
+        &email,
+        audit::LOGIN_SUCCESS,
+        Some("user"),
+        Some(&user_id),
+        json!({}),
+        Some(&ip),
+    )
+    .await;
 
     let secure = secure(&s);
     let mut resp = Json(json!({ "authenticated": true, "email": email })).into_response();
@@ -818,7 +864,7 @@ async fn persist_login(
     session_expiry: &chrono::DateTime<chrono::Utc>,
     app_secret: &str,
     cred_id: &str,
-) -> Result<(), ApiError> {
+) -> Result<String, ApiError> {
     let now = auth::now();
     let mut tx = s.pool.begin().await?;
     sqlx::query("INSERT INTO app_users (id,email,display_name,created_at,updated_at) VALUES (?,?,?,?,?) ON CONFLICT(email) DO UPDATE SET updated_at=excluded.updated_at")
@@ -842,7 +888,7 @@ async fn persist_login(
         .execute(&mut *tx).await?;
     tx.commit().await?;
 
-    Ok(())
+    Ok(user_id)
 }
 
 /// Revokes the session behind `token` and its mail app password (best effort).
@@ -975,6 +1021,15 @@ async fn require_session(
         .bind(&session_id)
         .execute(&s.pool)
         .await;
+    // The client IP rides along for the audit trail. ConnectInfo is in
+    // the request extensions (the server runs with
+    // into_make_service_with_connect_info); a request without it
+    // records an empty IP instead of failing the session.
+    let ip = req
+        .extensions()
+        .get::<axum::extract::ConnectInfo<std::net::SocketAddr>>()
+        .map(|c| client_ip(c.0, &headers))
+        .unwrap_or_default();
     req.extensions_mut().insert(CurrentUser {
         user_id,
         email,
@@ -982,6 +1037,7 @@ async fn require_session(
         session_id,
         session_token: token.to_string(),
         mailbox_creds: by_mailbox,
+        ip,
     });
     next.run(req).await
 }
@@ -996,7 +1052,13 @@ async fn session(State(s): S, Extension(u): Extension<CurrentUser>) -> Json<serd
     }))
 }
 
-async fn logout(State(s): S, headers: HeaderMap) -> ApiResult {
+async fn logout(
+    State(s): S,
+    headers: HeaderMap,
+    axum::extract::ConnectInfo(peer): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    Extension(u): Extension<CurrentUser>,
+) -> ApiResult {
+    let ip = client_ip(peer, &headers);
     if let Some(token) = headers
         .get(header::COOKIE)
         .and_then(|h| h.to_str().ok())
@@ -1004,6 +1066,17 @@ async fn logout(State(s): S, headers: HeaderMap) -> ApiResult {
     {
         revoke_by_token(&s, token).await;
     }
+    audit::record(
+        &s.pool,
+        Some(&u.user_id),
+        &u.email,
+        audit::LOGOUT,
+        Some("user"),
+        Some(&u.user_id),
+        json!({}),
+        Some(&ip),
+    )
+    .await;
     Ok((
         [(header::SET_COOKIE, auth::clear_cookie())],
         StatusCode::NO_CONTENT,
@@ -2451,6 +2524,7 @@ mod read_limit_tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             mailbox_creds: vec![],
         }
     }
@@ -2952,6 +3026,7 @@ mod handler_integration_tests {
             },
             session_id: "sess-1".into(),
             session_token: "tok-1".into(),
+            ip: "127.0.0.1".into(),
             // The test mailbox `mbx-1` (see `state()` below) is unlocked
             // for this session, the way the middleware would load it.
             mailbox_creds: vec![(
