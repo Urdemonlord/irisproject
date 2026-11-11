@@ -17,7 +17,7 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $Jmap = 'http://127.0.0.1:8080/jmap'
-$Using = @('urn:ietf:params:jmap:core', 'urn:stalwart:jmap')
+$JmapUsing = @('urn:ietf:params:jmap:core', 'urn:stalwart:jmap')
 $InboxDomain = "inbox.$Domain"
 $MailHost = "mail.$Domain"
 
@@ -36,7 +36,7 @@ $RecoveryAuth = Get-BasicAuth -User 'admin' -Password $RecoveryPassword
 function Invoke-Jmap {
     param([string]$Method, [hashtable]$Arguments)
     $body = @{
-        using = $Using
+        using = $JmapUsing
         methodCalls = @(, @($Method, $Arguments, '0'))
     } | ConvertTo-Json -Depth 10 -Compress
     try {
@@ -46,7 +46,20 @@ function Invoke-Jmap {
         $detail = $_.ErrorDetails.Message
         Fail "$Method failed to answer: $($_.Exception.Message) $detail"
     }
-    $result = $resp.methodResponses[0][1]
+    # A structurally valid JMAP response always carries methodResponses.
+    # If it does not, something else answered on 127.0.0.1:8080 (or the
+    # server rejected the whole request): fail with the raw body instead
+    # of a cryptic StrictMode property error further down.
+    $mrProp = $resp.PSObject.Properties['methodResponses']
+    if ($null -eq $mrProp -or $mrProp.Value.Count -lt 1) {
+        $raw = $resp | ConvertTo-Json -Depth 5 -Compress
+        Fail "$Method: unexpected response (no methodResponses): $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
+    }
+    $first = $mrProp.Value[0]
+    if ($first[0] -eq 'error') {
+        Fail "$Method returned JMAP error: $($first[1] | ConvertTo-Json -Depth 5 -Compress)"
+    }
+    $result = $first[1]
     # StrictMode is on: a missing property throws, so test for the
     # property's existence first (the Python original uses .get()).
     foreach ($key in @('notCreated', 'notUpdated', 'notDestroyed')) {
@@ -59,14 +72,37 @@ function Invoke-Jmap {
     return $result
 }
 
-# 1. Wait for the management API.
+function Get-CreatedId {
+    param($Result, [string]$Method, [string]$ClientId)
+    $createdProp = $Result.PSObject.Properties['created']
+    if ($null -eq $createdProp) {
+        $raw = $Result | ConvertTo-Json -Depth 5 -Compress
+        Fail "$Method returned no 'created' object: $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
+    }
+    $entryProp = $createdProp.Value.PSObject.Properties[$ClientId]
+    if ($null -eq $entryProp) {
+        $raw = $Result | ConvertTo-Json -Depth 5 -Compress
+        Fail "$Method did not create '$ClientId': $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
+    }
+    return $entryProp.Value.id
+}
+
+# 1. Wait for the management API. A 200 that is not a Stalwart session
+# (no capabilities object) means something else owns 127.0.0.1:8080:
+# fail at once with the body instead of failing cryptically later.
 $ready = $false
+$lastSessionBody = ''
 for ($i = 0; $i -lt 30; $i++) {
     try {
-        Invoke-RestMethod -Uri "$Jmap/session" -Headers @{ Authorization = $RecoveryAuth } -TimeoutSec 5 | Out-Null
-        $ready = $true
-        break
+        $sess = Invoke-RestMethod -Uri "$Jmap/session" -Headers @{ Authorization = $RecoveryAuth } -TimeoutSec 5
+        if ($null -ne $sess.PSObject.Properties['capabilities']) {
+            $ready = $true
+            break
+        }
+        $lastSessionBody = $sess | ConvertTo-Json -Depth 5 -Compress
+        Fail "something other than Stalwart answered /session on 127.0.0.1:8080: $($lastSessionBody.Substring(0, [Math]::Min(500, $lastSessionBody.Length)))"
     } catch {
+        if ($_.Exception.Message -match 'something other than Stalwart') { throw }
         Start-Sleep -Seconds 2
     }
 }
@@ -80,8 +116,8 @@ $res = Invoke-Jmap -Method 'x:Domain/set' -Arguments @{
     }
 }
 $domainIds = @{
-    $Domain      = $res.created.'d-main'.id
-    $InboxDomain = $res.created.'d-inbox'.id
+    $Domain      = Get-CreatedId -Result $res -Method 'x:Domain/set' -ClientId 'd-main'
+    $InboxDomain = Get-CreatedId -Result $res -Method 'x:Domain/set' -ClientId 'd-inbox'
 }
 Write-SetupLog "domains $Domain=$($domainIds[$Domain]), $InboxDomain=$($domainIds[$InboxDomain])"
 
@@ -102,7 +138,7 @@ function New-JmapAccount {
             }
         }
     }
-    return $created.created.u1.id
+    return Get-CreatedId -Result $created -Method 'x:Account/set' -ClientId 'u1'
 }
 $adminId = New-JmapAccount -Name $AdminLocal -DomainName $Domain -Password $AdminPassword -Description 'IRIS admin account'
 $tempId = New-JmapAccount -Name 'temp' -DomainName $InboxDomain -Password $TempPassword -Description 'IRIS temp inbox catch-all account'
@@ -144,7 +180,7 @@ if ((Test-Path $fullchain) -and (Test-Path $privkey)) {
             }
         }
     }
-    $certId = $cert.created.le.id
+    $certId = Get-CreatedId -Result $cert -Method 'x:Certificate/set' -ClientId 'le'
     Invoke-Jmap -Method 'x:SystemSettings/set' -Arguments @{
         update = @{ singleton = @{ defaultCertificateId = $certId } }
     } | Out-Null
