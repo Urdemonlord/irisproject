@@ -4,7 +4,7 @@
 # On a tag push (v*), the tarballs are uploaded to that tag's release
 # automatically: the release is created with generated notes if it
 # does not exist yet, and an existing release keeps its own notes.
-# (The Linux assets are still uploaded by hand.)
+# (The Linux assets are uploaded the same way by the Linux package workflow.)
 name: macOS package
 
 on:

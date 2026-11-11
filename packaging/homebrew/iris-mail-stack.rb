@@ -1,9 +1,8 @@
-# Draft Homebrew formula for the IRIS macOS one-package install.
+# Homebrew formula for the IRIS macOS one-package install.
 #
-# DRAFT: the sha256 values below are placeholders. Fill them from the
-# release page (or `shasum -a 256 <tarball>`) once the first tagged
-# release carries the macOS tarballs; until then `brew install` from
-# this formula cannot work. Do not guess hashes.
+# The sha256 values below were filled from the v0.4.0 release tarballs
+# (download the asset, `shasum -a 256 <tarball>`). Update the version
+# and both hashes together when a new release ships; never guess them.
 #
 # The formula only delivers the files into the Cellar. The system
 # setup (iris user, /etc/iris, /etc/stalwart, /etc/caddy, launchd
@@ -19,12 +18,12 @@ class IrisMailStack < Formula
 
   on_arm do
     url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-arm64.tar.gz"
-    sha256 "TODO-arm64-sha256-fill-from-release"
+    sha256 "0deca510e9de212e393d127db2a53ddce4c713b1afea44346d9cf4a226c76c38"
   end
 
   on_intel do
     url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-amd64.tar.gz"
-    sha256 "TODO-amd64-sha256-fill-from-release"
+    sha256 "f5268257fb2592f4127c18fe18463484d6f59ae88115b9bb7bdd083b1f42ccfd"
   end
 
   def install

@@ -1,0 +1,150 @@
+# Linux package - build the official IRIS .deb and tarball and upload
+# them to the release on a tag push, so the Linux assets no longer need
+# a manual upload. No deploy, no secrets: the build only assembles
+# files and verifies them statically (package contents, versions, script
+# syntax). Unlike the macOS/Windows workflows there is no live install
+# smoke test here: installing the .deb needs systemd and an interactive
+# postinst, so the install itself is proven by a real machine run.
+# On a tag push (v*), the .deb, the tarball and install.sh are uploaded
+# to that tag's release automatically: the release is created with
+# generated notes if it does not exist yet, and an existing release
+# keeps its own notes.
+name: Linux package
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/build.sh'
+      - 'packaging/VERSION'
+      - 'packaging/versions.env'
+      - 'packaging/src/**'
+      - 'packaging/scripts/**'
+      - '.github/workflows/package-linux.yml'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: linux-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Linux .deb and tarball
+    runs-on: ubuntu-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache cargo registry and build
+        uses: Swatinem/rust-cache@v2
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: apps/web
+      - name: Download Stalwart and Caddy
+        # build.sh verifies the pinned checksums but does not download;
+        # fetch the two tarballs the same way build-macos.sh does.
+        working-directory: packaging
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC1091
+          source ./versions.env
+          mkdir -p build/downloads
+          # build.sh expects these exact filenames, not the asset names.
+          if [ ! -f "build/downloads/stalwart.tar.gz" ]; then
+            echo "== downloading stalwart ($STALWART_ASSET)"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/stalwartlabs/stalwart/releases/download/v$STALWART_VERSION/$STALWART_ASSET" -o "build/downloads/stalwart.tar.gz"
+          fi
+          if [ ! -f "build/downloads/caddy.tar.gz" ]; then
+            echo "== downloading caddy ($CADDY_ASSET)"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$CADDY_ASSET" -o "build/downloads/caddy.tar.gz"
+          fi
+          echo "$STALWART_SHA256  build/downloads/stalwart.tar.gz" | sha256sum -c -
+          echo "$CADDY_SHA256  build/downloads/caddy.tar.gz" | sha256sum -c -
+      - name: Build Linux package
+        # Invoked via bash on purpose: the git executable bit does not
+        # survive every push path (see PR #25 for the Linux scripts).
+        run: bash build.sh
+        working-directory: packaging
+      - name: Verify the built assets
+        working-directory: packaging
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          test -f "build/iris-mail-stack_${version}_amd64.deb"
+          test -f "build/iris-mail-stack-${version}.tar.gz"
+          dpkg-deb --info "build/iris-mail-stack_${version}_amd64.deb" | grep -q "Version: $version"
+          # List to a file first: piping tar straight into grep -q lets
+          # grep close the pipe early, so tar dies with SIGPIPE and the
+          # step fails under pipefail even when the entry is there.
+          tar -tzf "build/iris-mail-stack-${version}.tar.gz" > /tmp/tarball-list.txt
+          grep -q "iris-mail-stack-${version}/install.sh" /tmp/tarball-list.txt
+          # The one-liner uploaded to the release must install this
+          # version's .deb, not a stale one.
+          grep -q "VERSION=$version" scripts/install-one-liner.sh
+          grep -q "releases/download/v$version/install.sh" scripts/install-one-liner.sh
+          bash -n scripts/install-one-liner.sh
+      - name: Stage release assets
+        working-directory: packaging
+        run: |
+          set -euo pipefail
+          version="$(cat VERSION)"
+          mkdir -p build/release
+          cp "build/iris-mail-stack_${version}_amd64.deb" "build/iris-mail-stack-${version}.tar.gz" build/release/
+          cp scripts/install-one-liner.sh build/release/install.sh
+      - name: Upload Linux assets
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-mail-stack-linux
+          path: packaging/build/release/
+          if-no-files-found: error
+
+  release:
+    name: Upload Linux assets to the release
+    runs-on: ubuntu-latest
+    needs: build
+    # Tags only: the assets go to the release for the pushed tag.
+    # PR runs stop after the build, so this step is first proven
+    # on the next real tag push, not by PR CI.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the package version matches the tag
+        # A release build must run from the release tag: packaging/VERSION
+        # has to equal the tag version, or the assets would be
+        # mislabelled on the wrong release.
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          version="$(cat packaging/VERSION)"
+          [ "$version" = "$tag" ] || { echo "packaging/VERSION ($version) does not match tag ($tag)"; exit 1; }
+      - name: Download Linux assets
+        uses: actions/download-artifact@v4
+        with:
+          name: iris-mail-stack-linux
+          path: /tmp/iris-linux-release
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Create the release if it does not exist yet, with notes
+          # generated from merged PRs. An existing release keeps its
+          # own notes; only the assets are added.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --generate-notes
+          # --clobber replaces the assets if this run is re-run.
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber /tmp/iris-linux-release/*
