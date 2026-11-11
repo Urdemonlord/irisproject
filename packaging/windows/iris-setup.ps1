@@ -53,7 +53,7 @@ function Invoke-Jmap {
     $mrProp = $resp.PSObject.Properties['methodResponses']
     if ($null -eq $mrProp -or $mrProp.Value.Count -lt 1) {
         $raw = $resp | ConvertTo-Json -Depth 5 -Compress
-        Fail "$Method: unexpected response (no methodResponses): $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
+        Fail "$($Method): unexpected response (no methodResponses): $($raw.Substring(0, [Math]::Min(1000, $raw.Length)))"
     }
     $first = $mrProp.Value[0]
     if ($first[0] -eq 'error') {

@@ -55,7 +55,7 @@ function Test-PowerShellSyntax {
     $errors = $null
     [void][System.Management.Automation.Language.Parser]::ParseFile($Path, [ref]$tokens, [ref]$errors)
     if ($errors.Count -gt 0) {
-        foreach ($err in $errors) { Write-Host "parse error in ${Path}: $($err.Message)" }
+        foreach ($err in $errors) { Write-Host "parse error in ${Path}:$($err.Extent.StartLineNumber): $($err.Message)" }
         throw "PowerShell syntax check failed for $Path"
     }
 }
@@ -83,7 +83,10 @@ $ApiBin = Join-Path $Root 'target/release/iris-api.exe'
 if (-not (Test-Path $ApiBin)) {
     Write-Host '== building iris-api (this takes a few minutes)'
     Push-Location $Root
-    try { cargo build --release --bin iris-api } finally { Pop-Location }
+    try {
+        cargo build --release --bin iris-api
+        if ($LASTEXITCODE -ne 0) { throw 'cargo build failed' }
+    } finally { Pop-Location }
 }
 if (-not (Test-Path $ApiBin)) { throw 'iris-api binary missing after build' }
 Write-Host "== iris-api: $((Get-Sha256 -Path $ApiBin).Substring(0, 16))..."
@@ -92,7 +95,10 @@ $WebDist = Join-Path $Root 'apps/web/dist'
 if (-not (Test-Path (Join-Path $WebDist 'index.html'))) {
     Write-Host '== building web dist (this takes a few minutes)'
     Push-Location (Join-Path $Root 'apps/web')
-    try { npm run build } finally { Pop-Location }
+    try {
+        npm run build
+        if ($LASTEXITCODE -ne 0) { throw 'npm run build failed' }
+    } finally { Pop-Location }
 }
 if (-not (Test-Path (Join-Path $WebDist 'index.html'))) { throw 'web dist missing after build' }
 $mainJs = Get-ChildItem (Join-Path $WebDist 'assets/main-*.js') | Select-Object -First 1

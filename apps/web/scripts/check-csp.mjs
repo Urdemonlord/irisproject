@@ -4,9 +4,10 @@
 // (see CSP_HEADER_VALUE in apps/api/src/main.rs and the header block in
 // packaging/src/usr/share/iris/Caddyfile.template).
 import { readFileSync } from 'node:fs'
+import { fileURLToPath } from 'node:url'
 import { join } from 'node:path'
 
-const dist = new URL('../dist', import.meta.url).pathname
+const dist = fileURLToPath(new URL('../dist', import.meta.url))
 const pages = ['index.html', 'privacy/index.html', 'terms/index.html', '404.html']
 let failed = false
 for (const page of pages) {
