@@ -62,16 +62,17 @@ jobs:
           # shellcheck disable=SC1091
           source ./versions.env
           mkdir -p build/downloads
-          if [ ! -f "build/downloads/$STALWART_ASSET" ]; then
+          # build.sh expects these exact filenames, not the asset names.
+          if [ ! -f "build/downloads/stalwart.tar.gz" ]; then
             echo "== downloading stalwart ($STALWART_ASSET)"
-            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/stalwartlabs/stalwart/releases/download/v$STALWART_VERSION/$STALWART_ASSET" -o "build/downloads/$STALWART_ASSET"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/stalwartlabs/stalwart/releases/download/v$STALWART_VERSION/$STALWART_ASSET" -o "build/downloads/stalwart.tar.gz"
           fi
-          if [ ! -f "build/downloads/$CADDY_ASSET" ]; then
+          if [ ! -f "build/downloads/caddy.tar.gz" ]; then
             echo "== downloading caddy ($CADDY_ASSET)"
-            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$CADDY_ASSET" -o "build/downloads/$CADDY_ASSET"
+            curl -fsSL --retry 5 --retry-delay 10 --retry-all-errors "https://github.com/caddyserver/caddy/releases/download/v$CADDY_VERSION/$CADDY_ASSET" -o "build/downloads/caddy.tar.gz"
           fi
-          echo "$STALWART_SHA256  build/downloads/$STALWART_ASSET" | sha256sum -c -
-          echo "$CADDY_SHA256  build/downloads/$CADDY_ASSET" | sha256sum -c -
+          echo "$STALWART_SHA256  build/downloads/stalwart.tar.gz" | sha256sum -c -
+          echo "$CADDY_SHA256  build/downloads/caddy.tar.gz" | sha256sum -c -
       - name: Build Linux package
         # Invoked via bash on purpose: the git executable bit does not
         # survive every push path (see PR #25 for the Linux scripts).
