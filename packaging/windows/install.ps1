@@ -264,6 +264,23 @@ if (-not (Test-Path $ProvisionMarker)) {
     }
 }
 
+# --- port pre-flight: Caddy needs 80/443. A listener already there
+# --- (on GitHub runners IIS holds :80 as System) makes Caddy exit on
+# --- start and NSSM park the service as Paused. Fail here with a clear
+# --- message instead of a dead service later.
+foreach ($port in @(80, 443)) {
+    $listener = Get-NetTCPConnection -LocalPort $port -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($listener) {
+        $proc = Get-Process -Id $listener.OwningProcess -ErrorAction SilentlyContinue
+        $procName = if ($proc) { $proc.ProcessName } else { 'unknown' }
+        $procPath = if ($proc -and $proc.Path) { $proc.Path } else { '' }
+        if ($procPath -and $procPath.StartsWith($InstallRoot, [System.StringComparison]::OrdinalIgnoreCase)) {
+            continue  # our own Caddy from an earlier install; restarted below
+        }
+        Fail "port $port is already in use by $procName (PID $($listener.OwningProcess)). Stop that service or free the port, then run install.ps1 again."
+    }
+}
+
 # --- register services with NSSM --------------------------------------------
 function Install-NssmService {
     param(

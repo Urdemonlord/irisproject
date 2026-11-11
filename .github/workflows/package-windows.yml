@@ -64,6 +64,20 @@ jobs:
         with:
           name: iris-mail-stack-windows
           path: ${{ runner.temp }}/iris-windows-test
+      - name: Free port 80 (runner IIS holds it as System)
+        run: |
+          $owner = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+          if ($owner) {
+            $proc = Get-Process -Id $owner.OwningProcess -ErrorAction SilentlyContinue
+            Write-Host "port 80 held by $($proc.ProcessName) (PID $($owner.OwningProcess)); stopping IIS/HTTP driver"
+            Get-Service W3SVC, WAS -ErrorAction SilentlyContinue | Stop-Service -Force -ErrorAction SilentlyContinue
+            Start-Sleep -Seconds 3
+            $owner = Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($owner) { net stop http /y 2>$null; Start-Sleep -Seconds 3 }
+            Get-NetTCPConnection -LocalPort 80 -State Listen -ErrorAction SilentlyContinue | Format-Table LocalPort, OwningProcess
+          } else {
+            Write-Host 'port 80 is free'
+          }
       - name: Install the zip (test domain)
         run: |
           $zip = Get-ChildItem -Path '${{ runner.temp }}/iris-windows-test' -Filter '*.zip' | Select-Object -First 1
