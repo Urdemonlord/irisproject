@@ -1,6 +1,6 @@
 # Homebrew formula for the IRIS macOS one-package install.
 #
-# The sha256 values below were filled from the v0.4.0 release tarballs
+# The sha256 values below were filled from the v0.4.1 release tarballs
 # (download the asset, `shasum -a 256 <tarball>`). Update the version
 # and both hashes together when a new release ships; never guess them.
 #
@@ -11,19 +11,19 @@
 class IrisMailStack < Formula
   desc "Self-hosted mail stack: IRIS webmail + Stalwart + Caddy, one install"
   homepage "https://github.com/Urdemonlord/irisproject"
-  version "0.4.0"
+  version "0.4.1"
   license all_of: ["MIT", "Apache-2.0"]
 
   depends_on macos: ">= :sonoma"
 
   on_arm do
     url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-arm64.tar.gz"
-    sha256 "0deca510e9de212e393d127db2a53ddce4c713b1afea44346d9cf4a226c76c38"
+    sha256 "08dfaaaf09a734d58d3bf8e19257da31d2f9a4e9dc67d9997b2cde2aab886c13"
   end
 
   on_intel do
     url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-amd64.tar.gz"
-    sha256 "f5268257fb2592f4127c18fe18463484d6f59ae88115b9bb7bdd083b1f42ccfd"
+    sha256 "96cadaaecfd28b4592edd83bfe5b459927dab10a6f0a75877aba6d02b18c152a"
   end
 
   def install
