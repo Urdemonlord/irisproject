@@ -49,6 +49,36 @@ Write-Host '== services'
 Need 'IRISStalwart running' { (Get-Service -Name 'IRISStalwart').Status -eq 'Running' }
 Need 'IRISApi running' { (Get-Service -Name 'IRISApi').Status -eq 'Running' }
 Need 'IRISCaddy running' { (Get-Service -Name 'IRISCaddy').Status -eq 'Running' }
+if ((Get-Service -Name 'IRISCaddy').Status -ne 'Running') {
+    # Caddy is down: show why before the https checks fail blindly.
+    # NSSM reports a repeatedly-exiting app as Paused and writes
+    # nothing to the service logs, so probe Caddy in the foreground.
+    Write-Host '--- IRISCaddy diagnostics (service not Running):'
+    $NssmDiag = Join-Path $InstallRoot 'bin/nssm.exe'
+    $CaddyDiag = Join-Path $InstallRoot 'bin/caddy.exe'
+    foreach ($key in @('AppDirectory', 'AppParameters', 'AppExit')) {
+        $val = & $NssmDiag get IRISCaddy $key 2>$null
+        Write-Host "nssm IRISCaddy $key = $val"
+    }
+    Write-Host '--- nssm event log (last 5):'
+    Get-WinEvent -FilterHashtable @{ LogName = 'Application'; ProviderName = 'nssm' } -MaxEvents 5 -ErrorAction SilentlyContinue |
+        ForEach-Object { Write-Host "$($_.TimeCreated): $($_.Message -replace "`r`n", ' ')" }
+    Write-Host '--- foreground caddy probe (20s):'
+    $probeOut = Join-Path $env:TEMP 'iris-caddy-probe.log'
+    $probeErr = Join-Path $env:TEMP 'iris-caddy-probe.err.log'
+    $probe = Start-Process -FilePath $CaddyDiag -ArgumentList "run --config `"$Caddyfile`" --adapter caddyfile" -RedirectStandardOutput $probeOut -RedirectStandardError $probeErr -PassThru -WindowStyle Hidden
+    Start-Sleep -Seconds 20
+    $listening = Get-NetTCPConnection -LocalPort 80, 443 -State Listen -ErrorAction SilentlyContinue |
+        ForEach-Object { "$($_.LocalPort):$((Get-Process -Id $_.OwningProcess -ErrorAction SilentlyContinue).ProcessName)" }
+    Write-Host "listening after probe: $($listening -join ', ')"
+    if (-not $probe.HasExited) { Stop-Process -Id $probe.Id -Force -ErrorAction SilentlyContinue }
+    $probe.WaitForExit(5000) | Out-Null
+    Write-Host "probe exit code: $($probe.ExitCode)"
+    Write-Host '--- probe stdout:'
+    Get-Content $probeOut -Tail 40 -ErrorAction SilentlyContinue
+    Write-Host '--- probe stderr:'
+    Get-Content $probeErr -Tail 40 -ErrorAction SilentlyContinue
+}
 
 Write-Host '== files and config'
 Need "Caddyfile rendered for $MailHost" { Select-String -Path $Caddyfile -Pattern ([regex]::Escape($MailHost)) -Quiet }
