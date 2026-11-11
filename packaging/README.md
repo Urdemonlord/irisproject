@@ -15,6 +15,9 @@ which builds IRIS from his fork (his branding, temp inbox off).
 There is also a macOS tarball (Apple Silicon and Intel, no `.deb`):
 see [macOS](#macos).
 
+There is also a Windows zip (x86_64 only, no `.msi` yet):
+see [Windows](#windows).
+
 ## What it installs
 
 | Piece | Location | Notes |
@@ -145,6 +148,70 @@ sudo dscl . -delete /Users/stalwart; sudo dscl . -delete /Groups/stalwart
 sudo dscl . -delete /Users/caddy; sudo dscl . -delete /Groups/caddy
 ```
 
+## Windows
+
+The same stack as a zip for Windows 10/11 and Windows Server, x86_64
+only (Stalwart publishes no Windows ARM binary). There is no `.deb`,
+`.msi` or Winget package yet; the zip is the install.
+
+```powershell
+Expand-Archive iris-mail-stack-0.4.0-windows-x86_64.zip
+cd iris-mail-stack-0.4.0-windows-x86_64
+# Run PowerShell as Administrator:
+.\scripts\install.ps1 -Domain example.com
+```
+
+Non-interactive install works the same way as on Linux:
+
+```powershell
+.\scripts\install.ps1 -Domain example.com -NonInteractive
+```
+
+The installer asks for the domain, generates all secrets, provisions
+Stalwart, registers the three services with NSSM, opens ports 80, 443,
+25, 587 and 993 in Windows Firewall, and prints the admin password
+once (also saved to `C:\Program Files\IRIS\etc\iris\.admin_credentials`).
+It writes the DNS records to publish into
+`C:\Program Files\IRIS\etc\iris\dns-zone.txt`.
+
+Differences from the Linux package, all forced by Windows:
+
+| Piece | Linux | Windows |
+| --- | --- | --- |
+| Services | systemd units | NSSM-wrapped Windows services (`IRISStalwart`, `IRISApi`, `IRISCaddy`) |
+| Installer scripts | `/usr/lib/iris` | `scripts\` in the zip, installed to `C:\Program Files\IRIS\scripts` |
+| Paths | `/etc/iris`, `/var/lib/*`, `/srv/iris/dist` | `C:\Program Files\IRIS\etc`, `data`, `dist` |
+| TLS for mail listeners | self-signed, then `iris-cert-sync` replaces it | self-signed only; no cert-sync yet, replace the files in `etc\stalwart	ls` by hand |
+| Cleanup / cert-sync | systemd timers | none yet |
+| Service control | `systemctl status iris-api` | `Get-Service IRISApi` |
+
+Everything else is the same: the Caddyfile (one path moved:
+`C:\Program Files\IRIS\dist` instead of `/srv/iris/dist`), the
+provisioning script (`iris-setup.ps1`, a PowerShell port of
+`iris-setup.py`), and the smoke test (`scripts\check-windows.ps1`).
+
+Upgrade: extract the new zip and run `install.ps1` again. It replaces
+the binaries and the web app and restarts the three services.
+`C:\Program Files\IRIS\.env`, the mail data and the config are kept.
+
+Uninstall (keeps mail and config until the last step):
+
+```powershell
+Stop-Service IRISStalwart, IRISApi, IRISCaddy
+C:\Program Files\IRISin
+ssm.exe remove IRISStalwart confirm
+C:\Program Files\IRISin
+ssm.exe remove IRISApi confirm
+C:\Program Files\IRISin
+ssm.exe remove IRISCaddy confirm
+Remove-Item 'C:\Program Files\IRIS' -Recurse
+```
+
+Limits: a home connection usually cannot receive mail (port 25
+blocked, dynamic IP, no reverse DNS); on such a machine the install
+works as webmail + local mail, not as a public mail server. See
+`README-Windows.txt` in the zip for the full list.
+
 ## After install
 
 - Webmail: `https://mail.<domain>`, log in as the admin email.
@@ -267,3 +334,7 @@ Bump `packaging/VERSION` together with the tag.
 The macOS tarballs ride the same release: build them from the tag with
 `packaging/macos/build-macos.sh` (or take them from the `macOS
 package` workflow run for the tag) and upload both to the release.
+
+The Windows zip rides the same release too: the `Windows
+package` workflow builds it on a tag push (after the smoke test)
+and uploads it to the release automatically.
