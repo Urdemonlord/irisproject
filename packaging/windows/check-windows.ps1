@@ -123,9 +123,18 @@ else {
 
 Write-Host '== login over loopback (admin account from provisioning)'
 try {
-    $csrf = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/auth/csrf' -TimeoutSec 10 -SessionVariable 'webSession'
+    $csrf = Invoke-RestMethod -Uri 'http://127.0.0.1:8000/auth/csrf' -TimeoutSec 10
     $token = $csrf.csrf_token
+    if (-not $token -or $token.Length -ne 64) { throw "csrf token missing or wrong length ($($token.Length))" }
     $loginBody = @{ email = $AdminEmail; password = $AdminPw } | ConvertTo-Json -Compress
+    # The CSRF cookie is Secure, so a WebSession refuses to send it
+    # over plain http (same trap the macOS check documents: it replays
+    # Set-Cookie by hand). Add the token as a plain cookie to the
+    # session so the double-submit check sees header + cookie.
+    $webSession = New-Object Microsoft.PowerShell.Commands.WebRequestSession
+    $csrfCookie = New-Object System.Net.Cookie('iris_csrf', $token, '/', '127.0.0.1')
+    $csrfCookie.Secure = $false
+    $webSession.Cookies.Add([System.Uri]'http://127.0.0.1:8000/', $csrfCookie)
     $login = Invoke-WebRequest -Uri 'http://127.0.0.1:8000/auth/login' -Method Post -Body $loginBody `
         -ContentType 'application/json' -Headers @{ 'x-csrf-token' = $token } `
         -WebSession $webSession -TimeoutSec 10
