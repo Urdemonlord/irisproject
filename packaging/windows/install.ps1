@@ -227,9 +227,19 @@ if (-not (Test-Path $ProvisionMarker)) {
     # it, so it stops working after this step.
     $env:STALWART_RECOVERY_ADMIN = "admin:$recoveryPw"
     try {
-        $proc = Start-Process -FilePath $StalwartExe -ArgumentList '--config', $StalwartConfig `
+        # NOTE: -ArgumentList must be ONE string with the path quoted by
+        # hand. Passing '--config', $path as an array lets PowerShell
+        # split the space-containing path, so Stalwart received
+        # --config C:\Program and started in bootstrap mode (to it, the
+        # config file "does not exist"). The NSSM service registration
+        # below already uses this single-string form.
+        Write-Log "starting Stalwart with config $StalwartConfig (exists: $(Test-Path $StalwartConfig))"
+        Write-Log "config content: $(Get-Content $StalwartConfig -Raw)"
+        $proc = Start-Process -FilePath $StalwartExe -ArgumentList "--config `"$StalwartConfig`"" `
             -RedirectStandardOutput $setupLog -RedirectStandardError $setupErrLog `
             -PassThru -WindowStyle Hidden
+        $cmdLine = (Get-CimInstance Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue).CommandLine
+        if ($cmdLine) { Write-Log "stalwart command line: $cmdLine" }
         try {
             $setupArgs = @{
                 Domain = $Domain

@@ -80,7 +80,9 @@ jobs:
           Get-Service IRISStalwart, IRISApi, IRISCaddy -ErrorAction SilentlyContinue | Format-Table -AutoSize
           foreach ($log in @(
             "$env:ProgramFiles/IRIS/logs/stalwart/stalwart.log",
+            "$env:ProgramFiles/IRIS/logs/stalwart/stalwart.err.log",
             "$env:ProgramFiles/IRIS/logs/stalwart/setup.log",
+            "$env:ProgramFiles/IRIS/logs/stalwart/setup.err.log",
             "$env:ProgramFiles/IRIS/logs/iris/iris-api.log",
             "$env:ProgramFiles/IRIS/logs/caddy/caddy.log")) {
             Write-Host "--- ${log}:"
