@@ -1,0 +1,126 @@
+# Windows package - build the official IRIS Windows zip and smoke-test
+# the install on a GitHub Windows runner. No deploy, no secrets: the
+# test domain is iris-test.local and the runner is throwaway.
+# On a tag push (v*), the zip is uploaded to that tag's release
+# automatically: the release is created with generated notes if it
+# does not exist yet, and an existing release keeps its own notes.
+# (The Linux assets are still uploaded by hand.)
+name: Windows package
+
+on:
+  pull_request:
+    paths:
+      - 'packaging/windows/**'
+      - '.github/workflows/package-windows.yml'
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: windows-package-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build Windows zip
+    runs-on: windows-latest
+    env:
+      CARGO_TERM_COLOR: always
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install stable toolchain
+        uses: dtolnay/rust-toolchain@stable
+      - name: Use Node.js 22
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - name: Install web dependencies
+        run: npm ci
+        working-directory: apps/web
+      - name: Build Windows package
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File build-windows.ps1
+        working-directory: packaging/windows
+      - name: Upload zip
+        uses: actions/upload-artifact@v4
+        with:
+          name: iris-mail-stack-windows
+          path: packaging/windows/build/windows/*.zip
+          if-no-files-found: error
+
+  test:
+    name: Smoke-test the Windows install
+    runs-on: windows-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+      - name: Download zip
+        uses: actions/download-artifact@v4
+        with:
+          name: iris-mail-stack-windows
+          path: ${{ runner.temp }}/iris-windows-test
+      - name: Install the zip (test domain)
+        run: |
+          $zip = Get-ChildItem -Path '${{ runner.temp }}/iris-windows-test' -Filter '*.zip' | Select-Object -First 1
+          $dest = Join-Path '${{ runner.temp }}' 'iris-windows-install'
+          Expand-Archive -Path $zip.FullName -DestinationPath $dest -Force
+          $root = Get-ChildItem -Path $dest -Directory | Select-Object -First 1 -ExpandProperty FullName
+          pwsh -NoProfile -ExecutionPolicy Bypass -File "$root/scripts/install.ps1" -Domain iris-test.local -NonInteractive
+      - name: Run the smoke test
+        run: pwsh -NoProfile -ExecutionPolicy Bypass -File check-windows.ps1
+        working-directory: packaging/windows
+      - name: Show service logs on failure
+        if: failure()
+        run: |
+          Get-Service IRISStalwart, IRISApi, IRISCaddy | Format-Table -AutoSize
+          foreach ($log in @(
+            "$env:ProgramFiles/IRIS/logs/stalwart/stalwart.log",
+            "$env:ProgramFiles/IRIS/logs/stalwart/setup.log",
+            "$env:ProgramFiles/IRIS/logs/iris/iris-api.log",
+            "$env:ProgramFiles/IRIS/logs/caddy/caddy.log")) {
+            Write-Host "--- ${log}:"
+            Get-Content $log -Tail 100 -ErrorAction SilentlyContinue
+          }
+
+  release:
+    name: Upload zip to the release
+    runs-on: ubuntu-latest
+    needs: [build, test]
+    # Tags only: the zip goes to the release for the pushed tag.
+    # PR runs stop after the smoke test, so this step is first proven
+    # on the next real tag push, not by PR CI.
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check the package version matches the tag
+        # A release build must run from the release tag: packaging/VERSION
+        # has to equal the tag version, or the zip would be mislabelled
+        # on the wrong release.
+        run: |
+          tag="${GITHUB_REF#refs/tags/v}"
+          version="$(cat packaging/VERSION)"
+          [ "$version" = "$tag" ] || { echo "packaging/VERSION ($version) does not match tag ($tag)"; exit 1; }
+      - name: Download zip
+        uses: actions/download-artifact@v4
+        with:
+          name: iris-mail-stack-windows
+          path: /tmp/iris-windows-release
+      - name: Upload to the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${GITHUB_REF#refs/tags/}"
+          # Create the release if it does not exist yet, with notes
+          # generated from merged PRs. An existing release keeps its
+          # own notes; only the assets are added.
+          gh release view "$tag" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
+            || gh release create "$tag" --repo "$GITHUB_REPOSITORY" --generate-notes
+          # --clobber replaces the assets if this run is re-run.
+          gh release upload "$tag" --repo "$GITHUB_REPOSITORY" --clobber /tmp/iris-windows-release/*.zip

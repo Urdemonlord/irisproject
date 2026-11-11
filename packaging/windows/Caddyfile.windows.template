@@ -1,0 +1,94 @@
+# IRIS - public reverse proxy (Caddy v2). Rendered by install.ps1
+# from this template; @MAIL_HOST@, @CONTENT_HOST@ and @DIST_ROOT@ are
+# replaced with the operator's domains and the install location.
+# Caddy issues TLS certificates automatically.
+# Based on the Linux Caddyfile.template, with the web root moved to the
+# Windows install directory.
+{
+	# Pin the admin API to loopback. The default binds the machine's
+	# hostname address, which fails on hosts whose hostname resolves
+	# to an address that is not assigned locally, and the admin API
+	# must never listen on a public interface (it accepts config
+	# changes without authentication).
+	admin 127.0.0.1:2019
+}
+
+@MAIL_HOST@ {
+	encode zstd gzip
+
+	# API + auth -> iris-api (same origin, needed for CSRF cookie + SameSite).
+	# X-Real-IP is trusted by the API only from loopback.
+	# flush_interval -1 keeps the SSE notification stream unbuffered.
+	@backend path /api/* /auth/* /health /ready
+	handle @backend {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Real-IP {remote_host}
+			flush_interval -1
+		}
+	}
+
+	# Static web app.
+	handle {
+		root * "@DIST_ROOT@"
+
+		# Hashed build files never change: cache for a year.
+		@hashed path /assets/*
+		header @hashed Cache-Control "public, max-age=31536000, immutable"
+
+		# HTML and root files (favicon, og-image, robots, sitemap): always revalidate.
+		@revalidate not path /assets/*
+		header @revalidate Cache-Control "no-cache"
+
+		file_server
+	}
+
+	# Unknown static paths -> custom 404 page (keeps the 404 status).
+	# Only errors raised by Caddy itself land here; API 404s pass through untouched.
+	handle_errors 404 {
+		root * "@DIST_ROOT@"
+		rewrite * /404.html
+		file_server
+	}
+
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "strict-origin-when-cross-origin"
+		Permissions-Policy "camera=(), microphone=(), geolocation=(), payment=()"
+		# App shell policy: no inline script, handler or style anywhere in
+		# the shell (see apps/web/public/early.js). The hosts are the ones the
+		# shell actually loads: Turnstile (script + challenge frame), Google
+		# Fonts (stylesheet + font files), and the separate mail-content
+		# origin (the one-time-token mail iframe) plus 'self' for the
+		# mail body's srcdoc fallback. Keep in sync with CSP_HEADER_VALUE
+		# in apps/api/src/main.rs, which stamps the same policy on API
+		# responses (without the content host: the API serves no framed
+		# document).
+		Content-Security-Policy "default-src 'self'; script-src 'self' https://challenges.cloudflare.com; style-src 'self' https://fonts.googleapis.com; img-src 'self' data:; font-src 'self' https://fonts.gstatic.com; connect-src 'self'; frame-src 'self' https://challenges.cloudflare.com https://@CONTENT_HOST@; object-src 'none'; base-uri 'self'; form-action 'self'"
+		-Server
+	}
+}
+
+@CONTENT_HOST@ {
+	# Separate origin for HTML mail rendering. Only the one-time
+	# html-body token URL is proxied to iris-api; everything else 404s.
+	# The frame may only be embedded by the mail host.
+	@htmlbody path /api/v1/mailboxes/*/messages/*/html-body
+	handle @htmlbody {
+		reverse_proxy 127.0.0.1:8000 {
+			header_up X-Real-IP {remote_host}
+		}
+	}
+
+	handle {
+		respond "Not found" 404
+	}
+
+	header {
+		Content-Security-Policy "frame-ancestors https://@MAIL_HOST@"
+		X-Content-Type-Options "nosniff"
+		Referrer-Policy "no-referrer"
+		-Server
+	}
+}
