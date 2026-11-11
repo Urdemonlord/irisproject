@@ -47,9 +47,13 @@ function Invoke-Jmap {
         Fail "$Method failed to answer: $($_.Exception.Message) $detail"
     }
     $result = $resp.methodResponses[0][1]
+    # StrictMode is on: a missing property throws, so test for the
+    # property's existence first (the Python original uses .get()).
     foreach ($key in @('notCreated', 'notUpdated', 'notDestroyed')) {
-        if ($result.$key) {
-            Fail "$Method refused: $(($result.$key | ConvertTo-Json -Depth 5 -Compress).Substring(0, [Math]::Min(400, ($result.$key | ConvertTo-Json -Depth 5 -Compress).Length)))"
+        $prop = $result.PSObject.Properties[$key]
+        if ($null -ne $prop -and $prop.Value) {
+            $refused = $prop.Value | ConvertTo-Json -Depth 5 -Compress
+            Fail "$Method refused: $($refused.Substring(0, [Math]::Min(400, $refused.Length)))"
         }
     }
     return $result
@@ -202,7 +206,12 @@ Write-SetupLog 'listeners smtp [::]:25, http 127.0.0.1:8080 (no 443/465/993/995/
 $domains = Invoke-Jmap -Method 'x:Domain/get' -Arguments @{ properties = @('name', 'dnsZoneFile') }
 $zones = @()
 foreach ($d in $domains.list) {
-    $zones += "# DNS records for $($d.name)`n$($d.dnsZoneFile)"
+    # dnsZoneFile may be absent for a domain; StrictMode forbids
+    # reading a missing property, so guard it like .get() in Python.
+    $zoneProp = $d.PSObject.Properties['dnsZoneFile']
+    $zoneText = ''
+    if ($null -ne $zoneProp) { $zoneText = $zoneProp.Value }
+    $zones += "# DNS records for $($d.name)`n$zoneText"
 }
 $zonePath = Join-Path $InstallRoot 'etc/iris/dns-zone.txt'
 [System.IO.File]::WriteAllText($zonePath, ($zones -join "`n"), (New-Object System.Text.UTF8Encoding($false)))

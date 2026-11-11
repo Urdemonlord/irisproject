@@ -77,7 +77,7 @@ jobs:
       - name: Show service logs on failure
         if: failure()
         run: |
-          Get-Service IRISStalwart, IRISApi, IRISCaddy | Format-Table -AutoSize
+          Get-Service IRISStalwart, IRISApi, IRISCaddy -ErrorAction SilentlyContinue | Format-Table -AutoSize
           foreach ($log in @(
             "$env:ProgramFiles/IRIS/logs/stalwart/stalwart.log",
             "$env:ProgramFiles/IRIS/logs/stalwart/setup.log",
