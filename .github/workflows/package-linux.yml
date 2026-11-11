@@ -86,7 +86,11 @@ jobs:
           test -f "build/iris-mail-stack_${version}_amd64.deb"
           test -f "build/iris-mail-stack-${version}.tar.gz"
           dpkg-deb --info "build/iris-mail-stack_${version}_amd64.deb" | grep -q "Version: $version"
-          tar -tzf "build/iris-mail-stack-${version}.tar.gz" | grep -q "iris-mail-stack-${version}/install.sh"
+          # List to a file first: piping tar straight into grep -q lets
+          # grep close the pipe early, so tar dies with SIGPIPE and the
+          # step fails under pipefail even when the entry is there.
+          tar -tzf "build/iris-mail-stack-${version}.tar.gz" > /tmp/tarball-list.txt
+          grep -q "iris-mail-stack-${version}/install.sh" /tmp/tarball-list.txt
           # The one-liner uploaded to the release must install this
           # version's .deb, not a stale one.
           grep -q "VERSION=$version" scripts/install-one-liner.sh
