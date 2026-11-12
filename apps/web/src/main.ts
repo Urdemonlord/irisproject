@@ -1104,7 +1104,7 @@ function attachContactSuggest(f: { el: HTMLInputElement; row: HTMLDivElement }, 
   f.el.addEventListener('blur', close)
 }
 
-async function openComposer(base: string, d: ComposeDraft, onChange: () => void) {
+async function openComposer(base: string, d: ComposeDraft, onChange: () => void, onDiscard?: (id: string) => void) {
   if (closeComposer) await closeComposer()
   let draftId = d.draftId
   let dirty = false
@@ -1295,7 +1295,7 @@ async function openComposer(base: string, d: ComposeDraft, onChange: () => void)
     closed = true; closeComposer = null
     document.removeEventListener('keydown', onKey)
     panel.remove()
-    if (id) { await api(`${base}/messages/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {}); onChange() }
+    if (id) { await api(`${base}/messages/${encodeURIComponent(id)}`, { method: 'DELETE' }).catch(() => {}); onDiscard?.(id); onChange() }
     toast('Draft discarded')
   }
 
@@ -1621,7 +1621,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const title = h('h2', { className: 'pane-title' }, meta.label)
   const nav = orgNav(key)
 
-  const compose = (d: ComposeDraft = {}) => { if (mb) openComposer(base, d, onMutate) }
+  const compose = (d: ComposeDraft = {}) => { if (mb) openComposer(base, d, onMutate, (id) => dropThreadsWith(id)) }
   const composeBtn = btn('btn btn-primary compose-btn', 'Compose', 'pen', { onclick: () => compose() })
   const fab = btn('btn btn-primary fab', 'Compose', 'pen', { onclick: () => compose() })
 
@@ -1699,6 +1699,15 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   }
   const keepLocal = () => { writeListCache(email, mb, key, all); draw() }
 
+  /** Mirror a mutation onto the Summary in `all`. A message opened
+   * from a fetched thread is a Detail, not the Summary the thread row
+   * is drawn from, so mutating it alone leaves the row (unread dot,
+   * star) and the unread count stale until the next reload. */
+  const syncSummary = (id: string, patch: Partial<Summary>) => {
+    const s = all.find((x) => x.id === id)
+    if (s) Object.assign(s, patch)
+  }
+
   /** Where messages in this view live, for Undo. Starred/label views span folders, so they have none. */
   const here: MoveTarget | null = view.kind === 'role' ? { folder: view.role } : view.kind === 'folder' ? { folder_id: view.id } : null
   const targetName = (t: MoveTarget) => 'folder' in t ? folderMeta(t.folder).label : org.folders.find((f) => f.id === t.folder_id)?.name ?? 'folder'
@@ -1740,6 +1749,7 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const toggleStar = async (m: Summary) => {
     const on = !m.is_starred
     m.is_starred = on
+    syncSummary(m.id, { is_starred: on })
     if (view.kind === 'starred' && !on) removeLocal(m.id)
     else keepLocal()
     try {
@@ -1789,12 +1799,14 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   const deleteForever = async (m: Summary) => {
     if (!(await confirmDialog('Delete forever?', 'This message will be permanently deleted. This can’t be undone.', 'Delete forever'))) return
     removeLocal(m.id)
+    dropThreadsWith(m.id)
     try { await api(url(m.id), { method: 'DELETE' }); messageCache.delete(url(m.id)); toast('Message deleted forever'); loadFolders() }
     catch { toast('Could not delete the message.'); load() }
   }
 
   const markUnread = async (m: Summary) => {
     m.is_read = false
+    syncSummary(m.id, { is_read: false })
     current = ''
     ui.hide(idle())
     draw()
@@ -1861,12 +1873,34 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
   /** Opened threads and their fetched details, kept across redraws. */
   const expandedThreads = new Set<string>()
   const threadDetails = new Map<string, ThreadDetail>()
+  /** In-flight thread fetches, so collapsing and re-expanding a row
+   * while its fetch is still running does not start a second one. */
+  const threadFetches = new Map<string, Promise<{ thread: ThreadDetail }>>()
+  /** Drop every cached thread holding `id`: after a delete (or a
+   * discarded draft) the cached detail would otherwise keep showing
+   * a message that no longer exists. */
+  const dropThreadsWith = (id: string) => {
+    for (const [tid, t] of threadDetails) {
+      if (t.messages.some((d) => d.id === id)) threadDetails.delete(tid)
+    }
+  }
 
   const openFromList = (m: Summary, i: number, wasUnread: boolean, total: number) => {
-    if (folder === 'drafts' || m.is_draft) return void openDraft(m)
+    // A draft opens in the composer only when it really is one: the
+    // $draft keyword, or listed in this Drafts folder. A thread fetch
+    // is account-wide, so an expanded Drafts conversation can also
+    // hold the original message — opening that in the composer would
+    // let an autosave destroy it (the server refuses non-draft ids
+    // too, but the composer must never offer the edit).
+    const isDraft = m.is_draft || (folder === 'drafts' && all.some((s) => s.id === m.id))
+    if (isDraft) return void openDraft(m)
     if (wasUnread) {
-      writeListCache(email, mb, key, all)
-      api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(loadFolders, () => {})
+      api(`${url(m.id)}/seen`, { method: 'POST', body: JSON.stringify({ seen: true }) }).then(() => {
+        syncSummary(m.id, { is_read: true })
+        writeListCache(email, mb, key, all)
+        loadFolders()
+        draw()
+      }, () => {})
     }
     current = m.id
     draw()
@@ -1878,24 +1912,29 @@ async function renderMailbox(view: MailView = { kind: 'role', role: 'inbox' }) {
     if (expandedThreads.has(g.id)) { expandedThreads.delete(g.id); draw(); return }
     expandedThreads.add(g.id)
     draw()
-    // A one-message thread needs no fetch: the loaded summary is the
-    // whole conversation. Larger threads fetch once and cache.
-    if (g.count > 1 && !threadDetails.has(g.id) && !g.id.startsWith('msg:')) {
-      api<{ thread: ThreadDetail }>(`${base}/threads/${encodeURIComponent(g.id)}`)
-        .then(({ thread }) => {
-          threadDetails.set(g.id, thread)
-          // Seed the message cache so opening a message in the thread
-          // needs no second fetch.
-          for (const d of thread.messages) {
-            const u = url(d.id)
-            if (!messageCache.has(u)) {
-              while (messageCache.size >= MESSAGE_CACHE_MAX) messageCache.delete(messageCache.keys().next().value!)
-              messageCache.set(u, { at: Date.now(), p: Promise.resolve({ message: d }) })
-            }
+    // The loaded page's count is only a lower bound: a thread's other
+    // messages may sit on later pages or in other folders, so a count
+    // of one on this page does not prove the thread is a singleton.
+    // Expand always fetches a real thread id once and caches it.
+    if (!threadDetails.has(g.id) && !g.id.startsWith('msg:') && !threadFetches.has(g.id)) {
+      const p = api<{ thread: ThreadDetail }>(`${base}/threads/${encodeURIComponent(g.id)}`)
+      threadFetches.set(g.id, p)
+      p.then(({ thread }) => {
+        threadDetails.set(g.id, thread)
+        // Seed the message cache so opening a message in the thread
+        // needs no second fetch.
+        for (const d of thread.messages) {
+          const u = url(d.id)
+          if (!messageCache.has(u)) {
+            while (messageCache.size >= MESSAGE_CACHE_MAX) messageCache.delete(messageCache.keys().next().value!)
+            messageCache.set(u, { at: Date.now(), p: Promise.resolve({ message: d }) })
           }
-          draw()
-        })
-        .catch(() => { toast('Could not load this conversation.') })
+        }
+        draw()
+      }).catch((err) => {
+        if ((err as HttpError).status === 401) { signOut(); renderLogin(); return }
+        toast('Could not load this conversation.')
+      }).finally(() => { threadFetches.delete(g.id) })
     }
   }
 
