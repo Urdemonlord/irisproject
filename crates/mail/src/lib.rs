@@ -2,7 +2,8 @@
 //! (never an admin credential), per TRD §5.
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use iris_config::limits::{
-    MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT, MAX_THREAD_MESSAGES,
+    MAX_CLEAR_KEYWORD_BATCHES, MAX_DESTROY_PER_CALL, MAX_PREVIEW_TEXT, MAX_THREAD_BODY_BYTES,
+    MAX_THREAD_FETCH_BATCH, MAX_THREAD_MESSAGES,
 };
 use serde::Serialize;
 use serde_json::{json, Value};
@@ -34,6 +35,11 @@ pub enum MailError {
     /// A folder still holds messages, so it cannot be deleted.
     #[error("folder is not empty")]
     NotEmpty,
+    /// The id a save/send wanted to replace is a real message, not a
+    /// draft. Destroying it would delete mail the user never meant to
+    /// discard; the caller must refuse instead.
+    #[error("not a draft")]
+    NotDraft,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1153,6 +1159,41 @@ impl JmapClient {
         }
     }
 
+    /// Whether the message `id` is a draft this account may replace.
+    /// Returns `Ok(true)` when the id may be destroyed, `Ok(false)`
+    /// when it does not exist (the draft was deleted elsewhere; the
+    /// caller saves fresh instead), and `Err(MailError::NotDraft)`
+    /// when it exists but is not a draft.
+    ///
+    /// The web opens a non-draft message in the draft composer when it
+    /// surfaces through an expanded Drafts conversation (the thread
+    /// fetch is account-wide), so an autosave would otherwise destroy
+    /// the original in the same `Email/set` that creates its
+    /// replacement. The check sits here, at the shared choke point,
+    /// so the save, send, and Sent-copy paths are all guarded.
+    pub async fn is_replaceable_draft(
+        &self,
+        user: &str,
+        pass: &str,
+        account: &str,
+        drafts: &str,
+        id: &str,
+    ) -> Result<bool, MailError> {
+        let r = self
+            .call(
+                user,
+                pass,
+                json!([["Email/get", {"accountId": account, "ids": [id],
+                "properties": ["mailboxIds", "keywords"]}, "g"]]),
+            )
+            .await?;
+        match r[0]["list"].get(0) {
+            None => Ok(false),
+            Some(e) if is_draft_email(e, drafts) => Ok(true),
+            Some(_) => Err(MailError::NotDraft),
+        }
+    }
+
     /// Saves a draft (replacing `replace` if given) and returns the new draft id.
     pub async fn save_draft(
         &self,
@@ -1163,12 +1204,24 @@ impl JmapClient {
         replace: Option<&str>,
     ) -> Result<String, MailError> {
         let drafts = self.folder_id(user, pass, account, "drafts").await?;
+        // The id being replaced must really be a draft; a real message
+        // is refused (see `is_replaceable_draft`). A missing id just
+        // means the draft was deleted elsewhere, so save fresh.
+        let mut destroy: Option<&str> = None;
+        if let Some(old) = replace {
+            if self
+                .is_replaceable_draft(user, pass, account, &drafts, old)
+                .await?
+            {
+                destroy = Some(old);
+            }
+        }
         let uploaded = self
             .upload_attachments(user, pass, account, &c.attachments)
             .await?;
         let mut set =
             json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
-        if let Some(old) = replace {
+        if let Some(old) = destroy {
             set["destroy"] = json!([old]);
         }
         let r = self
@@ -1199,13 +1252,23 @@ impl JmapClient {
         };
         let (drafts, sent) = (id_of("drafts")?, id_of("sent")?);
         let identity = self.identity(user, pass, account, &c.from).await?;
+        // The draft being replaced must really be a draft; see save_draft.
+        let mut destroy: Option<&str> = None;
+        if let Some(old) = draft {
+            if self
+                .is_replaceable_draft(user, pass, account, &drafts, old)
+                .await?
+            {
+                destroy = Some(old);
+            }
+        }
         // Uploads first: if one fails, no Email/set runs and nothing is sent.
         let uploaded = self
             .upload_attachments(user, pass, account, &c.attachments)
             .await?;
         let mut email_set =
             json!({"accountId": account, "create": {"n": email_json(c, &drafts, &uploaded)}});
-        if let Some(old) = draft {
+        if let Some(old) = destroy {
             email_set["destroy"] = json!([old]);
         }
         let r = self.call_using(user, pass, &USING_SUBMIT, json!([
@@ -1244,13 +1307,24 @@ impl JmapClient {
         draft: Option<&str>,
     ) -> Result<(), MailError> {
         let sent = self.folder_id(user, pass, account, "sent").await?;
+        // The draft being replaced must really be a draft; see save_draft.
+        let mut destroy: Option<&str> = None;
+        if let Some(old) = draft {
+            let drafts = self.folder_id(user, pass, account, "drafts").await?;
+            if self
+                .is_replaceable_draft(user, pass, account, &drafts, old)
+                .await?
+            {
+                destroy = Some(old);
+            }
+        }
         let uploaded = self
             .upload_attachments(user, pass, account, &c.attachments)
             .await?;
         let mut e = email_json(c, &sent, &uploaded);
         e["keywords"] = json!({"$seen": true});
         let mut set = json!({"accountId": account, "create": {"n": e}});
-        if let Some(old) = draft {
+        if let Some(old) = destroy {
             set["destroy"] = json!([old]);
         }
         let r = self
@@ -1366,6 +1440,14 @@ impl JmapClient {
     /// first (verified against the local server), so the tail of an
     /// over-long thread is its newest slice; the fetched details are
     /// still sorted by `receivedAt` below rather than trusting that.
+    ///
+    /// Bodies arrive in batches of `MAX_THREAD_FETCH_BATCH`, newest
+    /// first, and stop once the materialized body bytes reach
+    /// `MAX_THREAD_BODY_BYTES`. One `Email/get` still materializes its
+    /// whole JSON answer, so a single call over all ids could hand the
+    /// API a 200-message by 1 MB response (over 200 MB on a ~12 MB
+    /// process). An over-budget thread returns its newest slice up to
+    /// the budget — the same truncation as the message cap, by bytes.
     pub async fn get_thread(
         &self,
         user: &str,
@@ -1390,28 +1472,41 @@ impl JmapClient {
         if ids.is_empty() {
             return Err(MailError::NotFound);
         }
-        let ids: Vec<&str> = if ids.len() > MAX_THREAD_MESSAGES {
-            ids[ids.len() - MAX_THREAD_MESSAGES..].to_vec()
+        let ids: &[&str] = if ids.len() > MAX_THREAD_MESSAGES {
+            &ids[ids.len() - MAX_THREAD_MESSAGES..]
         } else {
-            ids
+            &ids
         };
-        let r = self
-            .call(
-                user,
-                pass,
-                json!([["Email/get", {"accountId": account, "ids": ids,
-                "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
-                "fetchAllBodyValues": true,
-                "maxBodyValueBytes": 1_000_000}, "g"]]),
-            )
-            .await?;
-        let details: Vec<MessageDetail> = r[0]["list"]
-            .as_array()
-            .cloned()
-            .unwrap_or_default()
-            .iter()
-            .map(detail_from_email)
-            .collect();
+        let mut details: Vec<MessageDetail> = Vec::new();
+        let mut body_bytes = 0usize;
+        // Newest first: `rchunks` yields the tail first, so the budget
+        // is spent on the newest messages. A batch that crosses the
+        // budget is still kept whole; the loop only stops before the
+        // next (older) batch.
+        for batch in ids.rchunks(MAX_THREAD_FETCH_BATCH) {
+            let r = self
+                .call(
+                    user,
+                    pass,
+                    json!([["Email/get", {"accountId": account, "ids": batch,
+                    "properties": detail_props(), "fetchTextBodyValues": true, "fetchHTMLBodyValues": true,
+                    "fetchAllBodyValues": true,
+                    "maxBodyValueBytes": 1_000_000}, "g"]]),
+                )
+                .await?;
+            let batch_details: Vec<MessageDetail> = r[0]["list"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default()
+                .iter()
+                .map(detail_from_email)
+                .collect();
+            body_bytes += batch_details.iter().map(body_bytes_of).sum::<usize>();
+            details.extend(batch_details);
+            if body_bytes >= MAX_THREAD_BODY_BYTES {
+                break;
+            }
+        }
         thread_from_details(thread_id, details)
     }
 
@@ -1504,6 +1599,24 @@ fn snapshot_from_query(q: &Value) -> InboxSnapshot {
             .and_then(Value::as_str)
             .map(str::to_string),
     }
+}
+
+/// Materialized body bytes of one fetched message: the text and HTML
+/// bodies the thread fetch keeps in memory. The budget in `get_thread`
+/// counts these, since bodies dominate a thread response.
+fn body_bytes_of(d: &MessageDetail) -> usize {
+    d.text_body.as_ref().map(String::len).unwrap_or(0)
+        + d.html_body.as_ref().map(String::len).unwrap_or(0)
+}
+
+/// Whether one `Email/get` object is a draft: it lives in the Drafts
+/// mailbox or carries the `$draft` keyword. Pure, so the rule can be
+/// tested from fixtures without a mail server.
+fn is_draft_email(e: &Value, drafts: &str) -> bool {
+    e["keywords"]["$draft"] == true
+        || e["mailboxIds"]
+            .as_object()
+            .is_some_and(|m| m.contains_key(drafts))
 }
 
 /// Builds a `ThreadDetail` from fetched messages. Pure, so the sort and
@@ -2323,6 +2436,22 @@ mod tests {
             thread_from_details("t1", vec![]),
             Err(MailError::NotFound)
         ));
+    }
+
+    #[test]
+    fn is_draft_email_accepts_keyword_or_drafts_folder() {
+        // $draft keyword, in another folder.
+        let e = json!({"mailboxIds": {"f-inbox": true}, "keywords": {"$draft": true}});
+        assert!(is_draft_email(&e, "f-drafts"));
+        // In the Drafts mailbox, no keyword (e.g. moved there by hand).
+        let e = json!({"mailboxIds": {"f-drafts": true}, "keywords": {}});
+        assert!(is_draft_email(&e, "f-drafts"));
+        // A real message: neither in Drafts nor keyworded.
+        let e = json!({"mailboxIds": {"f-inbox": true}, "keywords": {"$seen": true}});
+        assert!(!is_draft_email(&e, "f-drafts"));
+        // Missing mailboxIds/keywords entirely: not a draft.
+        let e = json!({});
+        assert!(!is_draft_email(&e, "f-drafts"));
     }
 
     fn snap(total: u64, newest: Option<&str>) -> InboxSnapshot {

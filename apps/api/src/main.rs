@@ -166,6 +166,7 @@ impl From<MailError> for ApiError {
         match e {
             MailError::Auth => ApiError(StatusCode::UNAUTHORIZED, "unauthorized"),
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
+            MailError::NotDraft => ApiError(StatusCode::BAD_REQUEST, "not_a_draft"),
             MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
             MailError::NotEmpty => ApiError(StatusCode::CONFLICT, "folder_not_empty"),
             // The mail server could not be reached at all, or every

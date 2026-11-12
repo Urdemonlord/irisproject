@@ -27,6 +27,17 @@ pub const MAX_PREVIEW_TEXT: usize = 2_000_000;
 /// mailing list) must not pull an unbounded `Email/get`; the newest
 /// slice is still a useful conversation view.
 pub const MAX_THREAD_MESSAGES: usize = 200;
+/// Max messages fetched with bodies in one `Email/get` call while
+/// resolving a thread. One call still materializes its whole JSON
+/// answer, so the thread fetch is batched: a 200-message thread must
+/// never arrive as a single 200 MB response.
+pub const MAX_THREAD_FETCH_BATCH: usize = 20;
+/// Max total body bytes materialized for one thread fetch (text + HTML
+/// bodies summed over the fetched messages). Batches run newest first
+/// and stop once the budget is reached, so an over-budget thread still
+/// returns its newest slice — the same truncation as the message cap,
+/// but by bytes instead of count.
+pub const MAX_THREAD_BODY_BYTES: usize = 10_000_000;
 /// Max inbox messages with attachments one DMARC scan examines, newest
 /// first. A scan that walked the whole inbox would take minutes and
 /// download without bound; reports are recent mail, so the newest
@@ -221,6 +232,8 @@ mod tests {
         assert_eq!(MAX_PREVIEW_TEXT, 2_000_000);
         assert_eq!(MAX_DESTROY_PER_CALL, 500);
         assert_eq!(MAX_THREAD_MESSAGES, 200);
+        assert_eq!(MAX_THREAD_FETCH_BATCH, 20);
+        assert_eq!(MAX_THREAD_BODY_BYTES, 10_000_000);
         assert_eq!(MAX_DMARC_SCAN_MESSAGES, 100);
         assert_eq!(MAX_DMARC_SCAN_ATTACHMENT_BYTES, 5_000_000);
         assert_eq!(MAX_DMARC_RECORDS_PER_REPORT, 5000);
