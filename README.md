@@ -277,7 +277,7 @@ Public site settings (build-time, all optional — defaults in `apps/web/vite.co
 | Variable | Default | Used for |
 |---|---|---|
 | `VITE_SITE_URL` | `https://mail.example.com` | canonical URLs, Open Graph image, `robots.txt`, `sitemap.xml` |
-| `VITE_CONTACT_EMAIL` | `admin@example.com` | footer + Privacy/Terms contact |
+| `VITE_CONTACT_EMAIL` | `admin@meowlabs.id` | footer + Privacy/Terms contact |
 | `VITE_CONTACT_ADDRESS` | empty (hidden) | postal address on Privacy/Terms |
 | `VITE_ANALYTICS_SRC` | empty (off) | Umami tracking script |
 | `VITE_ANALYTICS_WEBSITE_ID` | empty (off) | Umami website ID. Analytics loads only when set **and** the visitor allows it in the cookie notice; only route names are sent. |
