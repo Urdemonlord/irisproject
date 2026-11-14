@@ -100,5 +100,5 @@ echo "== installing the .deb (domain iris-test.local)"
 run_in "DEBIAN_FRONTEND=noninteractive IRIS_DOMAIN=iris-test.local dpkg -i /mnt/build/iris-mail-stack_$(cat VERSION)_amd64.deb"
 
 echo "== running in-container checks"
-run_in "/root/check-inside.sh"
+run_in "IRIS_TEST_CONTAINER=1 /root/check-inside.sh"
 echo "== all in-container checks passed"
