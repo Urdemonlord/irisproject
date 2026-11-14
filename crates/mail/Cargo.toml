@@ -14,3 +14,6 @@ flate2 = "1.0"
 zip = "9"
 quick-xml = { workspace = true }
 iris-config = { path = "../config" }
+
+[dev-dependencies]
+tokio = { workspace = true }

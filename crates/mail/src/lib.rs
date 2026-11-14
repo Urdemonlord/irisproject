@@ -2051,6 +2051,12 @@ fn email_json(c: &Compose, mailbox: &str, uploaded: &[UploadedAttachment]) -> Va
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Arc, Mutex};
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::{timeout, Duration},
+    };
 
     #[test]
     fn email_json_shapes_a_plain_text_draft() {
@@ -2504,6 +2510,337 @@ mod tests {
         assert_eq!(new_mail_count(&snap(1, Some("a")), &snap(0, None)), 0);
         // First message in an empty inbox.
         assert_eq!(new_mail_count(&snap(0, None), &snap(1, Some("a"))), 1);
+    }
+
+    /// What a fake JMAP server answers. One fake serves one test, so the
+    /// behaviour is fixed up front instead of switched mid-test.
+    enum FakeMode {
+        /// Thread fetch: `Thread/get` reports these ids (oldest first);
+        /// `Email/get` answers every requested id with a `body_len`-byte
+        /// text body.
+        Thread { ids: Vec<String>, body_len: usize },
+        /// Draft check / save: `Mailbox/get` reports the five standard
+        /// folders; a one-id `Email/get` answers whether that id is a
+        /// draft (`None` = it does not exist); `Email/set` reports a
+        /// fresh draft id.
+        Draft { probe_draft: Option<bool> },
+    }
+
+    /// Minimal fake JMAP server, mirroring the `FakeJmap` in `apps/api`:
+    /// reads one request per connection (until Content-Length), records
+    /// every method call, and answers from its fixed `FakeMode`. The
+    /// accept loop gives up after 5s idle, so the task ends on its own.
+    struct FakeJmap {
+        base_url: String,
+        requests: Arc<Mutex<Vec<Value>>>,
+        _task: tokio::task::JoinHandle<()>,
+    }
+
+    async fn fake_jmap(mode: FakeMode) -> FakeJmap {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}", listener.local_addr().unwrap());
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let task_requests = requests.clone();
+        let mode = Arc::new(mode);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok(Ok((mut stream, _))) =
+                    timeout(Duration::from_secs(5), listener.accept()).await
+                else {
+                    return;
+                };
+                // Read one request: headers, then exactly Content-Length bytes.
+                let mut bytes = Vec::new();
+                let mut chunk = [0u8; 4096];
+                let mut header_end: Option<usize> = None;
+                let mut expected: Option<usize> = None;
+                let mut complete = false;
+                while !complete {
+                    let Ok(n) = stream.read(&mut chunk).await else {
+                        break;
+                    };
+                    if n == 0 {
+                        break;
+                    }
+                    bytes.extend_from_slice(&chunk[..n]);
+                    if header_end.is_none() {
+                        if let Some(end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                            header_end = Some(end);
+                            let headers = String::from_utf8_lossy(&bytes[..end]);
+                            let length = headers
+                                .lines()
+                                .find_map(|line| {
+                                    let (name, value) = line.split_once(':')?;
+                                    name.eq_ignore_ascii_case("content-length")
+                                        .then(|| value.trim().parse::<usize>().ok())
+                                        .flatten()
+                                })
+                                .unwrap_or(0);
+                            expected = Some(end + 4 + length);
+                        }
+                    }
+                    if let Some(end) = expected {
+                        if bytes.len() >= end {
+                            complete = true;
+                        }
+                    }
+                }
+                let Some(end) = header_end else { continue };
+                let Some(total) = expected else { continue };
+                if bytes.len() < total {
+                    continue;
+                }
+                let body: Value =
+                    serde_json::from_slice(&bytes[end + 4..total]).unwrap_or(Value::Null);
+                task_requests.lock().unwrap().push(body.clone());
+                let payload = fake_response(&mode, &body);
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                    payload.len(),
+                    payload
+                );
+                if stream.write_all(response.as_bytes()).await.is_err() {
+                    continue;
+                }
+                let _ = stream.flush().await;
+            }
+        });
+        FakeJmap {
+            base_url,
+            requests,
+            _task: task,
+        }
+    }
+
+    /// One JMAP answer for one recorded request body.
+    fn fake_response(mode: &FakeMode, body: &Value) -> String {
+        let calls = body["methodCalls"].as_array().cloned().unwrap_or_default();
+        let mut responses = Vec::new();
+        for call in &calls {
+            let name = call[0].as_str().unwrap_or_default();
+            let args = &call[1];
+            let result = match name {
+                "Thread/get" => match mode {
+                    FakeMode::Thread { ids, .. } => json!({
+                        "accountId": "acct",
+                        "list": [{"id": "t1", "emailIds": ids}],
+                        "state": "s",
+                    }),
+                    FakeMode::Draft { .. } => {
+                        json!({"accountId": "acct", "list": [], "state": "s"})
+                    }
+                },
+                "Email/get" => {
+                    let wanted: Vec<&str> = args["ids"]
+                        .as_array()
+                        .map(|a| a.iter().filter_map(Value::as_str).collect())
+                        .unwrap_or_default();
+                    let list: Vec<Value> = match mode {
+                        FakeMode::Thread { body_len, .. } => wanted
+                            .iter()
+                            .map(|id| thread_message(id, *body_len))
+                            .collect(),
+                        FakeMode::Draft { probe_draft } => match probe_draft {
+                            None => vec![],
+                            Some(true) => vec![json!({
+                                "id": "old-draft",
+                                "mailboxIds": {"f-drafts": true},
+                                "keywords": {"$draft": true},
+                            })],
+                            Some(false) => vec![json!({
+                                "id": "old-draft",
+                                "mailboxIds": {"f-inbox": true},
+                                "keywords": {"$seen": true},
+                            })],
+                        },
+                    };
+                    json!({"accountId": "acct", "list": list, "state": "s"})
+                }
+                "Mailbox/get" => json!({
+                    "accountId": "acct",
+                    "list": [
+                        {"id": "f-inbox", "name": "Inbox", "role": "inbox", "totalEmails": 0, "unreadEmails": 0},
+                        {"id": "f-sent", "name": "Sent", "role": "sent", "totalEmails": 0, "unreadEmails": 0},
+                        {"id": "f-drafts", "name": "Drafts", "role": "drafts", "totalEmails": 0, "unreadEmails": 0},
+                        {"id": "f-archive", "name": "Archive", "role": "archive", "totalEmails": 0, "unreadEmails": 0},
+                        {"id": "f-trash", "name": "Trash", "role": "trash", "totalEmails": 0, "unreadEmails": 0},
+                    ],
+                    "state": "s",
+                }),
+                "Email/set" => json!({
+                    "accountId": "acct",
+                    "created": {"n": {"id": "new-draft"}},
+                    "destroyed": ["old-draft"],
+                    "state": "s",
+                }),
+                _ => json!({"accountId": "acct", "list": [], "state": "s"}),
+            };
+            responses.push(json!([name, result, "c"]));
+        }
+        serde_json::to_string(&json!({"methodResponses": responses})).unwrap()
+    }
+
+    /// One thread message as the fake server returns it: a `body_len`-byte
+    /// text body, `receivedAt` ordered by the numeric suffix of its id
+    /// (so `m0` is the oldest, `m249` the newest).
+    fn thread_message(id: &str, body_len: usize) -> Value {
+        let n: usize = id
+            .strip_prefix('m')
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        json!({
+            "id": id,
+            "threadId": "t1",
+            "subject": format!("Re: {id}"),
+            "preview": "hi",
+            "receivedAt": format!("2026-11-14T00:{:02}:{:02}Z", n / 60, n % 60),
+            "from": [{"email": "a@x.id"}],
+            "to": [{"email": "b@x.id"}],
+            "keywords": {},
+            "size": body_len,
+            "hasAttachment": false,
+            "textBody": [{"partId": "p", "type": "text/plain"}],
+            "bodyValues": {"p": {"value": "x".repeat(body_len)}},
+        })
+    }
+
+    /// The `args` of every recorded call with this JMAP method name, in order.
+    fn recorded_calls(fake: &FakeJmap, name: &str) -> Vec<Value> {
+        fake.requests
+            .lock()
+            .unwrap()
+            .iter()
+            .flat_map(|b| b["methodCalls"].as_array().cloned().unwrap_or_default())
+            .filter(|c| c[0].as_str() == Some(name))
+            .map(|c| c[1].clone())
+            .collect()
+    }
+
+    fn test_compose() -> Compose {
+        Compose {
+            from: "a@x.id".into(),
+            to: vec!["b@x.id".into()],
+            subject: "Hi".into(),
+            text: "Body".into(),
+            ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn get_thread_fetches_a_huge_thread_in_small_batches() {
+        let ids: Vec<String> = (0..250).map(|i| format!("m{i}")).collect();
+        let fake = fake_jmap(FakeMode::Thread { ids, body_len: 2 }).await;
+        let client = JmapClient::new(fake.base_url.clone());
+        let thread = client
+            .get_thread("u", "p", "acct", "t1")
+            .await
+            .expect("thread loads");
+        // A 250-message thread is capped to its newest 200, oldest first.
+        assert_eq!(thread.messages.len(), MAX_THREAD_MESSAGES);
+        assert_eq!(thread.messages[0].summary.id, "m50");
+        assert_eq!(thread.messages[199].summary.id, "m249");
+        // And it never arrived as one giant fetch: ten calls of 20,
+        // newest slice first.
+        let gets = recorded_calls(&fake, "Email/get");
+        assert_eq!(gets.len(), MAX_THREAD_MESSAGES / MAX_THREAD_FETCH_BATCH);
+        assert!(gets.iter().all(|a| a["ids"]
+            .as_array()
+            .is_some_and(|ids| ids.len() == MAX_THREAD_FETCH_BATCH)));
+        assert_eq!(gets[0]["ids"][0].as_str(), Some("m230"));
+        assert_eq!(gets[0]["ids"][19].as_str(), Some("m249"));
+    }
+
+    #[tokio::test]
+    async fn get_thread_stops_once_the_body_budget_is_reached() {
+        let ids: Vec<String> = (0..250).map(|i| format!("m{i}")).collect();
+        // Twenty 600 KB bodies already pass the 10 MB budget, so the
+        // newest batch is all the thread returns; the older messages
+        // are never fetched.
+        let fake = fake_jmap(FakeMode::Thread {
+            ids,
+            body_len: 600_000,
+        })
+        .await;
+        let client = JmapClient::new(fake.base_url.clone());
+        let thread = client
+            .get_thread("u", "p", "acct", "t1")
+            .await
+            .expect("thread loads");
+        assert_eq!(thread.messages.len(), MAX_THREAD_FETCH_BATCH);
+        assert_eq!(thread.messages[0].summary.id, "m230");
+        assert_eq!(recorded_calls(&fake, "Email/get").len(), 1);
+        let kept: usize = thread
+            .messages
+            .iter()
+            .map(|d| d.text_body.as_ref().map_or(0, |s| s.len()))
+            .sum();
+        assert!(kept >= MAX_THREAD_BODY_BYTES);
+    }
+
+    #[tokio::test]
+    async fn is_replaceable_draft_refuses_a_real_message() {
+        let fake = fake_jmap(FakeMode::Draft {
+            probe_draft: Some(false),
+        })
+        .await;
+        let client = JmapClient::new(fake.base_url.clone());
+        let err = client
+            .is_replaceable_draft("u", "p", "acct", "f-drafts", "old-draft")
+            .await;
+        assert!(matches!(err, Err(MailError::NotDraft)));
+    }
+
+    #[tokio::test]
+    async fn is_replaceable_draft_accepts_a_draft_and_tolerates_a_missing_one() {
+        let fake = fake_jmap(FakeMode::Draft {
+            probe_draft: Some(true),
+        })
+        .await;
+        let client = JmapClient::new(fake.base_url.clone());
+        assert!(client
+            .is_replaceable_draft("u", "p", "acct", "f-drafts", "old-draft")
+            .await
+            .unwrap());
+        let gone = fake_jmap(FakeMode::Draft { probe_draft: None }).await;
+        let client = JmapClient::new(gone.base_url.clone());
+        assert!(!client
+            .is_replaceable_draft("u", "p", "acct", "f-drafts", "old-draft")
+            .await
+            .unwrap());
+    }
+
+    #[tokio::test]
+    async fn save_draft_never_destroys_a_real_message() {
+        let fake = fake_jmap(FakeMode::Draft {
+            probe_draft: Some(false),
+        })
+        .await;
+        let client = JmapClient::new(fake.base_url.clone());
+        let err = client
+            .save_draft("u", "p", "acct", &test_compose(), Some("old-draft"))
+            .await;
+        assert!(matches!(err, Err(MailError::NotDraft)));
+        // The guard ran (one probe) and no Email/set ever happened, so
+        // the original is still there: an autosave can no longer destroy it.
+        assert_eq!(recorded_calls(&fake, "Email/get").len(), 1);
+        assert_eq!(recorded_calls(&fake, "Email/set").len(), 0);
+    }
+
+    #[tokio::test]
+    async fn save_draft_replaces_a_real_draft() {
+        let fake = fake_jmap(FakeMode::Draft {
+            probe_draft: Some(true),
+        })
+        .await;
+        let client = JmapClient::new(fake.base_url.clone());
+        let id = client
+            .save_draft("u", "p", "acct", &test_compose(), Some("old-draft"))
+            .await
+            .expect("draft saves");
+        assert_eq!(id, "new-draft");
+        let sets = recorded_calls(&fake, "Email/set");
+        assert_eq!(sets.len(), 1);
+        assert_eq!(sets[0]["destroy"], json!(["old-draft"]));
     }
 }
 
