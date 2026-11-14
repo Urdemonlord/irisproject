@@ -1,6 +1,8 @@
 #!/bin/bash
-# check-inside.sh - verification run inside the test container after the
-# .deb is installed. Exits non-zero on the first failed check.
+# check-inside.sh - verification run after the .deb is installed: inside
+# the test container (tests/test-container.sh) and on the GitHub Ubuntu
+# runner (the smoke-test job in .github/workflows/package-linux.yml).
+# Exits non-zero on the first failed check.
 # Test domain: iris-test.local (no real DNS). Caddy cannot get a public
 # certificate for it, so the HTTPS check temporarily switches the
 # Caddyfile to "tls internal" and back; the shipped vhost routing is
@@ -33,7 +35,12 @@ need "iris-cert-sync timer enabled" systemctl is-enabled --quiet iris-cert-sync.
 
 echo "== files and config"
 need "shipped units keep the hardening (test-only drop-in relaxes it, see tests/relax-namespaces.conf)" grep -q "^ProtectSystem=strict" /lib/systemd/system/iris-api.service
-need "test drop-in present for iris-api" test -f /etc/systemd/system/iris-api.service.d/relax-namespaces.conf
+# The container run installs a test-only drop-in (see
+# tests/relax-namespaces.conf); a bare runner install has no drop-in
+# and needs none, so this check only applies to container runs.
+if [ "${IRIS_TEST_CONTAINER:-}" = 1 ]; then
+  need "test drop-in present for iris-api" test -f /etc/systemd/system/iris-api.service.d/relax-namespaces.conf
+fi
 need "Caddyfile rendered for $MAIL_HOST" grep -q "$MAIL_HOST" /etc/caddy/Caddyfile
 need "mail-content vhost present" grep -q "mail-content.$DOMAIN" /etc/caddy/Caddyfile
 need "iris.env is production" grep -q "^IRIS_ENV=production" /etc/iris/iris.env
