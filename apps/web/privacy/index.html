@@ -15,16 +15,19 @@
     <main class="legal">
         <p class="eyebrow">Legal</p>
         <h1>Privacy policy</h1>
-        <p class="updated">Last updated: 30 October 2026</p>
+        <p class="draft-tag">Draft — not yet in effect</p>
+        <p class="updated">Last updated: 15 November 2026 (draft)</p>
 
-        <p>IRIS is a self-hosted email service run by Meow Labs. This page explains what IRIS stores about you, why, and for how long. We don’t sell your data and we don’t show ads.</p>
+        <p>This policy covers the IRIS service run by Meow Labs. IRIS is also open-source software you can run on your own server: if you use someone else’s IRIS instance, that operator’s policy applies instead, and Meow Labs receives no data from self-hosted instances. We don’t sell your data and we don’t show ads.</p>
 
         <h2 id="data">What we store</h2>
         <ul>
-            <li><strong>Your mail.</strong> Messages in your mailbox are stored on our own mail server so you can read them. We don’t scan them for advertising.</li>
-            <li><strong>Your session.</strong> When you sign in we create a session that lasts up to 30 days. We never store your password: sign-in creates a separate mail-server password for that session only, kept encrypted and destroyed when you sign out or the session ends.</li>
-            <li><strong>Temporary inboxes.</strong> Each temporary address and its messages live for 1 hour. After it expires, the address stops working immediately and its messages are deleted within about an hour.</li>
+            <li><strong>Your mail.</strong> Messages in your mailbox are stored on the mail server so you can read them. They are yours: we don’t scan them for advertising. If you run your own IRIS instance, your mail stays on your server.</li>
+            <li><strong>Your session.</strong> When you sign in we create a session that lasts up to 30 days. We never store your password: sign-in creates a separate mail-server password for that session only, kept encrypted and destroyed when you sign out or the session ends. Records of sessions that ended or were revoked are deleted 7 days later.</li>
+            <li><strong>Temporary inboxes.</strong> A temporary address needs no account and no personal details. It lives for 1 hour by default and can be extended up to 24 hours in total. After it expires, the address stops working immediately and its messages are deleted within about an hour. You can also delete a temporary inbox yourself at any time: the address stops at once and its messages are queued for deletion.</li>
+            <li><strong>Sign-in protection.</strong> Sign-in is protected by Cloudflare Turnstile, which checks browser and network signals to tell people apart from bots. Turnstile is run by Cloudflare; see Cloudflare’s privacy policy for what it collects.</li>
             <li><strong>Abuse protection.</strong> To limit how many temporary addresses can be created, we record your IP address and a random browser identifier for each request. These records are deleted after 2 days.</li>
+            <li><strong>Sending mail.</strong> Mail you send is delivered to its recipients over standard internet email. If the operator has set up an email relay (Resend, with Brevo as a fallback), outgoing transactional mail passes through that relay.</li>
             <li><strong>Server logs.</strong> Our servers keep short technical logs (errors, request outcomes) to keep the service running and secure.</li>
         </ul>
 
@@ -44,11 +47,12 @@
         <p>We count visits with <strong>Umami</strong>, which we host ourselves — no third-party trackers and no analytics cookies. It only loads after you allow it in the cookie notice. It records anonymous page views (for example “/temp”, the page title, your browser type and country) and never sees message contents, addresses or tokens. You can change your choice at any time: <button type="button" class="linklike link" data-cookie-settings>Cookie settings</button>.</p>
 
         <h2 id="sharing">Who we share data with</h2>
-        <p>Nobody, unless the law requires it. Mail you receive comes from the senders you gave your address to; mail is delivered by standard internet email.</p>
+        <p>We don’t sell your data and we don’t share it with advertisers. Mail you receive comes from the senders you gave your address to; mail you send goes to its recipients. If a relay is set up (see “Sending mail” above), that relay handles outgoing transactional mail. Apart from that, we share data only if the law requires it.</p>
 
         <h2 id="rights">Your choices</h2>
         <ul>
             <li>Sign out at any time to end your session on that device.</li>
+            <li>Delete a temporary inbox yourself at any time.</li>
             <li>Ask us for a copy of your data, or to delete your account and mailbox, using the contact below.</li>
         </ul>
 
