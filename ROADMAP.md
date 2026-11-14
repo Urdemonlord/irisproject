@@ -76,6 +76,10 @@ commitment to ship it.
   (v0.4.1). The Homebrew formula in the repo tracks the release
   (sha256 filled for 0.4.1); it is still a draft file, not a
   published tap.
+- **Threading/drafts hardening** — get_thread fetches bodies in
+  batches of 20 with a 10 MB body budget, and drafts are guarded
+  server-side so autosave/send/discard can never destroy a
+  non-draft original (PR #45, on main, unreleased).
 
 ## Planned
 
@@ -91,7 +95,3 @@ commitment to ship it.
 - **Real-machine install verification** — the Linux, macOS, and
   Windows packages have only been smoke-tested in CI runners so far,
   never on a real user machine.
-- **Threading/drafts hardening** — cap get_thread memory (a thread can
-  materialise >200 MB today) and scope Drafts fetching to drafts
-  only, so a non-draft message can never open in the draft composer
-  and autosave can never overwrite the original.
