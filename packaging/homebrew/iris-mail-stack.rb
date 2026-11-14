@@ -1,8 +1,8 @@
 # Homebrew formula for the IRIS macOS one-package install.
 #
 # The sha256 values below were filled from the v0.4.1 release tarballs
-# (download the asset, `shasum -a 256 <tarball>`). Update the version
-# and both hashes together when a new release ships; never guess them.
+# (download the asset, `shasum -a 256 <tarball>`). Update the version in
+# both URLs and both hashes together when a new release ships; never guess them.
 #
 # The formula only delivers the files into the Cellar. The system
 # setup (iris user, /etc/iris, /etc/stalwart, /etc/caddy, launchd
@@ -11,18 +11,15 @@
 class IrisMailStack < Formula
   desc "Self-hosted mail stack: IRIS webmail + Stalwart + Caddy, one install"
   homepage "https://github.com/Urdemonlord/irisproject"
-  version "0.4.1"
   license all_of: ["MIT", "Apache-2.0"]
 
-  depends_on macos: ">= :sonoma"
+  depends_on macos: :sonoma
 
-  on_arm do
-    url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-arm64.tar.gz"
+  if Hardware::CPU.arm?
+    url "https://github.com/Urdemonlord/irisproject/releases/download/v0.4.1/iris-mail-stack-0.4.1-macos-arm64.tar.gz"
     sha256 "08dfaaaf09a734d58d3bf8e19257da31d2f9a4e9dc67d9997b2cde2aab886c13"
-  end
-
-  on_intel do
-    url "https://github.com/Urdemonlord/irisproject/releases/download/v#{version}/iris-mail-stack-#{version}-macos-amd64.tar.gz"
+  else
+    url "https://github.com/Urdemonlord/irisproject/releases/download/v0.4.1/iris-mail-stack-0.4.1-macos-amd64.tar.gz"
     sha256 "96cadaaecfd28b4592edd83bfe5b459927dab10a6f0a75877aba6d02b18c152a"
   end
 
@@ -60,7 +57,7 @@ class IrisMailStack < Formula
   end
 
   test do
-    assert_predicate bin/"iris-api", :exist?
+    assert_path_exists bin/"iris-api"
     assert_match "1.0.3", shell_output("#{bin}/stalwart --version")
     assert_match "2.11.9", shell_output("#{bin}/caddy version")
   end
