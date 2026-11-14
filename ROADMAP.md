@@ -57,12 +57,41 @@ commitment to ship it.
   systemd timer as a safety net.
 - **CI** — `cargo fmt`, clippy (`-D warnings`), `cargo test`, web
   typecheck + build, and an advisory dependency audit on every push/PR.
+- **Audit trail** — who did what, when, for logins, sends, and admin
+  actions (v0.4.0).
+- **HTML compose + signatures** — rich-text mail and per-mailbox
+  signatures (v0.4.0).
+- **Multi-mailbox UI** — manage several permanent mailboxes from one
+  login (v0.4.0).
+- **Main-page CSP** — a strict Content-Security-Policy for the app
+  shell (v0.4.0).
+- **One-line installer** — `curl -fsSL .../install.sh | sudo sh`
+  installs the .deb on Debian 12 / Ubuntu 24.04 (amd64) (v0.3.0+).
+- **One-package installs** — Linux .deb + tarball, macOS tarballs
+  (arm64/amd64, launchd), and a Windows zip (x86_64, NSSM services +
+  install.ps1) bundling IRIS + Stalwart + Caddy (Windows: PR #42,
+  v0.4.1).
+- **Release automation** — Linux, macOS, and Windows assets are built
+  and uploaded to the GitHub Release automatically on `v*` tag pushes
+  (v0.4.1). The Homebrew formula in the repo tracks the release
+  (sha256 filled for 0.4.1); it is still a draft file, not a
+  published tap.
+- **Threading/drafts hardening** — get_thread fetches bodies in
+  batches of 20 with a 10 MB body budget, and drafts are guarded
+  server-side so autosave/send/discard can never destroy a
+  non-draft original (PR #45, on main, unreleased).
 
 ## Planned
 
-- **Audit trail** — who did what, when, for logins, sends, and key use.
-- **HTML compose + signatures** — rich-text mail and per-mailbox
-  signatures (compose attachments shipped in PR #16).
-- **Multi-mailbox UI** — manage several permanent mailboxes from one login.
-- **Main-page CSP** — a strict Content-Security-Policy for the app shell
-  (blocked on the inline-script refactor in `index.html`).
+- **Homebrew tap** — publish the formula as a tap so `brew install`
+  works (formula exists in packaging/homebrew/, sha256 filled
+  for 0.4.1).
+- **Linux install smoke test in CI** — install the .deb on a runner
+  and check the API responds (macOS and Windows already have one).
+- **Production hardening** — nightly SQLite backups (14-day
+  retention) + Stalwart snapshots with an off-host copy and a restore
+  drill; uptime/disk/log alerting; Terms of Service + Privacy Policy;
+  abuse@ and postmaster@ mailboxes.
+- **Real-machine install verification** — the Linux, macOS, and
+  Windows packages have only been smoke-tested in CI runners so far,
+  never on a real user machine.
