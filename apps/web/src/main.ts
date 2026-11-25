@@ -2331,7 +2331,9 @@ async function renderOrganize() {
   const drawAliases = () => {
     aliasForm.style.display = aliasesAvailable ? '' : 'none'
     aliasHint.style.display = aliasesAvailable ? '' : 'none'
+    const keepMailbox = aliasMailbox.value
     aliasMailbox.replaceChildren(...boxes().map(b => h('option', { value: b.id }, b.email_address)))
+    if (keepMailbox && boxes().some(b => b.id === keepMailbox)) aliasMailbox.value = keepMailbox
     if (!aliasesAvailable) {
       aliasList.replaceChildren(h('li', { className: 'muted' }, 'Alias management is not configured on this server.'))
       return
@@ -2363,7 +2365,9 @@ async function renderOrganize() {
       aliasesAvailable = true
     } catch (err) {
       const status = (err as HttpError).status
-      if (status === 503 || status === 404) { aliases = []; aliasesAvailable = false } else throw err
+      if (status === 401) throw err
+      if (status === 503 || status === 404) { aliases = []; aliasesAvailable = false }
+      else toast(orgError(err))
     }
     drawAliases()
   }
@@ -2384,6 +2388,14 @@ async function renderOrganize() {
   // ---------- Catch-all ----------
   const catchAlls = new Map<string, CatchAll>()
   let catchAllAvailable = true
+  // Domains whose catch-all endpoint 404s: the domain is missing on the
+  // server, not the feature as a whole. Domains listed by GET /api/v1/domains.
+  const catchAllMissing = new Set<string>()
+  let catchAllDomains: string[] = []
+  // Domains with a Set/Disable PUT in flight: a second click is ignored and
+  // both buttons stay disabled until the request settles, so an older
+  // response cannot overwrite newer state.
+  const catchAllPending = new Set<string>()
   const catchAllList = h('ul', { className: 'org-list' })
   const catchAllSection = section('Catch-all', 'Any address on a domain with no mailbox or alias of its own lands in one mailbox. Only enable this on a domain you control: it catches typos, spam, and anything else sent to the domain.',
     catchAllList)
@@ -2392,50 +2404,90 @@ async function renderOrganize() {
       catchAllList.replaceChildren(h('li', { className: 'muted' }, 'Catch-all is not configured on this server.'))
       return
     }
-    const domains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))].sort()
-    catchAllList.replaceChildren(...domains.map(domain => {
+    if (catchAllDomains.length === 0) {
+      catchAllList.replaceChildren(h('li', { className: 'muted' }, 'No domains yet.'))
+      return
+    }
+    catchAllList.replaceChildren(...catchAllDomains.map(domain => {
+      if (catchAllMissing.has(domain)) {
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, 'Not on this server.'))
+      }
       const state = catchAlls.get(domain)
       const targets = boxes().filter(b => b.email_address.toLowerCase().endsWith(`@${domain}`))
+      if (targets.length === 0) {
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, state?.enabled ? `→ ${state.target_address}` : 'No mailbox on this domain to deliver catch-all mail into.'))
+      }
       const sel = h('select', { className: 'input', 'aria-label': `Catch-all target for ${domain}` }) as HTMLSelectElement
       sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: state?.target_address === t.email_address }, t.email_address)))
       const setBtn = btn('btn btn-primary btn-sm', 'Set', 'check') as HTMLButtonElement
-      setBtn.addEventListener('click', async () => {
-        const restore = busy(setBtn, 'Saving…')
-        try {
-          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: sel.value }) })
-          catchAlls.set(domain, res)
-          toast(`Catch-all for ${domain} set`)
-          drawCatchAll()
-        } catch (err) { toast(orgError(err)) } finally { restore() }
-      })
       const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
-      offBtn.disabled = !state?.enabled
-      offBtn.addEventListener('click', async () => {
-        const restore = busy(offBtn, 'Saving…')
+      const pending = catchAllPending.has(domain)
+      setBtn.disabled = pending
+      offBtn.disabled = pending || !state?.enabled
+      const putCatchAll = async (clicked: HTMLButtonElement, target: string | null) => {
+        if (catchAllPending.has(domain)) return
+        catchAllPending.add(domain)
+        setBtn.disabled = true
+        offBtn.disabled = true
+        const restore = busy(clicked, 'Saving…')
         try {
-          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
+          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: target }) })
           catchAlls.set(domain, res)
-          toast(`Catch-all for ${domain} disabled`)
+          toast(target === null ? `Catch-all for ${domain} disabled` : `Catch-all for ${domain} set`)
           drawCatchAll()
-        } catch (err) { toast(orgError(err)) } finally { restore() }
-      })
+        } catch (err) { toast(orgError(err)) } finally {
+          catchAllPending.delete(domain)
+          restore()
+          // On failure no redraw happened, so the buttons are still live:
+          // put the non-clicked one back to its drawn state. (On success
+          // drawCatchAll rebuilt the row and these nodes are detached.)
+          if (clicked !== setBtn) setBtn.disabled = false
+          if (clicked !== offBtn) offBtn.disabled = !catchAlls.get(domain)?.enabled
+        }
+      }
+      setBtn.addEventListener('click', () => { void putCatchAll(setBtn, sel.value) })
+      offBtn.addEventListener('click', () => { void putCatchAll(offBtn, null) })
       return h('li', { className: 'org-item' },
         h('span', { className: 'org-item-title' }, domain),
         h('span', { className: 'muted' }, state?.enabled ? `→ ${state.target_address}` : 'Off'),
         sel, setBtn, offBtn)
     }))
   }
-  const loadCatchAll = async () => {
-    const domains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))]
+  // Domain list for the catch-all section. GET /api/v1/domains returns all
+  // server domains for admins and the user's own mailbox domains otherwise.
+  // Against an older server without the endpoint, fall back to the domains
+  // of the current user's mailboxes.
+  const loadDomains = async () => {
     try {
-      for (const domain of domains) {
-        const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`)
-        catchAlls.set(domain, res)
-      }
-      catchAllAvailable = true
+      const res = await api<{ domains: { name: string }[] }>('/api/v1/domains')
+      catchAllDomains = res.domains.map(d => d.name.toLowerCase()).sort()
     } catch (err) {
       const status = (err as HttpError).status
-      if (status === 503 || status === 404) { catchAlls.clear(); catchAllAvailable = false } else throw err
+      if (status === 401) throw err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; catchAllDomains = [] }
+      else {
+        if (status !== 404) toast(orgError(err))
+        catchAllDomains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))].sort()
+      }
+    }
+  }
+  const loadCatchAll = async () => {
+    for (const domain of catchAllDomains) {
+      try {
+        const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`)
+        catchAlls.set(domain, res)
+        catchAllMissing.delete(domain)
+      } catch (err) {
+        const status = (err as HttpError).status
+        if (status === 401) throw err
+        if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; break }
+        if (status === 404) { catchAlls.delete(domain); catchAllMissing.add(domain); continue }
+        toast(orgError(err))
+      }
     }
     drawCatchAll()
   }
@@ -2464,6 +2516,7 @@ async function renderOrganize() {
     sigRich.setHtml(sg.html)
     drawFolders(); drawLabels(); drawFilters(); drawContacts()
     await loadAliases()
+    await loadDomains()
     await loadCatchAll()
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }

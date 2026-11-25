@@ -40,9 +40,10 @@ pub struct Config {
     /// is never POSTed to an arbitrary or plaintext URL.
     pub turnstile_siteverify_url: String,
     pub stalwart_api_url: String,
-    /// Stalwart management (JMAP) API: a separate loopback listener from
-    /// the user JMAP API above (the installer binds it to 127.0.0.1:8080;
-    /// see `packaging/src/usr/lib/iris/iris-setup.py`). Only the alias
+    /// Stalwart management (JMAP) API: shares the single loopback HTTP
+    /// listener on 127.0.0.1:8080 with the user JMAP API above (the
+    /// installer binds one HTTP listener there; see
+    /// `packaging/src/usr/lib/iris/iris-setup.py`). Only the alias
     /// and catch-all endpoints talk to it, with the admin credential
     /// below. Read from `STALWART_MANAGEMENT_URL`.
     pub stalwart_management_url: String,
@@ -131,6 +132,10 @@ impl Config {
             &env,
             &std::env::var("TURNSTILE_HOSTNAMES").unwrap_or_default(),
         )?;
+        let stalwart_management_url = validate_stalwart_management_url(
+            &std::env::var("STALWART_MANAGEMENT_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
+        )?;
         Ok(Self {
             env,
             host: std::env::var("IRIS_HOST").unwrap_or_else(|_| "127.0.0.1".to_string()),
@@ -149,9 +154,10 @@ impl Config {
             turnstile_siteverify_url,
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
-            stalwart_management_url: std::env::var("STALWART_MANAGEMENT_URL")
-                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
-            stalwart_admin_user: std::env::var("STALWART_ADMIN_USER").unwrap_or_default(),
+            stalwart_management_url,
+            stalwart_admin_user: std::env::var("STALWART_ADMIN_USER")
+                .map(|v| v.trim().to_owned())
+                .unwrap_or_default(),
             stalwart_admin_password: std::env::var("STALWART_ADMIN_PASSWORD").unwrap_or_default(),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")
                 .unwrap_or_else(|_| "inbox.example.com".to_string()),
@@ -329,6 +335,64 @@ fn parse_turnstile_hostnames(env: &str, raw: &str) -> anyhow::Result<Vec<String>
         }
     }
     Ok(hostnames)
+}
+
+/// Validate `STALWART_MANAGEMENT_URL` at startup. The admin client
+/// sends the Stalwart admin credential (Basic auth) to this URL, so it
+/// must stay loopback-only: an `http`/`https` scheme, a loopback host
+/// (`127.0.0.0/8`, `::1`, or `localhost`), and no embedded userinfo
+/// (which could redirect the credential to another host). Anything
+/// else fails startup (`from_env` returns `Err`), never silently.
+/// Pure so it can be unit-tested without touching process env.
+fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
+    let url = raw.trim();
+    let err = || {
+        anyhow::anyhow!(
+            "STALWART_MANAGEMENT_URL must be an http(s) URL with a loopback host and no userinfo, e.g. http://127.0.0.1:8080; got '{raw}'"
+        )
+    };
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return Err(err());
+    };
+    if !scheme.eq_ignore_ascii_case("http") && !scheme.eq_ignore_ascii_case("https") {
+        return Err(err());
+    }
+    // Authority is everything up to the first path/query/fragment mark.
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    if authority.is_empty() || authority.contains(['@', '\\']) {
+        return Err(err());
+    }
+    // Split off the port, if any. A bracketed IPv6 literal keeps its
+    // brackets here; a bare IPv6 literal has more than one ':' and no
+    // port. Anything else with one ':' is host:port, and the port
+    // must be numeric.
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some((host, after)) = bracketed.split_once(']') else {
+            return Err(err());
+        };
+        if !after.is_empty() {
+            let Some(port) = after.strip_prefix(':') else {
+                return Err(err());
+            };
+            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+                return Err(err());
+            }
+        }
+        format!("[{host}]")
+    } else if authority.matches(':').count() > 1 {
+        authority.to_string()
+    } else if let Some((host, port)) = authority.split_once(':') {
+        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            return Err(err());
+        }
+        host.to_string()
+    } else {
+        authority.to_string()
+    };
+    if !is_loopback_hostname(&host.to_lowercase()) {
+        return Err(err());
+    }
+    Ok(url.to_string())
 }
 
 /// True for hostnames that point at this machine: `localhost` (and
@@ -605,6 +669,59 @@ mod tests {
             normalize_mail_content_origin(Some("http://mail-content.example.com")),
             ""
         );
+    }
+
+    #[test]
+    fn stalwart_management_url_accepts_loopback_forms() {
+        for good in [
+            "http://127.0.0.1:8080",
+            "https://127.0.0.1:8080",
+            "http://127.0.0.2:8080",
+            "http://127.9.9.9:8080",
+            "http://localhost:8080",
+            "http://localhost",
+            "http://127.0.0.1",
+            "http://[::1]:8080",
+            "http://::1",
+            "http://0:0:0:0:0:0:0:1",
+        ] {
+            assert!(
+                validate_stalwart_management_url(good).is_ok(),
+                "{good} must be accepted"
+            );
+        }
+        // Surrounding whitespace is trimmed.
+        assert_eq!(
+            validate_stalwart_management_url("  http://127.0.0.1:8080  ").unwrap(),
+            "http://127.0.0.1:8080"
+        );
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_non_loopback_and_userinfo() {
+        for bad in [
+            "",
+            "127.0.0.1:8080",
+            "ftp://127.0.0.1:8080",
+            "http://",
+            "http://example.com:8080",
+            "http://192.168.1.1:8080",
+            "http://10.0.0.1:8080",
+            "http://stalwart:8080",
+            "http://[::2]:8080",
+            "http://user:pass@127.0.0.1:8080",
+            "http://127.0.0.1:8080@attacker.invalid/",
+            "http://localhost:8080@attacker.invalid/",
+            "http://127.0.0.1:abc/",
+            "http://127.0.0.1:/",
+            "http://[::1/",
+            "https://attacker.invalid@127.0.0.1:8080",
+        ] {
+            assert!(
+                validate_stalwart_management_url(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
     }
 
     #[test]
