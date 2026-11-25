@@ -246,6 +246,15 @@ pub(crate) async fn unlock(
 /// (mailbox row, session credentials, signatures, labels, filters,
 /// DMARC rows, queued sends). The mail account itself and its mail on
 /// the server are untouched.
+///
+/// The alias check is serialized with `create_alias` on
+/// `organize_lock`, held from the check through the mailbox delete:
+/// without it a create could land between the check and the delete,
+/// so the delete would either destroy the mailbox the new alias
+/// points at (and, under the old CASCADE schema, its mirror row) or
+/// leave an orphaned server alias. With the lock a create either
+/// lands first, and this unlink is refused, or waits until the
+/// mailbox is gone, and then fails to find it.
 pub(crate) async fn unlink(
     State(s): S,
     Extension(u): Extension<CurrentUser>,
@@ -258,7 +267,11 @@ pub(crate) async fn unlink(
     // Refuse while aliases point at this mailbox: the alias rows
     // reference it, and the server aliases would outlive their IRIS
     // owner. Checked before any side effect (no app password is
-    // destroyed for a refused unlink).
+    // destroyed for a refused unlink), under `organize_lock` so a
+    // concurrent `create_alias` cannot slip in between this check
+    // and the mailbox delete below; the guard lives to the end of
+    // the function.
+    let _guard = s.organize_lock.lock().await;
     let alias_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE mailbox_id=?")
             .bind(&mailbox_id)

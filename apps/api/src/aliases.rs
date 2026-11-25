@@ -20,8 +20,23 @@
 //! `STALWART_ADMIN_PASSWORD` are unset, every endpoint here answers
 //! 503 `aliases_unavailable` (fail closed, like `IRIS_ADMIN_EMAILS`).
 //! Alias writes are serialized with `organize_lock`: the alias list is
-//! read, modified and written back whole, so two concurrent requests
-//! must not interleave a read-modify-write.
+//! read, modified and written back whole, so two concurrent IRIS
+//! requests must not interleave a read-modify-write. That lock cannot
+//! cover an out-of-band writer (WebUI/CLI), and Stalwart's management
+//! API offers no conditional write for the alias list (no etag or
+//! `ifInState` on `x:Account/set`: it is an unconditional whole-list
+//! replacement), so whole-list writes additionally go through
+//! `update_alias_list`: re-read before the write, compare with the
+//! list the change was computed from, verify after the write, and
+//! retry while the wanted state does not stick. That closes the race
+//! for every change the re-read or the verify can see, and repairs a
+//! concurrent writer overwriting our change. One window remains and
+//! is inherent to the API, not to this code: an out-of-band change
+//! landing between the final pre-write read and the `set` is still
+//! overwritten, because nothing in the read or the write can observe
+//! it. The window is a single round trip, and the verify step means
+//! the loss is one-sided (our change can be re-applied; theirs
+//! cannot be detected).
 //!
 //! This is a normal mail feature: aliases and catch-all for the user's
 //! own domains. There is no bulk creation, no temp-email provider API
@@ -87,6 +102,108 @@ type AliasRow = (String, String, String, i64, String);
 fn alias_present(list: &[EmailAlias], name: &str, domain_id: &str) -> bool {
     list.iter()
         .any(|a| a.name.eq_ignore_ascii_case(name) && a.domain_id == domain_id)
+}
+
+/// True when two alias lists hold the same entries, ignoring order:
+/// list order carries no meaning, and an out-of-band writer may
+/// return the entries in a different order than we wrote them.
+fn same_alias_list(a: &[EmailAlias], b: &[EmailAlias]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    let mut a: Vec<&EmailAlias> = a.iter().collect();
+    let mut b: Vec<&EmailAlias> = b.iter().collect();
+    let key = |e: &&EmailAlias| (e.name.to_lowercase(), e.domain_id.clone(), e.enabled);
+    a.sort_by_key(key);
+    b.sort_by_key(key);
+    a == b
+}
+
+/// Maximum rounds of the read-compare-write-verify loop for one
+/// whole-list alias write. One round is enough when nothing moves
+/// under us; three bounds the retry while a concurrent writer is
+/// actively rewriting the same list.
+const ALIAS_WRITE_ROUNDS: usize = 3;
+
+/// Applies `mutate` to the account's current server alias list and
+/// writes it back, with a bounded verify-and-retry loop.
+///
+/// Each round re-reads the list, applies `mutate` to what the server
+/// holds now (never to a stale snapshot), writes the result, and
+/// re-reads again to verify the wanted state stuck. The round is
+/// skipped with no write when the state already holds, and retried
+/// when the verify shows a concurrent whole-list writer overwrote
+/// our change. Returns the verified post-write list and whether a
+/// `set` was issued that the server holds (callers need the flag to
+/// know whether a failed later step must undo a change of ours, or
+/// leave an entry that predates us alone).
+///
+/// Error semantics, kept from the callers' previous inline code: a
+/// `Conflict`/`Protocol` refusal is definitive and returns at once
+/// (retrying the same list cannot help); an `Unavailable` (transport
+/// or timeout, where the write may have landed while the response
+/// was lost) re-reads once, and only a list that already holds the
+/// wanted state counts as landed, otherwise the original error is
+/// returned. Rounds exhausted without the state sticking is an
+/// `Unavailable`: the request may be retried, and no mirror row is
+/// written on the strength of an unconfirmed server list.
+async fn update_alias_list(
+    admin: &AdminClient,
+    account_id: &str,
+    mut mutate: impl FnMut(&mut Vec<EmailAlias>),
+) -> Result<(Vec<EmailAlias>, bool), iris_mail::MailError> {
+    for _ in 0..ALIAS_WRITE_ROUNDS {
+        let fresh = admin.get_account_aliases(account_id).await?;
+        let mut desired = fresh.clone();
+        mutate(&mut desired);
+        if same_alias_list(&desired, &fresh) {
+            // The wanted state already holds: another attempt, or an
+            // out-of-band writer, already made this change. No write.
+            return Ok((fresh, false));
+        }
+        match admin.set_account_aliases(account_id, &desired).await {
+            Ok(()) => {
+                let verified = admin.get_account_aliases(account_id).await?;
+                let mut after = verified.clone();
+                mutate(&mut after);
+                if same_alias_list(&after, &verified) {
+                    return Ok((verified, true));
+                }
+                // Our write did not stick: a concurrent whole-list
+                // writer overwrote it after our set. Loop and
+                // re-apply on top of what the server holds now.
+            }
+            Err(e) => {
+                if matches!(e, iris_mail::MailError::Unavailable(_)) {
+                    // Ambiguous: the write may have landed while the
+                    // response was lost. Re-read; only a list that
+                    // already holds the wanted state counts as
+                    // landed. (A Conflict refusal is definitive and
+                    // needs no reconcile.)
+                    match admin.get_account_aliases(account_id).await {
+                        Ok(current) => {
+                            let mut after = current.clone();
+                            mutate(&mut after);
+                            if same_alias_list(&after, &current) {
+                                return Ok((current, true));
+                            }
+                            return Err(e);
+                        }
+                        Err(read_err) => {
+                            tracing::error!(
+                                "update_alias_list: reconcile re-read failed for account {account_id}: {read_err}"
+                            );
+                            return Err(e);
+                        }
+                    }
+                }
+                return Err(e);
+            }
+        }
+    }
+    Err(iris_mail::MailError::Unavailable(
+        "alias list did not converge after repeated writes; retry the request".into(),
+    ))
 }
 
 /// GET /api/v1/aliases. The caller's own aliases, oldest first.
@@ -174,54 +291,48 @@ pub(crate) async fn create_alias(
     // Whether the server change actually landed: only then does a
     // failed mirror insert need to undo it.
     let mut server_changed = false;
-    if alias_present(&aliases, &local, &domain_info.id) {
-        // Self-heal: a previous attempt committed on the server but
-        // its mirror write never landed, so the address looks taken
-        // while no row owns it. The alias is already ours; skip the
-        // server write and go straight to the mirror insert so the
-        // row is created and the alias becomes manageable.
-    } else {
-        // Re-read and merge immediately before replacing the list,
-        // so an alias added out of band (WebUI/CLI) between the reads
-        // is kept instead of erased by our whole-list write.
-        let fresh = admin.get_account_aliases(&mb.account_id).await?;
-        let mut merged = fresh;
-        if !alias_present(&merged, &local, &domain_info.id) {
-            merged.push(EmailAlias {
-                name: local.clone(),
-                domain_id: domain_info.id.clone(),
-                enabled: true,
-            });
-        }
-        aliases = merged;
-        if let Err(set_err) = admin.set_account_aliases(&mb.account_id, &aliases).await {
-            if matches!(set_err, iris_mail::MailError::Unavailable(_)) {
-                // Transport/timeout: the server may have committed
-                // while the response was lost. Re-read; only when our
-                // alias is actually in the list is the change
-                // treated as landed. (A Conflict refusal is
-                // definitive and needs no reconcile.)
-                match admin.get_account_aliases(&mb.account_id).await {
-                    Ok(current) if alias_present(&current, &local, &domain_info.id) => {
-                        aliases = current;
-                        server_changed = true;
-                    }
-                    Ok(_) => return Err(set_err.into()),
-                    Err(read_err) => {
-                        tracing::error!(
-                            "create_alias: reconcile re-read failed for account {} address {address}: {read_err}",
-                            mb.account_id
-                        );
-                        return Err(set_err.into());
-                    }
-                }
-            } else {
-                return Err(set_err.into());
+    if !alias_present(&aliases, &local, &domain_info.id) {
+        // Write through the verify-and-retry loop (see
+        // `update_alias_list`): the change is computed from a fresh
+        // read, so an alias added out of band between the reads is
+        // kept instead of erased by our whole-list write, and a
+        // concurrent writer overwriting our change is repaired.
+        (aliases, server_changed) = update_alias_list(&admin, &mb.account_id, |list| {
+            if !alias_present(list, &local, &domain_info.id) {
+                list.push(EmailAlias {
+                    name: local.clone(),
+                    domain_id: domain_info.id.clone(),
+                    enabled: true,
+                });
             }
-        } else {
-            server_changed = true;
-        }
+        })
+        .await?;
     }
+    // The entry we now own on the server: written by us above, a
+    // leftover of a previous attempt whose mirror write never landed
+    // (self-heal), or added out of band while we worked. Self-heal
+    // only reconciles an entry that can be ours. IRIS only ever
+    // creates enabled aliases and has no toggle endpoint, so a
+    // disabled entry is provably not from a failed IRIS create: it
+    // is refused as taken, never adopted and never reported as
+    // enabled while Stalwart still rejects its mail. An enabled
+    // entry with no mirror row cannot be proven either way from the
+    // server data (an EmailAlias carries no owner marker), so it is
+    // adopted: adoption changes nothing on the server, it only
+    // records the mirror row for an alias that already delivers into
+    // the caller's own mailbox, and refusing it would orphan every
+    // alias whose mirror write failed, which is the failure the
+    // self-heal exists for.
+    let Some(server_entry) = aliases
+        .iter()
+        .find(|a| a.name.eq_ignore_ascii_case(&local) && a.domain_id == domain_info.id)
+    else {
+        return Err(ApiError(StatusCode::BAD_GATEWAY, "mail_server_unavailable"));
+    };
+    if !server_entry.enabled {
+        return Err(ApiError(StatusCode::CONFLICT, "alias_taken"));
+    }
+    let enabled = server_entry.enabled;
     // The Stalwart change landed; a failed mirror write undoes it, so
     // no live alias is ever left without its IRIS row (and the next
     // create of the same address does not hit a phantom conflict).
@@ -236,18 +347,24 @@ pub(crate) async fn create_alias(
     .bind(&b.mailbox_id)
     .bind(&address)
     .bind(&mb.account_id)
-    .bind(1)
+    .bind(i64::from(enabled))
     .bind(&now)
     .execute(&s.pool)
     .await
     {
         if server_changed {
-            // Undo by removing exactly our entry from the list as the
-            // server now holds it, never by popping the last entry:
-            // the list may hold out-of-band aliases after ours.
-            let mut undo = aliases.clone();
-            undo.retain(|a| !(a.name.eq_ignore_ascii_case(&local) && a.domain_id == domain_info.id));
-            if let Err(undo_err) = admin.set_account_aliases(&mb.account_id, &undo).await {
+            // Undo by removing exactly our entry from the list as
+            // the server now holds it, never by popping the last
+            // entry: the list is re-read first, so out-of-band
+            // aliases added since are kept, and the verify-and-retry
+            // loop applies here too.
+            if let Err(undo_err) = update_alias_list(&admin, &mb.account_id, |list| {
+                list.retain(|a| {
+                    !(a.name.eq_ignore_ascii_case(&local) && a.domain_id == domain_info.id)
+                });
+            })
+            .await
+            {
                 tracing::error!(
                     "create_alias: failed to undo server alias for account {} address {address}: {undo_err}",
                     mb.account_id
@@ -272,7 +389,14 @@ pub(crate) async fn create_alias(
         Some(&u.ip),
     )
     .await;
-    Ok(Json(alias_json(&alias_id, &address, &b.mailbox_id, true, &now)).into_response())
+    Ok(Json(alias_json(
+        &alias_id,
+        &address,
+        &b.mailbox_id,
+        enabled,
+        &now,
+    ))
+    .into_response())
 }
 
 /// DELETE /api/v1/aliases/:id. Removes the alias from the server list
@@ -316,27 +440,33 @@ pub(crate) async fn delete_alias(
         .unwrap_or_default();
     // The mirror row is deleted only once the server list is updated;
     // a missing account (mailbox deleted out of band) still converges
-    // by dropping the orphan row. `removed`/`written` remember what
-    // the server write took away, so a failed mirror delete can put
-    // it back.
+    // by dropping the orphan row. `removed` remembers the entry the
+    // server write took away, so a failed mirror delete can put it
+    // back. It is set only when this request actually removed the
+    // entry: when the server no longer holds it, there is nothing to
+    // restore.
     let mut removed: Option<EmailAlias> = None;
-    let mut written: Option<Vec<EmailAlias>> = None;
     match admin.get_account_aliases(&account_id).await {
         Ok(aliases) => {
             if alias_present(&aliases, local, &domain_id) {
-                // Re-read and merge immediately before replacing the
-                // list, so an alias added out of band between the
-                // reads survives our whole-list write.
-                let mut fresh = admin.get_account_aliases(&account_id).await?;
-                removed = fresh
+                // The removal goes through the same verify-and-retry
+                // loop as create (see `update_alias_list`): an alias
+                // added out of band between the reads survives our
+                // whole-list write, and a concurrent writer putting
+                // our entry back is retried instead of leaving a
+                // live alias with no mirror row.
+                let target = aliases
                     .iter()
                     .find(|a| a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id)
                     .cloned();
-                let before = fresh.len();
-                fresh.retain(|a| !(a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id));
-                if fresh.len() != before {
-                    admin.set_account_aliases(&account_id, &fresh).await?;
-                    written = Some(fresh);
+                let (_after, wrote) = update_alias_list(&admin, &account_id, |list| {
+                    list.retain(|a| {
+                        !(a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id)
+                    });
+                })
+                .await?;
+                if wrote {
+                    removed = target;
                 }
             }
         }
@@ -349,10 +479,18 @@ pub(crate) async fn delete_alias(
         .await
     {
         // The server alias is already gone: put it back rather than
-        // leaving server and mirror inconsistent.
-        if let (Some(entry), Some(mut list)) = (removed, written) {
-            list.push(entry);
-            if let Err(undo_err) = admin.set_account_aliases(&account_id, &list).await {
+        // leaving server and mirror inconsistent. The restore is a
+        // fresh read-modify-write through the same loop, not a
+        // replay of a stale list, so out-of-band aliases added
+        // since are kept.
+        if let Some(entry) = removed {
+            if let Err(undo_err) = update_alias_list(&admin, &account_id, |list| {
+                if !alias_present(list, &entry.name, &entry.domain_id) {
+                    list.push(entry.clone());
+                }
+            })
+            .await
+            {
                 tracing::error!(
                     "delete_alias: failed to restore server alias for account {account_id} address {address}: {undo_err}"
                 );
@@ -563,12 +701,15 @@ mod tests {
     /// and body. Tests may seed server aliases directly, and may arm
     /// the next `x:Account/set` to drop its response — with the
     /// update committed (a lost response after a landed write) or
-    /// without it (the write never landed).
+    /// without it (the write never landed) — or to have its committed
+    /// list replaced right after, as if a concurrent out-of-band
+    /// writer overwrote it.
     struct FakeMgmt {
         base_url: String,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
         state: Arc<Mutex<MgmtState>>,
         set_fail_mode: Arc<AtomicU8>,
+        replace_after_set: Arc<Mutex<Option<Vec<serde_json::Value>>>>,
         _task: tokio::task::JoinHandle<()>,
     }
 
@@ -577,13 +718,20 @@ mod tests {
         /// if another management client (WebUI/CLI, or a previous
         /// attempt whose mirror write never landed) had created it.
         fn seed_alias(&self, account: &str, name: &str, domain_id: &str) {
+            self.seed_alias_enabled(account, name, domain_id, true);
+        }
+
+        /// Same, with an explicit `enabled` flag: a disabled entry
+        /// is what a pre-existing alias disabled out of band looks
+        /// like on the server.
+        fn seed_alias_enabled(&self, account: &str, name: &str, domain_id: &str, enabled: bool) {
             self.state
                 .lock()
                 .unwrap()
                 .aliases
                 .entry(account.to_string())
                 .or_default()
-                .push(json!({"name": name, "domainId": domain_id, "enabled": true}));
+                .push(json!({"name": name, "domainId": domain_id, "enabled": enabled}));
         }
 
         /// The server's current alias list for `account`, in order.
@@ -604,6 +752,14 @@ mod tests {
         fn drop_next_set_response(&self, commit: bool) {
             self.set_fail_mode
                 .store(if commit { 1 } else { 2 }, Ordering::SeqCst);
+        }
+
+        /// Replaces the account's alias list right after the next
+        /// committed `x:Account/set`, as if a concurrent out-of-band
+        /// writer overwrote our whole-list write with its own list.
+        /// One-shot: the replacement is consumed by that set.
+        fn replace_after_next_set(&self, aliases: Vec<serde_json::Value>) {
+            *self.replace_after_set.lock().unwrap() = Some(aliases);
         }
     }
 
@@ -630,8 +786,11 @@ mod tests {
         let task_state = state.clone();
         let set_fail_mode = Arc::new(AtomicU8::new(0));
         let set_dropped = Arc::new(AtomicBool::new(false));
+        let replace_after_set: Arc<Mutex<Option<Vec<serde_json::Value>>>> =
+            Arc::new(Mutex::new(None));
         let task_set_fail_mode = set_fail_mode.clone();
         let task_set_dropped = set_dropped.clone();
+        let task_replace_after_set = replace_after_set.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok(Ok((mut stream, _))) =
@@ -767,6 +926,18 @@ mod tests {
                                     st.aliases.insert(acct.clone(), new_list);
                                 }
                             }
+                            // An armed concurrent writer: right after
+                            // our committed set, its own whole-list
+                            // write replaces the list we just wrote.
+                            if !refused && fail_mode != 2 {
+                                if let Some(replacement) =
+                                    task_replace_after_set.lock().unwrap().take()
+                                {
+                                    for acct in update.keys() {
+                                        st.aliases.insert(acct.clone(), replacement.clone());
+                                    }
+                                }
+                            }
                             if refused {
                                 serde_json::to_vec(&json!({"methodResponses": [[
                                     "x:Account/set",
@@ -846,6 +1017,7 @@ mod tests {
             requests,
             state,
             set_fail_mode,
+            replace_after_set,
             _task: task,
         }
     }
@@ -1134,6 +1306,70 @@ mod tests {
         assert_eq!(
             fake.server_aliases("acct-me"),
             vec![json!({"name": "sales", "domainId": "d-x", "enabled": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_refuses_disabled_server_alias() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // A matching server alias that is disabled cannot be from a
+        // failed IRIS create (IRIS only creates enabled aliases):
+        // adopting it would report the alias as enabled while
+        // Stalwart still rejects its mail.
+        fake.seed_alias_enabled("acct-me", "sales", "d-x", false);
+        let err = create(&s, user(), "sales@x.id", "mb1").await.unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "alias_taken");
+        // No mirror row, and no server write touched the list: the
+        // disabled entry is left exactly as it was.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        let sets: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][0] == "x:Account/set")
+            .collect();
+        assert_eq!(sets.len(), 0);
+        assert_eq!(
+            fake.server_aliases("acct-me"),
+            vec![json!({"name": "sales", "domainId": "d-x", "enabled": false})]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_retries_when_concurrent_writer_overwrites_set() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // A concurrent out-of-band writer replaces our whole-list
+        // write with its own list right after our set commits: the
+        // post-write verify must notice our alias is gone and
+        // re-apply it on top of the other writer's list, instead of
+        // writing a mirror row for an alias the server no longer has.
+        fake.replace_after_next_set(vec![
+            json!({"name": "other", "domainId": "d-x", "enabled": true}),
+        ]);
+        let id = create_ok(&s, "sales@x.id").await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id=?")
+            .bind(&id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // Two sets: the overwritten first attempt, then the retry.
+        let sets: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][0] == "x:Account/set")
+            .collect();
+        assert_eq!(sets.len(), 2);
+        assert_eq!(
+            fake.server_aliases("acct-me"),
+            vec![
+                json!({"name": "other", "domainId": "d-x", "enabled": true}),
+                json!({"name": "sales", "domainId": "d-x", "enabled": true}),
+            ]
         );
     }
 
