@@ -40,12 +40,17 @@ pub struct Config {
     /// is never POSTed to an arbitrary or plaintext URL.
     pub turnstile_siteverify_url: String,
     pub stalwart_api_url: String,
-    /// Stalwart management (JMAP) API: shares the single loopback HTTP
-    /// listener on 127.0.0.1:8080 with the user JMAP API above (the
-    /// installer binds one HTTP listener there; see
-    /// `packaging/src/usr/lib/iris/iris-setup.py`). Only the alias
-    /// and catch-all endpoints talk to it, with the admin credential
-    /// below. Read from `STALWART_MANAGEMENT_URL`.
+    /// Stalwart management (JMAP) API. In the packaged deployment it
+    /// shares the single loopback HTTP listener on 127.0.0.1:8080 with
+    /// the user JMAP API above (the installer binds one HTTP listener
+    /// there and points both URLs at it; see
+    /// `packaging/src/usr/lib/iris/iris-setup.py`). Outside that
+    /// deployment the two need not share a port: the user JMAP API
+    /// defaults to `http://localhost:8092` (`STALWART_API_URL`), so a
+    /// local or manual install keeps the management API on 8080 while
+    /// user JMAP stays on 8092. Only the alias and catch-all
+    /// endpoints talk to it, with the admin credential below. Read
+    /// from `STALWART_MANAGEMENT_URL`.
     pub stalwart_management_url: String,
     /// Stalwart admin credential for the management API (alias and
     /// catch-all changes). Read from `STALWART_ADMIN_USER` /
@@ -340,15 +345,20 @@ fn parse_turnstile_hostnames(env: &str, raw: &str) -> anyhow::Result<Vec<String>
 /// Validate `STALWART_MANAGEMENT_URL` at startup. The admin client
 /// sends the Stalwart admin credential (Basic auth) to this URL, so it
 /// must stay loopback-only: an `http`/`https` scheme, a loopback host
-/// (`127.0.0.0/8`, `::1`, or `localhost`), and no embedded userinfo
-/// (which could redirect the credential to another host). Anything
-/// else fails startup (`from_env` returns `Err`), never silently.
-/// Pure so it can be unit-tested without touching process env.
+/// (`127.0.0.0/8`, bracketed `::1`, or `localhost`), no embedded
+/// userinfo, no query or fragment (either would swallow the `/jmap/`
+/// path the admin client appends), and a port in range when one is
+/// given. A bare IPv6 authority is not a valid HTTP URL, so it is
+/// rejected in favour of the bracketed form. Anything else fails
+/// startup (`from_env` returns `Err`), never silently. The error
+/// message never echoes the supplied value, so a rejected URL cannot
+/// leak embedded credentials into startup logs. Pure so it can be
+/// unit-tested without touching process env.
 fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
     let url = raw.trim();
     let err = || {
         anyhow::anyhow!(
-            "STALWART_MANAGEMENT_URL must be an http(s) URL with a loopback host and no userinfo, e.g. http://127.0.0.1:8080; got '{raw}'"
+            "STALWART_MANAGEMENT_URL must be an http(s) URL with a loopback host and no userinfo, e.g. http://127.0.0.1:8080"
         )
     };
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -358,14 +368,20 @@ fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
         return Err(err());
     }
     // Authority is everything up to the first path/query/fragment mark.
-    let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let authority = &rest[..authority_end];
     if authority.is_empty() || authority.contains(['@', '\\']) {
         return Err(err());
     }
+    // A query or fragment would swallow the `/jmap/` path the admin
+    // client appends (`crates/mail/src/admin.rs`), so reject it even
+    // though the authority itself is fine.
+    if rest[authority_end..].contains(['?', '#']) {
+        return Err(err());
+    }
     // Split off the port, if any. A bracketed IPv6 literal keeps its
-    // brackets here; a bare IPv6 literal has more than one ':' and no
-    // port. Anything else with one ':' is host:port, and the port
-    // must be numeric.
+    // brackets here; a bare IPv6 literal is rejected outright (see
+    // below). Anything else with one ':' is host:port.
     let host = if let Some(bracketed) = authority.strip_prefix('[') {
         let Some((host, after)) = bracketed.split_once(']') else {
             return Err(err());
@@ -374,15 +390,20 @@ fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
             let Some(port) = after.strip_prefix(':') else {
                 return Err(err());
             };
-            if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+            if !valid_port(port) {
                 return Err(err());
             }
         }
         format!("[{host}]")
     } else if authority.matches(':').count() > 1 {
-        authority.to_string()
+        // Bare IPv6 authority (e.g. `http://::1`): not a valid HTTP
+        // URL, so reqwest would fail every request against it. Use
+        // the bracketed form instead.
+        return Err(anyhow::anyhow!(
+            "STALWART_MANAGEMENT_URL has a bare IPv6 authority; use the bracketed form, e.g. http://[::1]:8080"
+        ));
     } else if let Some((host, port)) = authority.split_once(':') {
-        if port.is_empty() || !port.bytes().all(|b| b.is_ascii_digit()) {
+        if !valid_port(port) {
             return Err(err());
         }
         host.to_string()
@@ -393,6 +414,15 @@ fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
         return Err(err());
     }
     Ok(url.to_string())
+}
+
+/// True when `port` is a usable listener port: all digits, fits in a
+/// `u16`, and not 0 (port 0 is never a listener, matching
+/// `is_local_http_endpoint` below).
+fn valid_port(port: &str) -> bool {
+    !port.is_empty()
+        && port.bytes().all(|b| b.is_ascii_digit())
+        && port.parse::<u16>().is_ok_and(|port| port > 0)
 }
 
 /// True for hostnames that point at this machine: `localhost` (and
@@ -682,8 +712,7 @@ mod tests {
             "http://localhost",
             "http://127.0.0.1",
             "http://[::1]:8080",
-            "http://::1",
-            "http://0:0:0:0:0:0:0:1",
+            "http://[::1]",
         ] {
             assert!(
                 validate_stalwart_management_url(good).is_ok(),
@@ -695,6 +724,93 @@ mod tests {
             validate_stalwart_management_url("  http://127.0.0.1:8080  ").unwrap(),
             "http://127.0.0.1:8080"
         );
+    }
+
+    #[test]
+    fn stalwart_management_url_error_never_echoes_credentials() {
+        // A rejected URL may carry embedded credentials, and this error
+        // is printed at startup by `Config::from_env().expect("config")`,
+        // so the message must never contain the supplied value.
+        for bad in [
+            "http://user:s3cret-pass@127.0.0.1:8080",
+            "http://admin:hunter2@example.com:8080",
+        ] {
+            let err = validate_stalwart_management_url(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                !err.contains("s3cret-pass") && !err.contains("hunter2"),
+                "{bad} leaked its credential into the error: {err}"
+            );
+            assert!(
+                !err.contains(bad),
+                "error must not echo the rejected URL: {err}"
+            );
+            // The message still shows a correct example URL.
+            assert!(
+                err.contains("http://127.0.0.1:8080"),
+                "error must show a correct example URL: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_query_and_fragment() {
+        // The admin client appends `/jmap/` to this URL, so a query or
+        // fragment would swallow that path and post to the wrong endpoint.
+        for bad in [
+            "http://127.0.0.1:8080?x=1",
+            "http://127.0.0.1:8080/?x=1",
+            "http://127.0.0.1:8080#frag",
+            "http://127.0.0.1:8080/#frag",
+            "http://127.0.0.1:8080/jmap?x=1",
+            "http://localhost:8080/path?next=/jmap/",
+        ] {
+            assert!(
+                validate_stalwart_management_url(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        // A plain path is still accepted; only query/fragment are new
+        // rejections here.
+        assert!(validate_stalwart_management_url("http://127.0.0.1:8080/jmap").is_ok());
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_out_of_range_ports() {
+        for bad in [
+            "http://127.0.0.1:65536",
+            "http://127.0.0.1:99999",
+            "http://[::1]:65536",
+            "http://[::1]:99999",
+            // Port 0 is never a listener (matches `is_local_http_endpoint`).
+            "http://127.0.0.1:0",
+            "http://[::1]:0",
+        ] {
+            assert!(
+                validate_stalwart_management_url(bad).is_err(),
+                "{bad} must be rejected"
+            );
+        }
+        // Boundary: 65535 is the largest valid port.
+        assert!(validate_stalwart_management_url("http://127.0.0.1:65535").is_ok());
+        assert!(validate_stalwart_management_url("http://[::1]:65535").is_ok());
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_bare_ipv6() {
+        for bad in ["http://::1", "http://0:0:0:0:0:0:0:1", "http://::1:8080"] {
+            let err = validate_stalwart_management_url(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("[::1]"),
+                "{bad} must point at the bracketed form: {err}"
+            );
+        }
+        // The bracketed forms stay accepted.
+        assert!(validate_stalwart_management_url("http://[::1]:8080").is_ok());
+        assert!(validate_stalwart_management_url("http://[::1]").is_ok());
     }
 
     #[test]

@@ -66,4 +66,68 @@ mod tests {
         let _ = std::fs::remove_file(path.with_extension("db-wal"));
         let _ = std::fs::remove_file(path.with_extension("db-shm"));
     }
+
+    // Migration 016: a mailbox delete must fail while alias rows
+    // point at it (ON DELETE RESTRICT), instead of silently deleting
+    // the alias rows the way 015's CASCADE did. The unlink handler
+    // refuses such a mailbox with 409 first; this is the schema
+    // backstop behind it, and it also proves the 015 -> 016 rebuild
+    // kept the rows and the indexes.
+    #[tokio::test]
+    async fn aliases_mailbox_delete_is_restricted() {
+        let pool = init_pool("sqlite::memory:").await.unwrap();
+        sqlx::query(
+            "INSERT INTO app_users (id,email,display_name,created_at,updated_at) \
+             VALUES ('u1','me@x.id','me','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) \
+             VALUES ('mb1','u1','me@x.id','acct-me','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO mail_aliases (id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at) \
+             VALUES ('al1','u1','mb1','sales@x.id','acct-me',1,'2026-01-01T00:00:00Z')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        // The mailbox delete fails while the alias row exists, and
+        // the alias row survives the refused delete.
+        let err = sqlx::query("DELETE FROM permanent_mailboxes WHERE id='mb1'")
+            .execute(&pool)
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(&err, sqlx::Error::Database(d) if d.message().contains("FOREIGN KEY")),
+            "expected a foreign key failure, got {err}"
+        );
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id='al1'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // Once the alias row is gone the mailbox deletes, and the
+        // rebuilt table really carries RESTRICT, not CASCADE.
+        sqlx::query("DELETE FROM mail_aliases WHERE id='al1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM permanent_mailboxes WHERE id='mb1'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mail_aliases'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(sql.contains("ON DELETE RESTRICT"), "{sql}");
+    }
 }

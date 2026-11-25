@@ -2399,6 +2399,29 @@ async function renderOrganize() {
   const catchAllList = h('ul', { className: 'org-list' })
   const catchAllSection = section('Catch-all', 'Any address on a domain with no mailbox or alias of its own lands in one mailbox. Only enable this on a domain you control: it catches typos, spam, and anything else sent to the domain.',
     catchAllList)
+  // Disables a domain's catch-all (PUT target null). Disabling needs
+  // no target address, so it works even for a domain with no mailbox
+  // on it, where no target can be offered. (The Set path below lives
+  // in putCatchAll because it also drives the target select.)
+  const disableCatchAll = async (domain: string, offBtn: HTMLButtonElement) => {
+    if (catchAllPending.has(domain)) return
+    catchAllPending.add(domain)
+    offBtn.disabled = true
+    const restore = busy(offBtn, 'Saving…')
+    try {
+      const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
+      catchAlls.set(domain, res)
+      toast(`Catch-all for ${domain} disabled`)
+      drawCatchAll()
+    } catch (err) { toast(orgError(err)) } finally {
+      catchAllPending.delete(domain)
+      restore()
+      // On failure no redraw happened, so the button is still live:
+      // put it back to its drawn state. (On success drawCatchAll
+      // rebuilt the row and this node is detached.)
+      offBtn.disabled = !catchAlls.get(domain)?.enabled
+    }
+  }
   const drawCatchAll = () => {
     if (!catchAllAvailable) {
       catchAllList.replaceChildren(h('li', { className: 'muted' }, 'Catch-all is not configured on this server.'))
@@ -2417,9 +2440,26 @@ async function renderOrganize() {
       const state = catchAlls.get(domain)
       const targets = boxes().filter(b => b.email_address.toLowerCase().endsWith(`@${domain}`))
       if (targets.length === 0) {
+        // No mailbox on this domain, so there is no target the server
+        // would accept: PUT rejects a target address on another
+        // domain, so a picker over the admin's other mailboxes would
+        // only fail. Offer what the API does allow instead: disabling
+        // a catch-all that is already set, and an honest pointer to
+        // link a mailbox on this domain first. Enabling with a
+        // mailbox from another domain needs a backend decision to
+        // relax that same-domain validation.
+        if (!state?.enabled) {
+          return h('li', { className: 'org-item' },
+            h('span', { className: 'org-item-title' }, domain),
+            h('span', { className: 'muted' }, 'Catch-all needs a mailbox on this domain as its target. Link a mailbox on this domain first, then pick it here.'))
+        }
+        const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
+        offBtn.disabled = catchAllPending.has(domain)
+        offBtn.addEventListener('click', () => { void disableCatchAll(domain, offBtn) })
         return h('li', { className: 'org-item' },
           h('span', { className: 'org-item-title' }, domain),
-          h('span', { className: 'muted' }, state?.enabled ? `→ ${state.target_address}` : 'No mailbox on this domain to deliver catch-all mail into.'))
+          h('span', { className: 'muted' }, `→ ${state.target_address}`),
+          offBtn)
       }
       const sel = h('select', { className: 'input', 'aria-label': `Catch-all target for ${domain}` }) as HTMLSelectElement
       sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: state?.target_address === t.email_address }, t.email_address)))
@@ -2476,18 +2516,45 @@ async function renderOrganize() {
     }
   }
   const loadCatchAll = async () => {
-    for (const domain of catchAllDomains) {
-      try {
-        const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`)
-        catchAlls.set(domain, res)
-        catchAllMissing.delete(domain)
-      } catch (err) {
-        const status = (err as HttpError).status
-        if (status === 401) throw err
-        if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; break }
-        if (status === 404) { catchAlls.delete(domain); catchAllMissing.add(domain); continue }
-        toast(orgError(err))
+    // One request per domain, but concurrently with a small cap: the
+    // serial loop made the page wait a round trip per domain. Outcomes
+    // are collected first and applied in domain order, so a 401 still
+    // aborts the page, a 503 still clears everything and stops, and a
+    // single failed domain still only toasts, exactly as before.
+    // Workers stop starting new fetches once a 401/503 lands.
+    const CONCURRENCY = 4
+    const outcomes: { res?: CatchAll; err?: unknown }[] = new Array(catchAllDomains.length)
+    let next = 0
+    let stopped = false
+    const workers = Array.from({ length: Math.min(CONCURRENCY, catchAllDomains.length) }, async () => {
+      while (!stopped) {
+        const i = next++
+        if (i >= catchAllDomains.length) return
+        const domain = catchAllDomains[i]
+        try {
+          outcomes[i] = { res: await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`) }
+        } catch (err) {
+          outcomes[i] = { err }
+          const status = (err as HttpError).status
+          if (status === 401 || status === 503) stopped = true
+        }
       }
+    })
+    await Promise.all(workers)
+    for (let i = 0; i < catchAllDomains.length; i++) {
+      const outcome = outcomes[i]
+      if (!outcome) continue
+      const domain = catchAllDomains[i]
+      if (outcome.res) {
+        catchAlls.set(domain, outcome.res)
+        catchAllMissing.delete(domain)
+        continue
+      }
+      const status = (outcome.err as HttpError).status
+      if (status === 401) throw outcome.err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; break }
+      if (status === 404) { catchAlls.delete(domain); catchAllMissing.add(domain); continue }
+      toast(orgError(outcome.err))
     }
     drawCatchAll()
   }
