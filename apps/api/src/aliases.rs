@@ -81,8 +81,20 @@ fn alias_json(
 
 type AliasRow = (String, String, String, i64, String);
 
+/// True when `list` already holds an alias with this local part on
+/// this domain. Dedupe key everywhere the list is merged: lowercased
+/// name plus domain id.
+fn alias_present(list: &[EmailAlias], name: &str, domain_id: &str) -> bool {
+    list.iter()
+        .any(|a| a.name.eq_ignore_ascii_case(name) && a.domain_id == domain_id)
+}
+
 /// GET /api/v1/aliases. The caller's own aliases, oldest first.
 pub(crate) async fn list_aliases(State(s): S, Extension(u): Extension<CurrentUser>) -> ApiResult {
+    // Fail closed like the other endpoints: without the admin
+    // credential the mirror may hold aliases the server no longer
+    // has, so answer 503 instead of serving stale rows.
+    admin_client(&s)?;
     let rows: Vec<AliasRow> = sqlx::query_as(
         "SELECT id, address, mailbox_id, enabled, created_at FROM mail_aliases \
          WHERE user_id=? ORDER BY created_at",
@@ -131,6 +143,15 @@ pub(crate) async fn create_alias(
     if !domain.eq_ignore_ascii_case(mb_domain) || address == mb.email {
         return Err(ApiError(StatusCode::CONFLICT, "alias_taken"));
     }
+    let local = address
+        .split_once('@')
+        .map(|(local, _)| local.to_string())
+        .unwrap_or_default();
+    // Serialize the whole read-modify-write: the cap and mirror
+    // checks, the server read and the mirror insert all happen under
+    // the lock, so two concurrent creates cannot both pass at 19
+    // aliases and insert the 20th and 21st.
+    let _guard = s.organize_lock.lock().await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE user_id=?")
         .bind(&u.user_id)
         .fetch_one(&s.pool)
@@ -145,28 +166,62 @@ pub(crate) async fn create_alias(
     if taken.is_some() {
         return Err(ApiError(StatusCode::CONFLICT, "alias_taken"));
     }
-    let local = address
-        .split_once('@')
-        .map(|(local, _)| local.to_string())
-        .unwrap_or_default();
-    let _guard = s.organize_lock.lock().await;
     let domain_info = admin
         .resolve_domain(domain)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
     let mut aliases = admin.get_account_aliases(&mb.account_id).await?;
-    if aliases
-        .iter()
-        .any(|a| a.name.eq_ignore_ascii_case(&local) && a.domain_id == domain_info.id)
-    {
-        return Err(ApiError(StatusCode::CONFLICT, "alias_taken"));
+    // Whether the server change actually landed: only then does a
+    // failed mirror insert need to undo it.
+    let mut server_changed = false;
+    if alias_present(&aliases, &local, &domain_info.id) {
+        // Self-heal: a previous attempt committed on the server but
+        // its mirror write never landed, so the address looks taken
+        // while no row owns it. The alias is already ours; skip the
+        // server write and go straight to the mirror insert so the
+        // row is created and the alias becomes manageable.
+    } else {
+        // Re-read and merge immediately before replacing the list,
+        // so an alias added out of band (WebUI/CLI) between the reads
+        // is kept instead of erased by our whole-list write.
+        let fresh = admin.get_account_aliases(&mb.account_id).await?;
+        let mut merged = fresh;
+        if !alias_present(&merged, &local, &domain_info.id) {
+            merged.push(EmailAlias {
+                name: local.clone(),
+                domain_id: domain_info.id.clone(),
+                enabled: true,
+            });
+        }
+        aliases = merged;
+        if let Err(set_err) = admin.set_account_aliases(&mb.account_id, &aliases).await {
+            if matches!(set_err, iris_mail::MailError::Unavailable(_)) {
+                // Transport/timeout: the server may have committed
+                // while the response was lost. Re-read; only when our
+                // alias is actually in the list is the change
+                // treated as landed. (A Conflict refusal is
+                // definitive and needs no reconcile.)
+                match admin.get_account_aliases(&mb.account_id).await {
+                    Ok(current) if alias_present(&current, &local, &domain_info.id) => {
+                        aliases = current;
+                        server_changed = true;
+                    }
+                    Ok(_) => return Err(set_err.into()),
+                    Err(read_err) => {
+                        tracing::error!(
+                            "create_alias: reconcile re-read failed for account {} address {address}: {read_err}",
+                            mb.account_id
+                        );
+                        return Err(set_err.into());
+                    }
+                }
+            } else {
+                return Err(set_err.into());
+            }
+        } else {
+            server_changed = true;
+        }
     }
-    aliases.push(EmailAlias {
-        name: local,
-        domain_id: domain_info.id,
-        enabled: true,
-    });
-    admin.set_account_aliases(&mb.account_id, &aliases).await?;
     // The Stalwart change landed; a failed mirror write undoes it, so
     // no live alias is ever left without its IRIS row (and the next
     // create of the same address does not hit a phantom conflict).
@@ -186,8 +241,19 @@ pub(crate) async fn create_alias(
     .execute(&s.pool)
     .await
     {
-        aliases.pop();
-        let _ = admin.set_account_aliases(&mb.account_id, &aliases).await;
+        if server_changed {
+            // Undo by removing exactly our entry from the list as the
+            // server now holds it, never by popping the last entry:
+            // the list may hold out-of-band aliases after ours.
+            let mut undo = aliases.clone();
+            undo.retain(|a| !(a.name.eq_ignore_ascii_case(&local) && a.domain_id == domain_info.id));
+            if let Err(undo_err) = admin.set_account_aliases(&mb.account_id, &undo).await {
+                tracing::error!(
+                    "create_alias: failed to undo server alias for account {} address {address}: {undo_err}",
+                    mb.account_id
+                );
+            }
+        }
         return Err(match e {
             sqlx::Error::Database(ref d) if d.is_unique_violation() => {
                 ApiError(StatusCode::CONFLICT, "alias_taken")
@@ -219,6 +285,11 @@ pub(crate) async fn delete_alias(
     Path(alias_id): Path<String>,
 ) -> ApiResult {
     let admin = admin_client(&s)?;
+    // The row is loaded and authorized only after the lock is held: a
+    // delete that waited behind a delete-and-recreate must see the new
+    // row, never remove the new server alias while deleting the old
+    // mirror id.
+    let _guard = s.organize_lock.lock().await;
     let row: Option<(String, String, String, String)> = sqlx::query_as(
         "SELECT user_id, mailbox_id, address, stalwart_account_id FROM mail_aliases WHERE id=?",
     )
@@ -231,37 +302,64 @@ pub(crate) async fn delete_alias(
     if owner_id != u.user_id && !iris_config::is_admin_email(&s.config.admin_emails, &u.email) {
         return Err(ApiError(StatusCode::NOT_FOUND, "not_found"));
     }
-    let _guard = s.organize_lock.lock().await;
+    let Some(domain) = domain_of(&address) else {
+        return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
+    };
+    let local = address
+        .split_once('@')
+        .map(|(local, _)| local)
+        .unwrap_or_default();
+    let domain_id = admin
+        .resolve_domain(domain)
+        .await?
+        .map(|d| d.id)
+        .unwrap_or_default();
     // The mirror row is deleted only once the server list is updated;
     // a missing account (mailbox deleted out of band) still converges
-    // by dropping the orphan row.
+    // by dropping the orphan row. `removed`/`written` remember what
+    // the server write took away, so a failed mirror delete can put
+    // it back.
+    let mut removed: Option<EmailAlias> = None;
+    let mut written: Option<Vec<EmailAlias>> = None;
     match admin.get_account_aliases(&account_id).await {
-        Ok(mut aliases) => {
-            let before = aliases.len();
-            let Some(domain) = domain_of(&address) else {
-                return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
-            };
-            let domain_id = admin
-                .resolve_domain(domain)
-                .await?
-                .map(|d| d.id)
-                .unwrap_or_default();
-            let local = address
-                .split_once('@')
-                .map(|(local, _)| local)
-                .unwrap_or_default();
-            aliases.retain(|a| !(a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id));
-            if aliases.len() != before {
-                admin.set_account_aliases(&account_id, &aliases).await?;
+        Ok(aliases) => {
+            if alias_present(&aliases, local, &domain_id) {
+                // Re-read and merge immediately before replacing the
+                // list, so an alias added out of band between the
+                // reads survives our whole-list write.
+                let mut fresh = admin.get_account_aliases(&account_id).await?;
+                removed = fresh
+                    .iter()
+                    .find(|a| a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id)
+                    .cloned();
+                let before = fresh.len();
+                fresh.retain(|a| !(a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id));
+                if fresh.len() != before {
+                    admin.set_account_aliases(&account_id, &fresh).await?;
+                    written = Some(fresh);
+                }
             }
         }
         Err(iris_mail::MailError::NotFound) => {}
         Err(e) => return Err(e.into()),
     }
-    sqlx::query("DELETE FROM mail_aliases WHERE id=?")
+    if let Err(e) = sqlx::query("DELETE FROM mail_aliases WHERE id=?")
         .bind(&alias_id)
         .execute(&s.pool)
-        .await?;
+        .await
+    {
+        // The server alias is already gone: put it back rather than
+        // leaving server and mirror inconsistent.
+        if let (Some(entry), Some(mut list)) = (removed, written) {
+            list.push(entry);
+            if let Err(undo_err) = admin.set_account_aliases(&account_id, &list).await {
+                tracing::error!(
+                    "delete_alias: failed to restore server alias for account {account_id} address {address}: {undo_err}"
+                );
+            }
+        }
+        return Err(e.into());
+    }
     audit::record(
         &s.pool,
         Some(&u.user_id),
@@ -301,6 +399,36 @@ fn catch_all_json(domain: &str, target: Option<&str>) -> serde_json::Value {
     })
 }
 
+/// GET /api/v1/domains. The domains the caller can use: every server
+/// domain for an admin, the distinct domains of the caller's own
+/// active mailboxes otherwise. Sorted by name.
+pub(crate) async fn list_domains(State(s): S, Extension(u): Extension<CurrentUser>) -> ApiResult {
+    let admin = admin_client(&s)?;
+    let mut names: Vec<String> = if iris_config::is_admin_email(&s.config.admin_emails, &u.email) {
+        admin
+            .list_domains()
+            .await?
+            .into_iter()
+            .map(|d| d.name)
+            .collect()
+    } else {
+        let emails: Vec<String> = sqlx::query_scalar(
+            "SELECT email_address FROM permanent_mailboxes WHERE user_id=? AND status='active'",
+        )
+        .bind(&u.user_id)
+        .fetch_all(&s.pool)
+        .await?;
+        emails
+            .iter()
+            .filter_map(|e| domain_of(e).map(|d| d.to_lowercase()))
+            .collect()
+    };
+    names.sort();
+    names.dedup();
+    let domains: Vec<_> = names.iter().map(|n| json!({ "name": n })).collect();
+    Ok(Json(json!({ "domains": domains })).into_response())
+}
+
 /// GET /api/v1/domains/:domain/catch-all. The server is the source of
 /// truth; the mirror row is refreshed best-effort from the answer.
 pub(crate) async fn get_catch_all(
@@ -313,6 +441,10 @@ pub(crate) async fn get_catch_all(
     if !can_manage_domain(&s, &u, &domain).await? {
         return Err(ApiError(StatusCode::FORBIDDEN, "forbidden"));
     }
+    // Hold the lock from the server read through the mirror upsert,
+    // so a concurrent PUT cannot commit a new target before this GET
+    // writes its stale target back to `domain_catch_all`.
+    let _guard = s.organize_lock.lock().await;
     let info = admin
         .resolve_domain(&domain)
         .await?
@@ -366,8 +498,9 @@ pub(crate) async fn set_catch_all(
         .resolve_domain(&domain)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
+    let previous_target = info.catch_all.clone();
     admin.set_catch_all(&info.id, target.as_deref()).await?;
-    sqlx::query(
+    if let Err(e) = sqlx::query(
         "INSERT INTO domain_catch_all (domain,target_address,updated_at) VALUES (?,?,?) \
          ON CONFLICT(domain) DO UPDATE SET target_address=excluded.target_address, updated_at=excluded.updated_at",
     )
@@ -375,7 +508,20 @@ pub(crate) async fn set_catch_all(
     .bind(&target)
     .bind(iris_auth::now())
     .execute(&s.pool)
-    .await?;
+    .await
+    {
+        // The Stalwart change already landed: restore the previous
+        // target rather than leaving server and mirror disagreeing.
+        if let Err(restore_err) = admin
+            .set_catch_all(&info.id, previous_target.as_deref())
+            .await
+        {
+            tracing::error!(
+                "set_catch_all: failed to restore previous catch-all for domain {domain}: {restore_err}"
+            );
+        }
+        return Err(e.into());
+    }
     audit::record(
         &s.pool,
         Some(&u.user_id),
@@ -397,7 +543,10 @@ mod tests {
     use axum::body::to_bytes;
     use base64::{engine::general_purpose::STANDARD, Engine as _};
     use std::collections::HashMap;
-    use std::sync::{Arc, Mutex};
+    use std::sync::{
+        atomic::{AtomicBool, AtomicU8, Ordering},
+        Arc, Mutex,
+    };
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -411,11 +560,51 @@ mod tests {
     /// `notUpdated` exactly like a real server refuses a taken
     /// address. Domains: `x.id` (no catch-all) and `y.id` (catch-all
     /// to `postmaster@y.id`). Records every request's basic-auth user
-    /// and body.
+    /// and body. Tests may seed server aliases directly, and may arm
+    /// the next `x:Account/set` to drop its response — with the
+    /// update committed (a lost response after a landed write) or
+    /// without it (the write never landed).
     struct FakeMgmt {
         base_url: String,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
+        state: Arc<Mutex<MgmtState>>,
+        set_fail_mode: Arc<AtomicU8>,
         _task: tokio::task::JoinHandle<()>,
+    }
+
+    impl FakeMgmt {
+        /// Puts an alias straight onto the server for `account`, as
+        /// if another management client (WebUI/CLI, or a previous
+        /// attempt whose mirror write never landed) had created it.
+        fn seed_alias(&self, account: &str, name: &str, domain_id: &str) {
+            self.state
+                .lock()
+                .unwrap()
+                .aliases
+                .entry(account.to_string())
+                .or_default()
+                .push(json!({"name": name, "domainId": domain_id, "enabled": true}));
+        }
+
+        /// The server's current alias list for `account`, in order.
+        fn server_aliases(&self, account: &str) -> Vec<serde_json::Value> {
+            self.state
+                .lock()
+                .unwrap()
+                .aliases
+                .get(account)
+                .cloned()
+                .unwrap_or_default()
+        }
+
+        /// Drops the next `x:Account/set` response without answering.
+        /// `commit` decides whether the update still lands on the
+        /// server first: true simulates a response lost after the
+        /// write, false a write that never happened.
+        fn drop_next_set_response(&self, commit: bool) {
+            self.set_fail_mode
+                .store(if commit { 1 } else { 2 }, Ordering::SeqCst);
+        }
     }
 
     struct MgmtState {
@@ -439,6 +628,10 @@ mod tests {
         }));
         let task_requests = requests.clone();
         let task_state = state.clone();
+        let set_fail_mode = Arc::new(AtomicU8::new(0));
+        let set_dropped = Arc::new(AtomicBool::new(false));
+        let task_set_fail_mode = set_fail_mode.clone();
+        let task_set_dropped = set_dropped.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok(Ok((mut stream, _))) =
@@ -532,7 +725,12 @@ mod tests {
                         }
                         "x:Account/set" => {
                             // Whole-list replacement: reject an alias
-                            // another account already owns.
+                            // another account already owns. An armed
+                            // drop mode (see `drop_next_set_response`)
+                            // closes the connection without answering:
+                            // mode 1 still commits first, mode 2 does
+                            // not.
+                            let fail_mode = task_set_fail_mode.swap(0, Ordering::SeqCst);
                             let mut st = task_state.lock().unwrap();
                             let update = args["update"].as_object().cloned().unwrap_or_default();
                             let mut refused = false;
@@ -565,7 +763,7 @@ mod tests {
                                         }
                                     }
                                 }
-                                if !refused {
+                                if !refused && fail_mode != 2 {
                                     st.aliases.insert(acct.clone(), new_list);
                                 }
                             }
@@ -577,6 +775,9 @@ mod tests {
                                 ]]}))
                                 .unwrap()
                             } else {
+                                if fail_mode != 0 {
+                                    task_set_dropped.store(true, Ordering::SeqCst);
+                                }
                                 serde_json::to_vec(&json!({"methodResponses": [[
                                     "x:Account/set",
                                     {"updated": {"acct-me": {}}, "notUpdated": {}},
@@ -619,6 +820,12 @@ mod tests {
                 } else {
                     br#"{"error":"no such route"}"#.to_vec()
                 };
+                // An armed drop: close without answering, so the
+                // client sees a transport failure.
+                if task_set_dropped.swap(false, Ordering::SeqCst) {
+                    let _ = stream.shutdown().await;
+                    continue;
+                }
                 let status = if method == "POST" && path == "/jmap/" {
                     "200 OK"
                 } else {
@@ -637,6 +844,8 @@ mod tests {
         FakeMgmt {
             base_url: format!("http://{address}"),
             requests,
+            state,
+            set_fail_mode,
             _task: task,
         }
     }
@@ -897,6 +1106,172 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(n, 0);
+    }
+
+    #[tokio::test]
+    async fn create_self_heals_when_server_already_has_alias() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // A previous attempt committed on the server, but its mirror
+        // write never landed: the server already holds the alias and
+        // no row owns it. Creating it again must not answer
+        // `alias_taken`; it heals the mirror instead.
+        fake.seed_alias("acct-me", "sales", "d-x");
+        let id = create_ok(&s, "sales@x.id").await;
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id=?")
+            .bind(&id)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // No server write was needed: the alias was already there,
+        // and it was not duplicated.
+        let sets: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][0] == "x:Account/set")
+            .collect();
+        assert_eq!(sets.len(), 0);
+        assert_eq!(
+            fake.server_aliases("acct-me"),
+            vec![json!({"name": "sales", "domainId": "d-x", "enabled": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_preserves_out_of_band_alias() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // An alias another management client added to this account:
+        // our whole-list write must carry it along, not erase it.
+        fake.seed_alias("acct-me", "other", "d-x");
+        create_ok(&s, "sales@x.id").await;
+        let sets: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][0] == "x:Account/set")
+            .collect();
+        assert_eq!(sets.len(), 1);
+        assert_eq!(
+            sets[0]["body"]["methodCalls"][0][1]["update"]["acct-me"]["aliases"],
+            json!({
+                "0": {"name": "other", "domainId": "d-x", "enabled": true},
+                "1": {"name": "sales", "domainId": "d-x", "enabled": true},
+            })
+        );
+        assert_eq!(
+            fake.server_aliases("acct-me"),
+            vec![
+                json!({"name": "other", "domainId": "d-x", "enabled": true}),
+                json!({"name": "sales", "domainId": "d-x", "enabled": true}),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reconciles_when_set_response_is_lost() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The server commits, then the response is lost: the create
+        // must re-read, find the alias landed, and still write the
+        // mirror row instead of failing.
+        fake.drop_next_set_response(true);
+        let id = create_ok(&s, "sales@x.id").await;
+        let row: (String, String) =
+            sqlx::query_as("SELECT mailbox_id, address FROM mail_aliases WHERE id=?")
+                .bind(&id)
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(row, ("mb1".into(), "sales@x.id".into()));
+        assert_eq!(
+            fake.server_aliases("acct-me"),
+            vec![json!({"name": "sales", "domainId": "d-x", "enabled": true})]
+        );
+    }
+
+    #[tokio::test]
+    async fn create_reports_original_error_when_lost_set_did_not_land() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The response is lost and the write never landed: the
+        // reconcile re-read finds nothing, so the original transport
+        // error is returned and no mirror row is written.
+        fake.drop_next_set_response(false);
+        let err = create(&s, user(), "sales@x.id", "mb1").await.unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.1, "mail_server_unavailable");
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 0);
+        assert!(fake.server_aliases("acct-me").is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_answers_503_while_admin_credential_unset() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "", vec![]).await;
+        let err = list_aliases(State(s.clone()), Extension(user()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1, "aliases_unavailable");
+        assert!(requests(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_domains_admin_sees_all_domains() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec!["admin@x.id".into()]).await;
+        let mut admin = user();
+        admin.email = "admin@x.id".into();
+        admin.user_id = "u-admin".into();
+        let res = list_domains(State(s.clone()), Extension(admin))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["domains"], json!([{"name": "x.id"}, {"name": "y.id"}]));
+    }
+
+    #[tokio::test]
+    async fn list_domains_non_admin_sees_own_domains_only() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // u1's only mailbox is on x.id: y.id must not leak.
+        let res = list_domains(State(s.clone()), Extension(user()))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["domains"], json!([{"name": "x.id"}]));
+        // A second own mailbox on y.id adds that domain, and only
+        // that one; no server call is made for non-admins.
+        sqlx::query(
+            "INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mb-y','u1','you@y.id','acct-me','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let res = list_domains(State(s.clone()), Extension(user()))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["domains"], json!([{"name": "x.id"}, {"name": "y.id"}]));
+        assert!(requests(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn list_domains_answers_503_while_admin_credential_unset() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "", vec![]).await;
+        let err = list_domains(State(s.clone()), Extension(user()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1, "aliases_unavailable");
+        assert!(requests(&fake).is_empty());
     }
 
     #[tokio::test]

@@ -18,7 +18,7 @@
 CREATE TABLE mail_aliases (
     id TEXT PRIMARY KEY,
     user_id TEXT NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,
-    mailbox_id TEXT NOT NULL REFERENCES permanent_mailboxes(id) ON DELETE CASCADE,
+    mailbox_id TEXT NOT NULL REFERENCES permanent_mailboxes(id) ON DELETE RESTRICT,
     address TEXT NOT NULL UNIQUE,
     stalwart_account_id TEXT NOT NULL,
     enabled INTEGER NOT NULL DEFAULT 1,

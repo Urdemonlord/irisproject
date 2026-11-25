@@ -239,10 +239,13 @@ pub(crate) async fn unlock(
 }
 
 /// POST /api/v1/mailboxes/:mailbox_id/unlink. Removes a linked mailbox
-/// from this login: the primary mailbox cannot be unlinked, and only
-/// IRIS-side state goes away (mailbox row, session credentials,
-/// signatures, labels, filters, DMARC rows, queued sends). The mail
-/// account itself and its mail on the server are untouched.
+/// from this login: the primary mailbox cannot be unlinked, and a
+/// mailbox that still owns aliases cannot be unlinked either (409
+/// `mailbox_has_aliases`): unlinking it would leave live server
+/// aliases with no IRIS owner. Only IRIS-side state goes away
+/// (mailbox row, session credentials, signatures, labels, filters,
+/// DMARC rows, queued sends). The mail account itself and its mail on
+/// the server are untouched.
 pub(crate) async fn unlink(
     State(s): S,
     Extension(u): Extension<CurrentUser>,
@@ -251,6 +254,18 @@ pub(crate) async fn unlink(
     let mb = owned_mailbox(&s, &u, &mailbox_id).await?;
     if mb.email == u.email {
         return Err(ApiError(StatusCode::CONFLICT, "cannot_unlink_primary"));
+    }
+    // Refuse while aliases point at this mailbox: the alias rows
+    // reference it, and the server aliases would outlive their IRIS
+    // owner. Checked before any side effect (no app password is
+    // destroyed for a refused unlink).
+    let alias_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE mailbox_id=?")
+            .bind(&mailbox_id)
+            .fetch_one(&s.pool)
+            .await?;
+    if alias_count > 0 {
+        return Err(ApiError(StatusCode::CONFLICT, "mailbox_has_aliases"));
     }
     // Destroy this session's app password for the mailbox (best effort):
     // the row delete below removes the sealed copies for every session,
@@ -972,6 +987,54 @@ mod tests {
             destroys[0]["body"]["methodCalls"][0][1]["destroy"][0],
             "cred-1"
         );
+    }
+
+    #[tokio::test]
+    async fn unlink_refuses_mailbox_with_aliases() {
+        let fake = fake_jmap().await;
+        let s = state(&fake).await;
+        let mb2 = link_bob(&s).await;
+        sqlx::query(
+            "INSERT INTO mail_aliases (id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at) \
+             VALUES ('al1','u1',?,'sales@x.id','acct-bob',1,'2026-01-01T00:00:00Z')",
+        )
+        .bind(&mb2)
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let mut u = user();
+        u.mailbox_creds.push((
+            mb2.clone(),
+            Creds {
+                user: "bob@x.id".into(),
+                pass: "app-secret-for-bob@x.id".into(),
+            },
+        ));
+        let err = unlink(State(s.clone()), Extension(u), Path(mb2.clone()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::CONFLICT);
+        assert_eq!(err.1, "mailbox_has_aliases");
+        // The mailbox and its alias survive the refusal.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM permanent_mailboxes WHERE id=?")
+            .bind(&mb2)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE mailbox_id=?")
+            .bind(&mb2)
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
+        // The refusal has no side effect: no app password was
+        // destroyed for it.
+        let destroys: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][1]["destroy"].is_array())
+            .collect();
+        assert_eq!(destroys.len(), 0);
     }
 
     #[tokio::test]
