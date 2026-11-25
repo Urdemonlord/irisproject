@@ -71,8 +71,9 @@ mod tests {
     // point at it (ON DELETE RESTRICT), instead of silently deleting
     // the alias rows the way 015's CASCADE did. The unlink handler
     // refuses such a mailbox with 409 first; this is the schema
-    // backstop behind it, and it also proves the 015 -> 016 rebuild
-    // kept the rows and the indexes.
+    // backstop behind it. It checks the final schema only and does
+    // not cover the 015 -> 016 rebuild; see
+    // `aliases_rebuild_keeps_rows_and_indexes` for that.
     #[tokio::test]
     async fn aliases_mailbox_delete_is_restricted() {
         let pool = init_pool("sqlite::memory:").await.unwrap();
@@ -129,5 +130,113 @@ mod tests {
         .await
         .unwrap();
         assert!(sql.contains("ON DELETE RESTRICT"), "{sql}");
+    }
+
+    // The 015 -> 016 rebuild itself, through the real migration
+    // runner: migrations 001-015 first, a row written under 015,
+    // then 016 on the same file. The row survives the rebuild with
+    // its values intact, both indexes still exist, and the rebuilt
+    // table carries RESTRICT, not CASCADE.
+    #[tokio::test]
+    async fn aliases_rebuild_keeps_rows_and_indexes() {
+        // A temp dir holding copies of the migration files: the
+        // embedded `migrate!` in `init_pool` always runs all of them,
+        // so a partial run needs its own migrator over copies.
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("iris-rebuild-test-{nanos}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+        let copy_upto = |n: u32| {
+            for entry in std::fs::read_dir(&src).unwrap() {
+                let entry = entry.unwrap();
+                let name = entry.file_name().to_string_lossy().into_owned();
+                let num: u32 = name[..3].parse().unwrap_or(0);
+                if num != 0 && num <= n {
+                    std::fs::copy(entry.path(), dir.join(&name)).unwrap();
+                }
+            }
+        };
+        copy_upto(15);
+        let db_path = dir.join("rebuild.db");
+        let url = format!("sqlite://{}?mode=rwc", db_path.display());
+        let pool = SqlitePool::connect_with(
+            SqliteConnectOptions::from_str(&url)
+                .unwrap()
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+        sqlx::migrate::Migrator::new(dir.clone())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        for q in [
+            "INSERT INTO app_users (id,email,display_name,created_at,updated_at) \
+             VALUES ('u1','me@x.id','me','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) \
+             VALUES ('mb1','u1','me@x.id','acct-me','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+            "INSERT INTO mail_aliases (id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at) \
+             VALUES ('al1','u1','mb1','sales@x.id','acct-me',1,'2026-01-01T00:00:00Z')",
+        ] {
+            sqlx::query(q).execute(&pool).await.unwrap();
+        }
+        copy_upto(16);
+        sqlx::migrate::Migrator::new(dir.clone())
+            .await
+            .unwrap()
+            .run(&pool)
+            .await
+            .unwrap();
+        let row: (String, String, String, String, i64) = sqlx::query_as(
+            "SELECT id,user_id,mailbox_id,address,enabled FROM mail_aliases WHERE id='al1'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(
+            row,
+            (
+                "al1".to_string(),
+                "u1".to_string(),
+                "mb1".to_string(),
+                "sales@x.id".to_string(),
+                1
+            )
+        );
+        let indexes: Vec<String> = sqlx::query_scalar(
+            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='mail_aliases' ORDER BY name",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        // The two named indexes survive the rebuild (SQLite also
+        // reports its own autoindexes for the PRIMARY KEY and the
+        // UNIQUE address, which is expected, not a regression).
+        for want in ["idx_mail_aliases_mailbox", "idx_mail_aliases_user"] {
+            assert!(
+                indexes.iter().any(|i| i == want),
+                "missing index {want}: {indexes:?}"
+            );
+        }
+        let sql: String = sqlx::query_scalar(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='mail_aliases'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(
+            sql.contains(
+                "mailbox_id TEXT NOT NULL REFERENCES permanent_mailboxes(id) ON DELETE RESTRICT"
+            ),
+            "{sql}"
+        );
+        pool.close().await;
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

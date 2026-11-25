@@ -325,6 +325,7 @@ async fn main() {
         )
         .route("/api/v1/aliases/:id", delete(aliases::delete_alias))
         .route("/api/v1/domains", get(aliases::list_domains))
+        .route("/api/v1/domains/catch-all", get(aliases::list_catch_alls))
         .route(
             "/api/v1/domains/:domain/catch-all",
             get(aliases::get_catch_all).put(aliases::set_catch_all),

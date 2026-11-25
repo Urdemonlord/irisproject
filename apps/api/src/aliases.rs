@@ -250,25 +250,28 @@ pub(crate) async fn create_alias(
     if address.is_empty() || !valid_email_address(&address) || b.mailbox_id.is_empty() {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     }
-    let mb = owned_mailbox(&s, &u, &b.mailbox_id).await?;
     let Some(domain) = domain_of(&address) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     };
+    let local = address
+        .split_once('@')
+        .map(|(local, _)| local.to_string())
+        .unwrap_or_default();
+    // Serialize the whole read-modify-write: the mailbox lookup, the
+    // cap and mirror checks, the server read and the mirror insert
+    // all happen under the lock, so two concurrent creates cannot
+    // both pass at 19 aliases and insert the 20th and 21st, and a
+    // concurrent unlink cannot delete the mailbox between the lookup
+    // and the server write (the lookup would then be stale and the
+    // alias would land on a deleted mailbox).
+    let _guard = s.organize_lock.lock().await;
+    let mb = owned_mailbox(&s, &u, &b.mailbox_id).await?;
     let Some(mb_domain) = domain_of(&mb.email) else {
         return Err(ApiError(StatusCode::BAD_REQUEST, "invalid_request"));
     };
     if !domain.eq_ignore_ascii_case(mb_domain) || address == mb.email {
         return Err(ApiError(StatusCode::CONFLICT, "alias_taken"));
     }
-    let local = address
-        .split_once('@')
-        .map(|(local, _)| local.to_string())
-        .unwrap_or_default();
-    // Serialize the whole read-modify-write: the cap and mirror
-    // checks, the server read and the mirror insert all happen under
-    // the lock, so two concurrent creates cannot both pass at 19
-    // aliases and insert the 20th and 21st.
-    let _guard = s.organize_lock.lock().await;
     let count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE user_id=?")
         .bind(&u.user_id)
         .fetch_one(&s.pool)
@@ -454,19 +457,32 @@ pub(crate) async fn delete_alias(
                 // added out of band between the reads survives our
                 // whole-list write, and a concurrent writer putting
                 // our entry back is retried instead of leaving a
-                // live alias with no mirror row.
-                let target = aliases
-                    .iter()
-                    .find(|a| a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id)
-                    .cloned();
+                // live alias with no mirror row. What this request's
+                // accepted write removed is captured inside the
+                // mutate closure: the closure runs on the fresh list
+                // each round, so it sees the entry exactly as the
+                // server held it when the write was computed —
+                // including an out-of-band disable that landed after
+                // the preliminary read above. Each round re-captures
+                // (the closure also runs on the verify copy, where
+                // the entry is already gone), so the value reflects
+                // the last write attempt. Restoring that entry,
+                // rather than the preliminary snapshot, is what keeps
+                // a failed mirror delete from silently re-enabling an
+                // alias somebody else disabled.
+                let mut removed_entry: Option<EmailAlias> = None;
                 let (_after, wrote) = update_alias_list(&admin, &account_id, |list| {
                     list.retain(|a| {
-                        !(a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id)
+                        let hit = a.name.eq_ignore_ascii_case(local) && a.domain_id == domain_id;
+                        if hit {
+                            removed_entry = Some(a.clone());
+                        }
+                        !hit
                     });
                 })
                 .await?;
                 if wrote {
-                    removed = target;
+                    removed = removed_entry;
                 }
             }
         }
@@ -567,6 +583,67 @@ pub(crate) async fn list_domains(State(s): S, Extension(u): Extension<CurrentUse
     Ok(Json(json!({ "domains": domains })).into_response())
 }
 
+/// GET /api/v1/domains/catch-all. Every catch-all setting the caller
+/// may manage, in one request backed by a single domain-catalog read:
+/// the web used to GET each domain in turn (four concurrent workers,
+/// still one whole-catalog read per domain under `organize_lock`),
+/// which made an admin with many domains pay one catalog read per
+/// domain and apply the results in domain order, so a 503 on an early
+/// domain could swallow a 401 on a later one and a failed domain
+/// silently rendered Off. One call returns the settings for every
+/// domain the caller may manage (every server domain for an admin,
+/// the caller's own mailbox domains otherwise) plus the managed
+/// domains the server does not know, so the web can render those as
+/// missing instead of a global error. The mirror
+/// (`domain_catch_all`) is not refreshed here: nothing in production
+/// reads it (only the per-domain GET upserts it), and a read that
+/// wrote rows would need the lock for no benefit.
+pub(crate) async fn list_catch_alls(
+    State(s): S,
+    Extension(u): Extension<CurrentUser>,
+) -> ApiResult {
+    let admin = admin_client(&s)?;
+    let is_admin = iris_config::is_admin_email(&s.config.admin_emails, &u.email);
+    let mut managed: Vec<String> = if is_admin {
+        Vec::new()
+    } else {
+        let emails: Vec<String> = sqlx::query_scalar(
+            "SELECT email_address FROM permanent_mailboxes WHERE user_id=? AND status='active'",
+        )
+        .bind(&u.user_id)
+        .fetch_all(&s.pool)
+        .await?;
+        emails
+            .iter()
+            .filter_map(|e| domain_of(e).map(|d| d.to_lowercase()))
+            .collect()
+    };
+    let catalog = admin.list_domains().await?;
+    let mut catch_alls = Vec::new();
+    let mut missing = Vec::new();
+    if is_admin {
+        for d in &catalog {
+            catch_alls.push(catch_all_json(
+                &d.name.to_lowercase(),
+                d.catch_all.as_deref(),
+            ));
+        }
+    } else {
+        managed.sort();
+        managed.dedup();
+        for name in &managed {
+            match catalog.iter().find(|d| d.name.eq_ignore_ascii_case(name)) {
+                Some(d) => catch_alls.push(catch_all_json(
+                    &d.name.to_lowercase(),
+                    d.catch_all.as_deref(),
+                )),
+                None => missing.push(json!({ "name": name })),
+            }
+        }
+    }
+    Ok(Json(json!({ "catch_alls": catch_alls, "missing": missing })).into_response())
+}
+
 /// GET /api/v1/domains/:domain/catch-all. The server is the source of
 /// truth; the mirror row is refreshed best-effort from the answer.
 pub(crate) async fn get_catch_all(
@@ -617,6 +694,12 @@ pub(crate) async fn set_catch_all(
 ) -> ApiResult {
     let admin = admin_client(&s)?;
     let domain = domain.trim().to_lowercase();
+    // The lock comes before the ownership check: a mailbox that
+    // passes `can_manage_domain` could be unlinked before this PUT
+    // takes the lock, and the PUT would then change a domain the
+    // caller no longer owns. Holding the lock across the check and
+    // the write makes the check see the committed unlink.
+    let _guard = s.organize_lock.lock().await;
     if !can_manage_domain(&s, &u, &domain).await? {
         return Err(ApiError(StatusCode::FORBIDDEN, "forbidden"));
     }
@@ -631,13 +714,36 @@ pub(crate) async fn set_catch_all(
         }
         _ => None,
     };
-    let _guard = s.organize_lock.lock().await;
     let info = admin
         .resolve_domain(&domain)
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
     let previous_target = info.catch_all.clone();
-    admin.set_catch_all(&info.id, target.as_deref()).await?;
+    // An ambiguous write (transport failure: the update may have
+    // landed while the response was lost) is reconciled by reading
+    // the domain back: if the requested target is there, the write
+    // landed and the mirror/audit steps below still run; if the
+    // server still holds something else, the original error is
+    // returned; if the readback itself fails, the original error is
+    // returned and the failure is logged — the mirror keeps the old
+    // target and the next GET refreshes it from the server, so the
+    // disagreement stays visible instead of silent.
+    if let Err(e) = admin.set_catch_all(&info.id, target.as_deref()).await {
+        if matches!(e, iris_mail::MailError::Unavailable(_)) {
+            match admin.resolve_domain(&domain).await {
+                Ok(Some(current)) if current.catch_all == target => {}
+                Ok(_) => return Err(e.into()),
+                Err(read_err) => {
+                    tracing::error!(
+                        "set_catch_all: reconcile readback failed for domain {domain}: {read_err}"
+                    );
+                    return Err(e.into());
+                }
+            }
+        } else {
+            return Err(e.into());
+        }
+    }
     if let Err(e) = sqlx::query(
         "INSERT INTO domain_catch_all (domain,target_address,updated_at) VALUES (?,?,?) \
          ON CONFLICT(domain) DO UPDATE SET target_address=excluded.target_address, updated_at=excluded.updated_at",
@@ -704,12 +810,19 @@ mod tests {
     /// without it (the write never landed) — or to have its committed
     /// list replaced right after, as if a concurrent out-of-band
     /// writer overwrote it.
+    /// Armed one-shot hook for `disable_alias_on_get`: (account,
+    /// alias name, domain id, Nth get) — disable that entry on the
+    /// Nth `x:Account/get` for its account.
+    type DisableOnGet = Arc<Mutex<Option<(String, String, String, usize)>>>;
+
     struct FakeMgmt {
         base_url: String,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
         state: Arc<Mutex<MgmtState>>,
         set_fail_mode: Arc<AtomicU8>,
         replace_after_set: Arc<Mutex<Option<Vec<serde_json::Value>>>>,
+        domain_set_fail_mode: Arc<AtomicU8>,
+        disable_on_get: DisableOnGet,
         _task: tokio::task::JoinHandle<()>,
     }
 
@@ -754,6 +867,25 @@ mod tests {
                 .store(if commit { 1 } else { 2 }, Ordering::SeqCst);
         }
 
+        /// Drops the next `x:Domain/set` response without answering,
+        /// with the same commit semantics as `drop_next_set_response`.
+        fn drop_next_domain_set_response(&self, commit: bool) {
+            self.domain_set_fail_mode
+                .store(if commit { 1 } else { 2 }, Ordering::SeqCst);
+        }
+
+        /// Disables one alias on the Nth `x:Account/get` for its
+        /// account, as if another management client disabled it
+        /// between two reads of the same handler.
+        fn disable_alias_on_get(&self, account: &str, name: &str, domain_id: &str, nth_get: usize) {
+            *self.disable_on_get.lock().unwrap() = Some((
+                account.to_string(),
+                name.to_string(),
+                domain_id.to_string(),
+                nth_get,
+            ));
+        }
+
         /// Replaces the account's alias list right after the next
         /// committed `x:Account/set`, as if a concurrent out-of-band
         /// writer overwrote our whole-list write with its own list.
@@ -788,9 +920,17 @@ mod tests {
         let set_dropped = Arc::new(AtomicBool::new(false));
         let replace_after_set: Arc<Mutex<Option<Vec<serde_json::Value>>>> =
             Arc::new(Mutex::new(None));
+        let domain_set_fail_mode = Arc::new(AtomicU8::new(0));
+        let domain_set_dropped = Arc::new(AtomicBool::new(false));
+        let disable_on_get: DisableOnGet = Arc::new(Mutex::new(None));
+        let get_counts: Arc<Mutex<HashMap<String, usize>>> = Arc::new(Mutex::new(HashMap::new()));
         let task_set_fail_mode = set_fail_mode.clone();
         let task_set_dropped = set_dropped.clone();
         let task_replace_after_set = replace_after_set.clone();
+        let task_domain_set_fail_mode = domain_set_fail_mode.clone();
+        let task_domain_set_dropped = domain_set_dropped.clone();
+        let task_disable_on_get = disable_on_get.clone();
+        let task_get_counts = get_counts.clone();
         let task = tokio::spawn(async move {
             loop {
                 let Ok(Ok((mut stream, _))) =
@@ -868,6 +1008,34 @@ mod tests {
                     match first {
                         "x:Account/get" => {
                             let id = args["ids"][0].as_str().unwrap_or_default();
+                            // One-shot test hook (see
+                            // `disable_alias_on_get`): on the Nth get
+                            // for this account, disable the armed
+                            // entry first, as if another client had
+                            // just disabled it.
+                            {
+                                let mut counts = task_get_counts.lock().unwrap();
+                                let n = counts.entry(id.to_string()).or_insert(0);
+                                *n += 1;
+                                if let Some((acct, name, domain_id, nth)) =
+                                    task_disable_on_get.lock().unwrap().clone()
+                                {
+                                    if acct == id && *n == nth {
+                                        if let Some(list) =
+                                            task_state.lock().unwrap().aliases.get_mut(&acct)
+                                        {
+                                            for a in list.iter_mut() {
+                                                if a["name"].as_str().unwrap_or("") == name
+                                                    && a["domainId"].as_str().unwrap_or("")
+                                                        == domain_id
+                                                {
+                                                    a["enabled"] = json!(false);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let aliases = task_state
                                 .lock()
                                 .unwrap()
@@ -971,13 +1139,23 @@ mod tests {
                             .unwrap()
                         }
                         "x:Domain/set" => {
+                            // An armed drop mode (see
+                            // `drop_next_domain_set_response`) closes
+                            // the connection without answering: mode 1
+                            // still commits first, mode 2 does not.
+                            let fail_mode = task_domain_set_fail_mode.swap(0, Ordering::SeqCst);
                             let mut st = task_state.lock().unwrap();
                             let update = args["update"].as_object().cloned().unwrap_or_default();
                             for (domain_id, patch) in &update {
-                                st.catch_all.insert(
-                                    domain_id.clone(),
-                                    patch["catchAllAddress"].as_str().map(str::to_string),
-                                );
+                                if fail_mode != 2 {
+                                    st.catch_all.insert(
+                                        domain_id.clone(),
+                                        patch["catchAllAddress"].as_str().map(str::to_string),
+                                    );
+                                }
+                            }
+                            if fail_mode != 0 {
+                                task_domain_set_dropped.store(true, Ordering::SeqCst);
                             }
                             serde_json::to_vec(&json!({"methodResponses": [[
                                 "x:Domain/set",
@@ -993,7 +1171,9 @@ mod tests {
                 };
                 // An armed drop: close without answering, so the
                 // client sees a transport failure.
-                if task_set_dropped.swap(false, Ordering::SeqCst) {
+                if task_set_dropped.swap(false, Ordering::SeqCst)
+                    || task_domain_set_dropped.swap(false, Ordering::SeqCst)
+                {
                     let _ = stream.shutdown().await;
                     continue;
                 }
@@ -1018,6 +1198,8 @@ mod tests {
             state,
             set_fail_mode,
             replace_after_set,
+            domain_set_fail_mode,
+            disable_on_get,
             _task: task,
         }
     }
@@ -1748,6 +1930,176 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
         assert_eq!(err.1, "aliases_unavailable");
+    }
+
+    #[tokio::test]
+    async fn list_catch_alls_admin_sees_all_in_one_call() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec!["admin@x.id".into()]).await;
+        let mut admin = user();
+        admin.email = "admin@x.id".into();
+        admin.user_id = "u-admin".into();
+        let res = list_catch_alls(State(s.clone()), Extension(admin))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["catch_alls"],
+            json!([
+                {"domain": "x.id", "target_address": null, "enabled": false},
+                {"domain": "y.id", "target_address": "postmaster@y.id", "enabled": true},
+            ])
+        );
+        assert_eq!(v["missing"], json!([]));
+        // One management call backs the whole answer.
+        let gets: Vec<_> = requests(&fake)
+            .into_iter()
+            .filter(|r| r["body"]["methodCalls"][0][0] == "x:Domain/get")
+            .collect();
+        assert_eq!(gets.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn list_catch_alls_non_admin_sees_own_domains_and_missing() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // A second mailbox on a domain the server does not know.
+        sqlx::query(
+            "INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) VALUES ('mb-z','u1','me@z.id','acct-me','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let res = list_catch_alls(State(s.clone()), Extension(user()))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(
+            v["catch_alls"],
+            json!([{"domain": "x.id", "target_address": null, "enabled": false}])
+        );
+        assert_eq!(v["missing"], json!([{"name": "z.id"}]));
+        // y.id is on the server but not the caller's, so it leaks
+        // neither as a setting nor as missing.
+        assert!(!body.windows(4).any(|w| w == b"y.id"));
+    }
+
+    #[tokio::test]
+    async fn list_catch_alls_answers_503_while_admin_credential_unset() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "", vec![]).await;
+        let err = list_catch_alls(State(s.clone()), Extension(user()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(err.1, "aliases_unavailable");
+        assert!(requests(&fake).is_empty());
+    }
+
+    #[tokio::test]
+    async fn set_catch_all_reconciles_lost_response_when_write_landed() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The Domain/set response is lost, but the update committed.
+        fake.drop_next_domain_set_response(true);
+        let res = set_catch_all(
+            State(s.clone()),
+            Extension(user()),
+            Path("x.id".into()),
+            Json(SetCatchAllBody {
+                target_address: Some("me@x.id".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["target_address"], "me@x.id");
+        // The mirror followed the landed write.
+        let target: Option<String> =
+            sqlx::query_scalar("SELECT target_address FROM domain_catch_all WHERE domain='x.id'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(target.as_deref(), Some("me@x.id"));
+    }
+
+    #[tokio::test]
+    async fn set_catch_all_returns_error_when_lost_write_never_landed() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The Domain/set response is lost and the update never
+        // committed: the readback proves it, so the original error
+        // is returned instead of a phantom success.
+        fake.drop_next_domain_set_response(false);
+        let err = set_catch_all(
+            State(s.clone()),
+            Extension(user()),
+            Path("x.id".into()),
+            Json(SetCatchAllBody {
+                target_address: Some("me@x.id".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.1, "mail_server_unavailable");
+        // Server and mirror both keep the old (unset) target.
+        let res = get_catch_all(State(s.clone()), Extension(user()), Path("x.id".into()))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], false);
+        assert!(v["target_address"].is_null());
+    }
+
+    #[tokio::test]
+    async fn delete_restore_puts_back_the_entry_the_write_removed() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        fake.seed_alias("acct-me", "sales", "d-x");
+        sqlx::query(
+            "INSERT INTO mail_aliases (id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at) \
+             VALUES ('al-del','u1','mb1','sales@x.id','acct-me',1,'2026-01-01T00:00:00Z')",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        // Another client disables the alias on the second server
+        // read (the fresh read inside `update_alias_list`), after
+        // the preliminary read saw it enabled.
+        fake.disable_alias_on_get("acct-me", "sales", "d-x", 2);
+        // Make the mirror delete fail, so the handler must restore
+        // the server alias it just removed.
+        sqlx::query(
+            "CREATE TRIGGER fail_alias_delete BEFORE DELETE ON mail_aliases \
+             BEGIN SELECT RAISE(ABORT, 'delete blocked for test'); END;",
+        )
+        .execute(&s.pool)
+        .await
+        .unwrap();
+        let err = delete_alias(State(s.clone()), Extension(user()), Path("al-del".into()))
+            .await
+            .unwrap_err();
+        assert_eq!(err.0, StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(err.1, "internal_error");
+        // The alias is back exactly as the accepted write removed
+        // it: disabled, not re-enabled from the preliminary
+        // snapshot the handler read first.
+        let server = fake.server_aliases("acct-me");
+        assert_eq!(server.len(), 1);
+        assert_eq!(server[0]["name"], "sales");
+        assert_eq!(server[0]["enabled"], json!(false));
+        // And the mirror row survives the refused delete.
+        let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id='al-del'")
+            .fetch_one(&s.pool)
+            .await
+            .unwrap();
+        assert_eq!(n, 1);
     }
 
     #[tokio::test]

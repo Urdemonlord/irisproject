@@ -209,6 +209,13 @@ impl AdminClient {
         let responses = v["methodResponses"]
             .as_array()
             .ok_or_else(|| MailError::Protocol("no methodResponses".into()))?;
+        if responses.is_empty() {
+            // An HTTP 200 with no method responses at all: callers
+            // index `r[0]` (e.g. `list_domains`), which would panic
+            // instead of returning a 502. Reject it here, at the one
+            // place every management call funnels through.
+            return Err(MailError::Protocol("empty methodResponses".into()));
+        }
         let out: Vec<Value> = responses.iter().map(|r| r[1].clone()).collect();
         for (i, r) in responses.iter().enumerate() {
             if r[0] == "error" {
@@ -407,6 +414,19 @@ mod tests {
                 "status {status} gave {err:?}, want Unavailable mentioning {want}"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn empty_method_responses_is_protocol_not_panic() {
+        // An HTTP 200 with no method responses at all: without the
+        // guard in `call`, `list_domains` would index `r[0]` on an
+        // empty vector and panic instead of returning a 502.
+        let base = fake_admin_server(200, r#"{"methodResponses":[]}"#.to_string()).await;
+        let client = AdminClient::new(base, "admin".into(), "secret".into());
+        assert!(matches!(
+            client.list_domains().await,
+            Err(MailError::Protocol(_))
+        ));
     }
 
     #[tokio::test]
