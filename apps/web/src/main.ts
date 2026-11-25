@@ -1407,6 +1407,7 @@ const mailboxErrors: Record<string, string> = {
   invalid_request: 'Enter a valid email address and a password.',
   already_unlocked: 'That mailbox is already unlocked.',
   cannot_unlink_primary: 'The primary mailbox cannot be unlinked.',
+  mailbox_has_aliases: 'This mailbox still has aliases. Remove its aliases in Organize first, then unlink it.',
   not_found: 'It no longer exists. Reload the page and try again.',
   mail_server_error: errorText.mail_server_error,
   mail_server_unavailable: errorText.mail_server_unavailable,
@@ -2342,7 +2343,7 @@ async function renderOrganize() {
       const mb = boxes().find(b => b.id === a.mailbox_id)
       const del = btn('btn btn-ghost btn-sm danger', 'Delete', 'trash') as HTMLButtonElement
       del.addEventListener('click', async () => {
-        if (!await confirmDialog('Delete alias', `Delete ${a.address}? Mail to it will stop being delivered.`, 'Delete alias')) return
+        if (!await confirmDialog('Delete alias', `Delete ${a.address}? This alias's route is removed. If the domain has a catch-all enabled, mail to it may still be delivered to the catch-all mailbox.`, 'Delete alias')) return
         const restore = busy(del, 'Deleting…')
         try {
           await api(`/api/v1/aliases/${a.id}`, { method: 'DELETE' })
@@ -2396,6 +2397,16 @@ async function renderOrganize() {
   // both buttons stay disabled until the request settles, so an older
   // response cannot overwrite newer state.
   const catchAllPending = new Set<string>()
+  // Unsaved target picks, keyed by domain: a redraw (after another
+  // domain's Set/Disable, or a failed load) rebuilds every row from
+  // the saved target only, which would silently discard a pick the
+  // user made but has not Set yet. Drafts are reapplied on redraw
+  // and cleared when their domain's Set succeeds.
+  const catchAllDrafts = new Map<string, string>()
+  // Domains whose catch-all could not be read (the batch load failed
+  // for a reason other than 401/503): their state is unknown, never
+  // Off, and the row offers a retry instead of a wrong state.
+  const catchAllFailed = new Set<string>()
   const catchAllList = h('ul', { className: 'org-list' })
   const catchAllSection = section('Catch-all', 'Any address on a domain with no mailbox or alias of its own lands in one mailbox. Only enable this on a domain you control: it catches typos, spam, and anything else sent to the domain.',
     catchAllList)
@@ -2408,18 +2419,25 @@ async function renderOrganize() {
     catchAllPending.add(domain)
     offBtn.disabled = true
     const restore = busy(offBtn, 'Saving…')
+    let ok = false
     try {
       const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
+      ok = true
       catchAlls.set(domain, res)
       toast(`Catch-all for ${domain} disabled`)
+      // The pending key comes off before the redraw: the new row is
+      // built from it, and a key still present would leave the live
+      // buttons disabled with nothing left to re-enable them.
+      catchAllPending.delete(domain)
       drawCatchAll()
     } catch (err) { toast(orgError(err)) } finally {
       catchAllPending.delete(domain)
       restore()
-      // On failure no redraw happened, so the button is still live:
-      // put it back to its drawn state. (On success drawCatchAll
-      // rebuilt the row and this node is detached.)
-      offBtn.disabled = !catchAlls.get(domain)?.enabled
+      // On failure no redraw happened, so rebuild the row from the
+      // current state: a concurrent redraw may have detached this
+      // button, and the live row would otherwise stay disabled with
+      // no way to retry.
+      if (!ok) drawCatchAll()
     }
   }
   const drawCatchAll = () => {
@@ -2436,6 +2454,14 @@ async function renderOrganize() {
         return h('li', { className: 'org-item' },
           h('span', { className: 'org-item-title' }, domain),
           h('span', { className: 'muted' }, 'Not on this server.'))
+      }
+      if (catchAllFailed.has(domain)) {
+        const retryBtn = btn('btn btn-ghost btn-sm', 'Retry', 'refresh') as HTMLButtonElement
+        retryBtn.addEventListener('click', () => { void loadCatchAll() })
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, "Couldn't load catch-all."),
+          retryBtn)
       }
       const state = catchAlls.get(domain)
       const targets = boxes().filter(b => b.email_address.toLowerCase().endsWith(`@${domain}`))
@@ -2462,7 +2488,14 @@ async function renderOrganize() {
           offBtn)
       }
       const sel = h('select', { className: 'input', 'aria-label': `Catch-all target for ${domain}` }) as HTMLSelectElement
-      sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: state?.target_address === t.email_address }, t.email_address)))
+      // A pick the user made but has not Set yet survives redraws:
+      // without the draft it would silently revert to the saved
+      // target (or the first mailbox) whenever another domain's
+      // update rebuilds the rows.
+      const draft = catchAllDrafts.get(domain)
+      const picked = draft && targets.some(t => t.email_address === draft) ? draft : state?.target_address
+      sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: picked === t.email_address }, t.email_address)))
+      sel.addEventListener('change', () => { catchAllDrafts.set(domain, sel.value) })
       const setBtn = btn('btn btn-primary btn-sm', 'Set', 'check') as HTMLButtonElement
       const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
       const pending = catchAllPending.has(domain)
@@ -2474,19 +2507,30 @@ async function renderOrganize() {
         setBtn.disabled = true
         offBtn.disabled = true
         const restore = busy(clicked, 'Saving…')
+        let ok = false
         try {
           const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: target }) })
+          ok = true
           catchAlls.set(domain, res)
+          // A Set just saved this pick, so it is no longer a draft.
+          // A Disable leaves the draft alone: the pick is still the
+          // user's choice for a later Set.
+          if (target !== null) catchAllDrafts.delete(domain)
           toast(target === null ? `Catch-all for ${domain} disabled` : `Catch-all for ${domain} set`)
+          // The pending key comes off before the redraw: the new row
+          // is built from it, and a key still present would leave
+          // the live buttons disabled with nothing left to
+          // re-enable them.
+          catchAllPending.delete(domain)
           drawCatchAll()
         } catch (err) { toast(orgError(err)) } finally {
           catchAllPending.delete(domain)
           restore()
-          // On failure no redraw happened, so the buttons are still live:
-          // put the non-clicked one back to its drawn state. (On success
-          // drawCatchAll rebuilt the row and these nodes are detached.)
-          if (clicked !== setBtn) setBtn.disabled = false
-          if (clicked !== offBtn) offBtn.disabled = !catchAlls.get(domain)?.enabled
+          // On failure no redraw happened, so rebuild the row from
+          // the current state: a concurrent redraw may have detached
+          // these buttons, and the live row would otherwise stay
+          // disabled with no way to retry.
+          if (!ok) drawCatchAll()
         }
       }
       setBtn.addEventListener('click', () => { void putCatchAll(setBtn, sel.value) })
@@ -2516,45 +2560,34 @@ async function renderOrganize() {
     }
   }
   const loadCatchAll = async () => {
-    // One request per domain, but concurrently with a small cap: the
-    // serial loop made the page wait a round trip per domain. Outcomes
-    // are collected first and applied in domain order, so a 401 still
-    // aborts the page, a 503 still clears everything and stops, and a
-    // single failed domain still only toasts, exactly as before.
-    // Workers stop starting new fetches once a 401/503 lands.
-    const CONCURRENCY = 4
-    const outcomes: { res?: CatchAll; err?: unknown }[] = new Array(catchAllDomains.length)
-    let next = 0
-    let stopped = false
-    const workers = Array.from({ length: Math.min(CONCURRENCY, catchAllDomains.length) }, async () => {
-      while (!stopped) {
-        const i = next++
-        if (i >= catchAllDomains.length) return
-        const domain = catchAllDomains[i]
-        try {
-          outcomes[i] = { res: await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`) }
-        } catch (err) {
-          outcomes[i] = { err }
-          const status = (err as HttpError).status
-          if (status === 401 || status === 503) stopped = true
-        }
+    // One request for every domain, backed by a single domain-catalog
+    // read on the server (GET /api/v1/domains/catch-all). The old loop
+    // GETed each domain in turn — four concurrent workers, still one
+    // whole-catalog read per domain under `organize_lock` — and applied
+    // the results in domain order, so a 503 on an early domain could
+    // swallow a 401 on a later one, and a failed domain silently
+    // rendered Off. A failed batch load leaves the previous state
+    // alone and marks every domain failed, so the rows offer a retry
+    // instead of a wrong Off. A 404 means an older server without the
+    // endpoint: every domain is missing, as the per-domain GETs used
+    // to report.
+    try {
+      const res = await api<{ catch_alls: CatchAll[]; missing: { name: string }[] }>('/api/v1/domains/catch-all')
+      catchAlls.clear()
+      catchAllMissing.clear()
+      catchAllFailed.clear()
+      for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
+      for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
+    } catch (err) {
+      const status = (err as HttpError).status
+      if (status === 401) throw err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
+      else if (status === 404) {
+        for (const domain of catchAllDomains) catchAllMissing.add(domain)
+      } else {
+        toast(orgError(err))
+        for (const domain of catchAllDomains) catchAllFailed.add(domain)
       }
-    })
-    await Promise.all(workers)
-    for (let i = 0; i < catchAllDomains.length; i++) {
-      const outcome = outcomes[i]
-      if (!outcome) continue
-      const domain = catchAllDomains[i]
-      if (outcome.res) {
-        catchAlls.set(domain, outcome.res)
-        catchAllMissing.delete(domain)
-        continue
-      }
-      const status = (outcome.err as HttpError).status
-      if (status === 401) throw outcome.err
-      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; break }
-      if (status === 404) { catchAlls.delete(domain); catchAllMissing.add(domain); continue }
-      toast(orgError(outcome.err))
     }
     drawCatchAll()
   }
