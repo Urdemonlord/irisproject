@@ -1556,6 +1556,9 @@ const orgErrors: Record<string, string> = {
   invalid_contact_email: 'Enter a valid email address.',
   contact_exists: 'A contact with this email already exists.',
   too_many_contacts: 'You’ve reached the limit of 500 contacts.',
+  aliases_unavailable: 'Alias management is not configured on this server.',
+  alias_taken: 'That address is already in use.',
+  alias_limit_reached: 'You’ve reached the limit of 20 aliases.',
   not_found: 'It no longer exists. Reload the page and try again.',
   mail_server_unavailable: errorText.mail_server_unavailable,
   mail_server_error: errorText.mail_server_error,
@@ -2061,6 +2064,10 @@ function describeFilter(f: FilterRule) {
   return `If ${field} contains “${f.value}”, ${then}`
 }
 
+// ---------- Aliases and catch-all ----------
+type MailAlias = { id: string; address: string; mailbox_id: string; enabled: boolean; created_at: string }
+type CatchAll = { domain: string; target_address: string | null; enabled: boolean }
+
 async function renderOrganize() {
   const { email, mb } = await ensureAccount()
   const base = `/api/v1/mailboxes/${mb}`
@@ -2309,6 +2316,130 @@ async function renderOrganize() {
   }
   const sigModeRow = h('div', { className: 'compose-mode', role: 'group', ariaLabel: 'Signature format' }, sigPlainBtn, sigRichBtn)
   const sigBox = h('div', { className: 'sig-editor' }, sigModeRow, sigRich.wrap, sigText, sigError)
+  // ---------- Aliases ----------
+  let aliases: MailAlias[] = []
+  let aliasesAvailable = true
+  const boxes = () => account?.boxes ?? []
+  const aliasList = h('ul', { className: 'org-list' })
+  const aliasLocal = h('input', { className: 'input', type: 'text', placeholder: 'name', autocomplete: 'off', 'aria-label': 'Alias name' }) as HTMLInputElement
+  const aliasMailbox = h('select', { className: 'input', 'aria-label': 'Deliver into mailbox' }) as HTMLSelectElement
+  const aliasHint = h('p', { className: 'muted' }, 'Mail to the alias lands in the selected mailbox.')
+  const aliasAdd = btn('btn btn-primary btn-sm', 'Add alias', 'plus') as HTMLButtonElement
+  const aliasForm = h('div', { className: 'org-form-row' }, aliasLocal,
+    h('span', { className: 'muted' }, '@'), aliasMailbox, aliasAdd)
+  const aliasSection = section('Aliases', 'Extra addresses on your own domains that deliver into one of your mailboxes.', aliasList, aliasForm, aliasHint)
+  const drawAliases = () => {
+    aliasForm.style.display = aliasesAvailable ? '' : 'none'
+    aliasHint.style.display = aliasesAvailable ? '' : 'none'
+    aliasMailbox.replaceChildren(...boxes().map(b => h('option', { value: b.id }, b.email_address)))
+    if (!aliasesAvailable) {
+      aliasList.replaceChildren(h('li', { className: 'muted' }, 'Alias management is not configured on this server.'))
+      return
+    }
+    const rows: Node[] = aliases.map(a => {
+      const mb = boxes().find(b => b.id === a.mailbox_id)
+      const del = btn('btn btn-ghost btn-sm danger', 'Delete', 'trash') as HTMLButtonElement
+      del.addEventListener('click', async () => {
+        if (!await confirmDialog('Delete alias', `Delete ${a.address}? Mail to it will stop being delivered.`, 'Delete alias')) return
+        const restore = busy(del, 'Deleting…')
+        try {
+          await api(`/api/v1/aliases/${a.id}`, { method: 'DELETE' })
+          toast('Alias deleted')
+          await loadAliases()
+        } catch (err) { toast(orgError(err)) } finally { restore() }
+      })
+      return h('li', { className: 'org-item' },
+        h('span', { className: 'org-item-title' }, a.address),
+        h('span', { className: 'muted' }, mb ? `→ ${mb.email_address}` : ''),
+        del)
+    })
+    if (rows.length === 0) rows.push(h('li', { className: 'muted' }, 'No aliases yet.'))
+    aliasList.replaceChildren(...rows)
+  }
+  const loadAliases = async () => {
+    try {
+      const res = await api<{ aliases: MailAlias[] }>('/api/v1/aliases')
+      aliases = res.aliases
+      aliasesAvailable = true
+    } catch (err) {
+      const status = (err as HttpError).status
+      if (status === 503 || status === 404) { aliases = []; aliasesAvailable = false } else throw err
+    }
+    drawAliases()
+  }
+  aliasAdd.addEventListener('click', async () => {
+    const local = aliasLocal.value.trim()
+    const mb = boxes().find(b => b.id === aliasMailbox.value)
+    if (!local || !mb) return
+    const domain = mb.email_address.split('@')[1]
+    const restore = busy(aliasAdd, 'Adding…')
+    try {
+      await api('/api/v1/aliases', { method: 'POST', body: JSON.stringify({ address: `${local}@${domain}`, mailbox_id: mb.id }) })
+      aliasLocal.value = ''
+      toast('Alias added')
+      await loadAliases()
+    } catch (err) { toast(orgError(err)) } finally { restore() }
+  })
+
+  // ---------- Catch-all ----------
+  const catchAlls = new Map<string, CatchAll>()
+  let catchAllAvailable = true
+  const catchAllList = h('ul', { className: 'org-list' })
+  const catchAllSection = section('Catch-all', 'Any address on a domain with no mailbox or alias of its own lands in one mailbox. Only enable this on a domain you control: it catches typos, spam, and anything else sent to the domain.',
+    catchAllList)
+  const drawCatchAll = () => {
+    if (!catchAllAvailable) {
+      catchAllList.replaceChildren(h('li', { className: 'muted' }, 'Catch-all is not configured on this server.'))
+      return
+    }
+    const domains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))].sort()
+    catchAllList.replaceChildren(...domains.map(domain => {
+      const state = catchAlls.get(domain)
+      const targets = boxes().filter(b => b.email_address.toLowerCase().endsWith(`@${domain}`))
+      const sel = h('select', { className: 'input', 'aria-label': `Catch-all target for ${domain}` }) as HTMLSelectElement
+      sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: state?.target_address === t.email_address }, t.email_address)))
+      const setBtn = btn('btn btn-primary btn-sm', 'Set', 'check') as HTMLButtonElement
+      setBtn.addEventListener('click', async () => {
+        const restore = busy(setBtn, 'Saving…')
+        try {
+          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: sel.value }) })
+          catchAlls.set(domain, res)
+          toast(`Catch-all for ${domain} set`)
+          drawCatchAll()
+        } catch (err) { toast(orgError(err)) } finally { restore() }
+      })
+      const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
+      offBtn.disabled = !state?.enabled
+      offBtn.addEventListener('click', async () => {
+        const restore = busy(offBtn, 'Saving…')
+        try {
+          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
+          catchAlls.set(domain, res)
+          toast(`Catch-all for ${domain} disabled`)
+          drawCatchAll()
+        } catch (err) { toast(orgError(err)) } finally { restore() }
+      })
+      return h('li', { className: 'org-item' },
+        h('span', { className: 'org-item-title' }, domain),
+        h('span', { className: 'muted' }, state?.enabled ? `→ ${state.target_address}` : 'Off'),
+        sel, setBtn, offBtn)
+    }))
+  }
+  const loadCatchAll = async () => {
+    const domains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))]
+    try {
+      for (const domain of domains) {
+        const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`)
+        catchAlls.set(domain, res)
+      }
+      catchAllAvailable = true
+    } catch (err) {
+      const status = (err as HttpError).status
+      if (status === 503 || status === 404) { catchAlls.clear(); catchAllAvailable = false } else throw err
+    }
+    drawCatchAll()
+  }
+
   const sigSection = section('Signature', 'Added automatically to new messages. You can still edit or delete it in the composer.',
     sigBox, h('div', { className: 'org-submit' }, sigSave, sigStatus))
 
@@ -2321,6 +2452,7 @@ async function renderOrganize() {
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
     section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
     section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm),
+    aliasSection, catchAllSection,
     sigSection)), mobileNav('organize', account?.is_admin === true))
   folderList.replaceChildren(skeleton(2))
   try {
@@ -2331,6 +2463,8 @@ async function renderOrganize() {
     sigText.value = sg.text
     sigRich.setHtml(sg.html)
     drawFolders(); drawLabels(); drawFilters(); drawContacts()
+    await loadAliases()
+    await loadCatchAll()
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     folderList.replaceChildren(errorState(orgError(err), () => { void renderOrganize() }))

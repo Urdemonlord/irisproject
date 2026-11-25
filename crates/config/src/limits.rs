@@ -200,6 +200,15 @@ pub const MAX_CONTACTS_PER_USER: i64 = 500;
 pub const MAX_CONTACT_NAME_CHARS: usize = 100;
 /// Search terms are truncated to this many characters before going to SQL.
 pub const MAX_CONTACT_SEARCH_CHARS: usize = 100;
+
+// --- Aliases and catch-all -------------------------------------------
+// Alias management talks to the Stalwart management API with an admin
+// credential (see `crates/config`): every alias is one entry in the
+// account's server-side alias list, so the cap bounds both the IRIS
+// mirror rows and the server list a user can grow.
+
+/// Max mail aliases one user can own across all their mailboxes.
+pub const MAX_ALIASES_PER_USER: i64 = 20;
 /// Default page size for contact listing.
 pub const DEFAULT_CONTACTS_LIMIT: u32 = 50;
 /// Max page size a client may request for contact listing.
@@ -270,5 +279,6 @@ mod tests {
         assert_eq!(MAX_HTML_BODY_BYTES, 5_000_000);
         assert_eq!(HTML_BODY_TOKEN_TTL_SECS, 120);
         assert_eq!(MAX_PENDING_HTML_BODIES, 512);
+        assert_eq!(MAX_ALIASES_PER_USER, 20);
     }
 }

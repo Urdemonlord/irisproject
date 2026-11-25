@@ -56,6 +56,12 @@ pub(crate) const MAILBOX_LINK: &str = "mailbox.link";
 pub(crate) const MAILBOX_UNLOCK: &str = "mailbox.unlock";
 /// A linked mailbox was unlinked from a login.
 pub(crate) const MAILBOX_UNLINK: &str = "mailbox.unlink";
+/// A mail alias was created for one of the user's mailboxes.
+pub(crate) const ALIAS_CREATE: &str = "alias.create";
+/// A mail alias was deleted.
+pub(crate) const ALIAS_DELETE: &str = "alias.delete";
+/// A domain's catch-all target was set (or cleared to disable it).
+pub(crate) const CATCHALL_SET: &str = "catchall.set";
 /// A per-mailbox signature was saved (or cleared).
 pub(crate) const SIGNATURE_SAVE: &str = "signature.save";
 
@@ -459,6 +465,9 @@ mod tests {
                 turnstile_hostnames: Vec::new(),
                 turnstile_siteverify_url: String::new(),
                 stalwart_api_url: jmap_url,
+                stalwart_management_url: "http://127.0.0.1:9".into(),
+                stalwart_admin_user: String::new(),
+                stalwart_admin_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),

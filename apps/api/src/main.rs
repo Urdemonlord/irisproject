@@ -6,7 +6,7 @@ use axum::{
         sse::{KeepAlive, Sse},
         IntoResponse, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Extension, Json, Router,
 };
 use iris_auth as auth;
@@ -28,6 +28,7 @@ use sqlx::SqlitePool;
 use std::{sync::Arc, time::Duration};
 
 mod admin;
+mod aliases;
 mod audit;
 mod cleanup;
 mod compose;
@@ -168,6 +169,7 @@ impl From<MailError> for ApiError {
             MailError::NotFound => ApiError(StatusCode::NOT_FOUND, "not_found"),
             MailError::NotDraft => ApiError(StatusCode::BAD_REQUEST, "not_a_draft"),
             MailError::Rejected(_) => ApiError(StatusCode::UNPROCESSABLE_ENTITY, "send_rejected"),
+            MailError::Conflict(_) => ApiError(StatusCode::CONFLICT, "alias_taken"),
             MailError::NotEmpty => ApiError(StatusCode::CONFLICT, "folder_not_empty"),
             // The mail server could not be reached at all, or every
             // relay in the chain answered with an error.
@@ -316,6 +318,15 @@ async fn main() {
         .route(
             "/api/v1/mailboxes/:mailbox_id/unlink",
             post(linked_mailboxes::unlink),
+        )
+        .route(
+            "/api/v1/aliases",
+            get(aliases::list_aliases).post(aliases::create_alias),
+        )
+        .route("/api/v1/aliases/:id", delete(aliases::delete_alias))
+        .route(
+            "/api/v1/domains/:domain/catch-all",
+            get(aliases::get_catch_all).put(aliases::set_catch_all),
         )
         .route("/api/v1/mailboxes/:mailbox_id/messages", get(list_messages))
         .route("/api/v1/mailboxes/:mailbox_id/events", get(mailbox_events))
@@ -1810,6 +1821,9 @@ mod password_reset_webhook_tests {
                 turnstile_hostnames: Vec::new(),
                 turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
+                stalwart_management_url: "http://127.0.0.1:9".into(),
+                stalwart_admin_user: String::new(),
+                stalwart_admin_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
@@ -2586,6 +2600,9 @@ mod read_limit_tests {
                 turnstile_hostnames: Vec::new(),
                 turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
+                stalwart_management_url: "http://127.0.0.1:9".into(),
+                stalwart_admin_user: String::new(),
+                stalwart_admin_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
@@ -3088,6 +3105,9 @@ mod handler_integration_tests {
                 turnstile_hostnames: Vec::new(),
                 turnstile_siteverify_url: String::new(),
                 stalwart_api_url: "http://127.0.0.1:9".into(),
+                stalwart_management_url: "http://127.0.0.1:9".into(),
+                stalwart_admin_user: String::new(),
+                stalwart_admin_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),

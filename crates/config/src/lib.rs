@@ -40,6 +40,23 @@ pub struct Config {
     /// is never POSTed to an arbitrary or plaintext URL.
     pub turnstile_siteverify_url: String,
     pub stalwart_api_url: String,
+    /// Stalwart management (JMAP) API: a separate loopback listener from
+    /// the user JMAP API above (the installer binds it to 127.0.0.1:8080;
+    /// see `packaging/src/usr/lib/iris/iris-setup.py`). Only the alias
+    /// and catch-all endpoints talk to it, with the admin credential
+    /// below. Read from `STALWART_MANAGEMENT_URL`.
+    pub stalwart_management_url: String,
+    /// Stalwart admin credential for the management API (alias and
+    /// catch-all changes). Read from `STALWART_ADMIN_USER` /
+    /// `STALWART_ADMIN_PASSWORD`. Both must be set for the alias and
+    /// catch-all endpoints to answer; when either is empty those
+    /// endpoints fail closed with 503 `aliases_unavailable` (see
+    /// `stalwart_admin_configured`). The account must hold the
+    /// `sysAccountGet`, `sysAccountUpdate`, `sysDomainGet` and
+    /// `sysDomainUpdate` permissions (a System Administrator role
+    /// account). Never shipped to the browser.
+    pub stalwart_admin_user: String,
+    pub stalwart_admin_password: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
     /// Catch-all sink mailbox for the temp domain (not an admin account).
@@ -132,6 +149,10 @@ impl Config {
             turnstile_siteverify_url,
             stalwart_api_url: std::env::var("STALWART_API_URL")
                 .unwrap_or_else(|_| "http://localhost:8092".to_string()),
+            stalwart_management_url: std::env::var("STALWART_MANAGEMENT_URL")
+                .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string()),
+            stalwart_admin_user: std::env::var("STALWART_ADMIN_USER").unwrap_or_default(),
+            stalwart_admin_password: std::env::var("STALWART_ADMIN_PASSWORD").unwrap_or_default(),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")
                 .unwrap_or_else(|_| "inbox.example.com".to_string()),
             temp_inbox_default_expiry_hours: std::env::var("TEMP_INBOX_DEFAULT_EXPIRY_HOURS")
@@ -179,6 +200,21 @@ impl Config {
                 &std::env::var("IRIS_ADMIN_EMAILS").unwrap_or_default(),
             ),
         })
+    }
+}
+
+/// True when the Stalwart admin credential is fully configured: both
+/// the user and the password are set. The alias and catch-all endpoints
+/// fail closed (503 `aliases_unavailable`) while this is false.
+pub fn stalwart_admin_configured(user: &str, password: &str) -> bool {
+    !user.trim().is_empty() && !password.is_empty()
+}
+
+impl Config {
+    /// True when this config carries a usable Stalwart admin credential
+    /// (see `stalwart_admin_configured`).
+    pub fn stalwart_admin_configured(&self) -> bool {
+        stalwart_admin_configured(&self.stalwart_admin_user, &self.stalwart_admin_password)
     }
 }
 
@@ -569,6 +605,15 @@ mod tests {
             normalize_mail_content_origin(Some("http://mail-content.example.com")),
             ""
         );
+    }
+
+    #[test]
+    fn stalwart_admin_needs_both_user_and_password() {
+        assert!(stalwart_admin_configured("admin", "secret"));
+        assert!(!stalwart_admin_configured("", "secret"));
+        assert!(!stalwart_admin_configured("   ", "secret"));
+        assert!(!stalwart_admin_configured("admin", ""));
+        assert!(!stalwart_admin_configured("", ""));
     }
 
     #[test]
