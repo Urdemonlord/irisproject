@@ -9,6 +9,7 @@ use serde::Serialize;
 use serde_json::{json, Value};
 use thiserror::Error;
 
+pub mod admin;
 pub mod dmarc;
 pub mod html;
 
@@ -32,6 +33,10 @@ pub enum MailError {
     /// The mail server refused to send (e.g. recipient rejected).
     #[error("rejected: {0}")]
     Rejected(String),
+    /// The mail server refused a change because the address is already
+    /// in use by another account (alias creation).
+    #[error("conflict: {0}")]
+    Conflict(String),
     /// A folder still holds messages, so it cannot be deleted.
     #[error("folder is not empty")]
     NotEmpty,
@@ -255,7 +260,7 @@ pub struct JmapClient {
 }
 
 const USING: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:mail"];
-const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
+pub(crate) const USING_STALWART: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:stalwart:jmap"];
 const USING_SIEVE: [&str; 2] = ["urn:ietf:params:jmap:core", "urn:ietf:params:jmap:sieve"];
 const USING_SUBMIT: [&str; 3] = [
     "urn:ietf:params:jmap:core",
@@ -1924,7 +1929,7 @@ pub fn extract_text_attachment(
     Err(MailError::Protocol("not_previewable".into()))
 }
 
-async fn check(resp: reqwest::Response) -> Result<Value, MailError> {
+pub(crate) async fn check(resp: reqwest::Response) -> Result<Value, MailError> {
     match resp.status().as_u16() {
         401 | 403 => Err(MailError::Auth),
         s if s >= 400 => Err(MailError::Unavailable(format!("HTTP {s}"))),

@@ -8,3 +8,7 @@ license.workspace = true
 serde = { workspace = true }
 dotenvy = "0.15"
 anyhow = "1.0"
+# The same URL parser reqwest (the Stalwart admin HTTP client) uses:
+# `validate_stalwart_management_url` gates on it so a URL the client
+# cannot parse is rejected at startup instead of failing every request.
+url = "2.5"

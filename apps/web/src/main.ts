@@ -1407,6 +1407,7 @@ const mailboxErrors: Record<string, string> = {
   invalid_request: 'Enter a valid email address and a password.',
   already_unlocked: 'That mailbox is already unlocked.',
   cannot_unlink_primary: 'The primary mailbox cannot be unlinked.',
+  mailbox_has_aliases: 'This mailbox still has aliases. Remove its aliases in Organize first, then unlink it.',
   not_found: 'It no longer exists. Reload the page and try again.',
   mail_server_error: errorText.mail_server_error,
   mail_server_unavailable: errorText.mail_server_unavailable,
@@ -1556,6 +1557,9 @@ const orgErrors: Record<string, string> = {
   invalid_contact_email: 'Enter a valid email address.',
   contact_exists: 'A contact with this email already exists.',
   too_many_contacts: 'You’ve reached the limit of 500 contacts.',
+  aliases_unavailable: 'Alias management is not configured on this server.',
+  alias_taken: 'That address is already in use.',
+  alias_limit_reached: 'You’ve reached the limit of 20 aliases.',
   not_found: 'It no longer exists. Reload the page and try again.',
   mail_server_unavailable: errorText.mail_server_unavailable,
   mail_server_error: errorText.mail_server_error,
@@ -2061,6 +2065,10 @@ function describeFilter(f: FilterRule) {
   return `If ${field} contains “${f.value}”, ${then}`
 }
 
+// ---------- Aliases and catch-all ----------
+type MailAlias = { id: string; address: string; mailbox_id: string; enabled: boolean; created_at: string }
+type CatchAll = { domain: string; target_address: string | null; enabled: boolean }
+
 async function renderOrganize() {
   const { email, mb } = await ensureAccount()
   const base = `/api/v1/mailboxes/${mb}`
@@ -2309,6 +2317,408 @@ async function renderOrganize() {
   }
   const sigModeRow = h('div', { className: 'compose-mode', role: 'group', ariaLabel: 'Signature format' }, sigPlainBtn, sigRichBtn)
   const sigBox = h('div', { className: 'sig-editor' }, sigModeRow, sigRich.wrap, sigText, sigError)
+  // ---------- Aliases ----------
+  let aliases: MailAlias[] = []
+  let aliasesAvailable = true
+  const boxes = () => account?.boxes ?? []
+  const aliasList = h('ul', { className: 'org-list' })
+  const aliasLocal = h('input', { className: 'input', type: 'text', placeholder: 'name', autocomplete: 'off', 'aria-label': 'Alias name' }) as HTMLInputElement
+  const aliasMailbox = h('select', { className: 'input', 'aria-label': 'Deliver into mailbox' }) as HTMLSelectElement
+  const aliasHint = h('p', { className: 'muted' }, 'Mail to the alias lands in the selected mailbox.')
+  const aliasAdd = btn('btn btn-primary btn-sm', 'Add alias', 'plus') as HTMLButtonElement
+  const aliasForm = h('div', { className: 'org-form-row' }, aliasLocal,
+    h('span', { className: 'muted' }, '@'), aliasMailbox, aliasAdd)
+  const aliasSection = section('Aliases', 'Extra addresses on your own domains that deliver into one of your mailboxes.', aliasList, aliasForm, aliasHint)
+  const drawAliases = () => {
+    aliasForm.style.display = aliasesAvailable ? '' : 'none'
+    aliasHint.style.display = aliasesAvailable ? '' : 'none'
+    const keepMailbox = aliasMailbox.value
+    aliasMailbox.replaceChildren(...boxes().map(b => h('option', { value: b.id }, b.email_address)))
+    if (keepMailbox && boxes().some(b => b.id === keepMailbox)) aliasMailbox.value = keepMailbox
+    if (!aliasesAvailable) {
+      aliasList.replaceChildren(h('li', { className: 'muted' }, 'Alias management is not configured on this server.'))
+      return
+    }
+    const rows: Node[] = aliases.map(a => {
+      const mb = boxes().find(b => b.id === a.mailbox_id)
+      const del = btn('btn btn-ghost btn-sm danger', 'Delete', 'trash') as HTMLButtonElement
+      del.addEventListener('click', async () => {
+        if (!await confirmDialog('Delete alias', `Delete ${a.address}? This alias's route is removed. If the domain has a catch-all enabled, mail to it may still be delivered to the catch-all mailbox.`, 'Delete alias')) return
+        const restore = busy(del, 'Deleting…')
+        try {
+          await api(`/api/v1/aliases/${a.id}`, { method: 'DELETE' })
+          toast('Alias deleted')
+          await loadAliases()
+        } catch (err) { toast(orgError(err)) } finally { restore() }
+      })
+      return h('li', { className: 'org-item' },
+        h('span', { className: 'org-item-title' }, a.address),
+        h('span', { className: 'muted' }, mb ? `→ ${mb.email_address}` : ''),
+        del)
+    })
+    if (rows.length === 0) rows.push(h('li', { className: 'muted' }, 'No aliases yet.'))
+    aliasList.replaceChildren(...rows)
+  }
+  const loadAliases = async () => {
+    try {
+      const res = await api<{ aliases: MailAlias[] }>('/api/v1/aliases')
+      aliases = res.aliases
+      aliasesAvailable = true
+    } catch (err) {
+      const status = (err as HttpError).status
+      if (status === 401) throw err
+      if (status === 503 || status === 404) { aliases = []; aliasesAvailable = false }
+      else toast(orgError(err))
+    }
+    drawAliases()
+  }
+  aliasAdd.addEventListener('click', async () => {
+    const local = aliasLocal.value.trim()
+    const mb = boxes().find(b => b.id === aliasMailbox.value)
+    if (!local || !mb) return
+    const domain = mb.email_address.split('@')[1]
+    const restore = busy(aliasAdd, 'Adding…')
+    try {
+      await api('/api/v1/aliases', { method: 'POST', body: JSON.stringify({ address: `${local}@${domain}`, mailbox_id: mb.id }) })
+      aliasLocal.value = ''
+      toast('Alias added')
+      await loadAliases()
+    } catch (err) { toast(orgError(err)) } finally { restore() }
+  })
+
+  // ---------- Catch-all ----------
+  const catchAlls = new Map<string, CatchAll>()
+  let catchAllAvailable = true
+  // Domains whose catch-all endpoint 404s: the domain is missing on the
+  // server, not the feature as a whole. Domains listed by GET /api/v1/domains.
+  const catchAllMissing = new Set<string>()
+  let catchAllDomains: string[] = []
+  // Domains with a Set/Disable PUT in flight: a second click is ignored and
+  // both buttons stay disabled until the request settles, so an older
+  // response cannot overwrite newer state.
+  const catchAllPending = new Set<string>()
+  // Unsaved target picks, keyed by domain: a redraw (after another
+  // domain's Set/Disable, or a failed load) rebuilds every row from
+  // the saved target only, which would silently discard a pick the
+  // user made but has not Set yet. Drafts are reapplied on redraw
+  // and cleared when their domain's Set succeeds.
+  const catchAllDrafts = new Map<string, string>()
+  // Generation counter for catch-all state: bumped on every
+  // successful Set/Disable. A load that started before the bump
+  // must not apply its snapshot afterwards — the Set/Disable
+  // already wrote newer state, and the load's response predates
+  // it. A stale load schedules one fresh load after it settles
+  // instead of overwriting.
+  let catchAllSeq = 0
+  let catchAllStaleReload = false
+  // Domains whose catch-all could not be read (the batch load failed
+  // for a reason other than 401/503): their state is unknown, never
+  // Off, and the row offers a retry instead of a wrong state.
+  const catchAllFailed = new Set<string>()
+  const catchAllList = h('ul', { className: 'org-list' })
+  const catchAllSection = section('Catch-all', 'Any address on a domain with no mailbox or alias of its own lands in one mailbox. Only enable this on a domain you control: it catches typos, spam, and anything else sent to the domain.',
+    catchAllList)
+  // Disables a domain's catch-all (PUT target null). Disabling needs
+  // no target address, so it works even for a domain with no mailbox
+  // on it, where no target can be offered. (The Set path below lives
+  // in putCatchAll because it also drives the target select.)
+  const disableCatchAll = async (domain: string, offBtn: HTMLButtonElement) => {
+    if (catchAllPending.has(domain)) return
+    catchAllPending.add(domain)
+    offBtn.disabled = true
+    const restore = busy(offBtn, 'Saving…')
+    let ok = false
+    try {
+      const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
+      ok = true
+      catchAlls.set(domain, res)
+      catchAllSeq++
+      toast(`Catch-all for ${domain} disabled`)
+      // The pending key comes off before the redraw: the new row is
+      // built from it, and a key still present would leave the live
+      // buttons disabled with nothing left to re-enable them.
+      catchAllPending.delete(domain)
+      drawCatchAll()
+    } catch (err) { toast(orgError(err)) } finally {
+      catchAllPending.delete(domain)
+      restore()
+      // On failure no redraw happened, so rebuild the row from the
+      // current state: a concurrent redraw may have detached this
+      // button, and the live row would otherwise stay disabled with
+      // no way to retry.
+      if (!ok) drawCatchAll()
+    }
+  }
+  const drawCatchAll = () => {
+    if (!catchAllAvailable) {
+      catchAllList.replaceChildren(h('li', { className: 'muted' }, 'Catch-all is not configured on this server.'))
+      return
+    }
+    if (catchAllDomains.length === 0) {
+      catchAllList.replaceChildren(h('li', { className: 'muted' }, 'No domains yet.'))
+      return
+    }
+    catchAllList.replaceChildren(...catchAllDomains.map(domain => {
+      if (catchAllMissing.has(domain)) {
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, 'Not on this server.'))
+      }
+      if (catchAllFailed.has(domain)) {
+        const retryBtn = btn('btn btn-ghost btn-sm', 'Retry', 'refresh') as HTMLButtonElement
+        retryBtn.addEventListener('click', () => {
+          // Disabled until the load settles: a second click while a
+          // batch load is running would start a concurrent load whose
+          // completion overwrites shared state out of order. The
+          // redraw at the end of the load replaces this button, so
+          // there is nothing to re-enable.
+          retryBtn.disabled = true
+          // The promise is caught, not discarded: loadCatchAll
+          // rethrows 401, and an unhandled rejection would leave the
+          // user on a dead session instead of sending them to login.
+          loadCatchAll().catch((err) => {
+            if ((err as HttpError).status === 401) { account = null; void renderLogin() }
+          })
+        })
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, "Couldn't load catch-all."),
+          retryBtn)
+      }
+      const state = catchAlls.get(domain)
+      const targets = boxes().filter(b => b.email_address.toLowerCase().endsWith(`@${domain}`))
+      if (targets.length === 0) {
+        // No mailbox on this domain, so there is no target the server
+        // would accept: PUT rejects a target address on another
+        // domain, so a picker over the admin's other mailboxes would
+        // only fail. Offer what the API does allow instead: disabling
+        // a catch-all that is already set, and an honest pointer to
+        // link a mailbox on this domain first. Enabling with a
+        // mailbox from another domain needs a backend decision to
+        // relax that same-domain validation.
+        if (!state?.enabled) {
+          return h('li', { className: 'org-item' },
+            h('span', { className: 'org-item-title' }, domain),
+            h('span', { className: 'muted' }, 'Catch-all needs a mailbox on this domain as its target. Link a mailbox on this domain first, then pick it here.'))
+        }
+        const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
+        offBtn.disabled = catchAllPending.has(domain)
+        offBtn.addEventListener('click', () => { void disableCatchAll(domain, offBtn) })
+        return h('li', { className: 'org-item' },
+          h('span', { className: 'org-item-title' }, domain),
+          h('span', { className: 'muted' }, `→ ${state.target_address}`),
+          offBtn)
+      }
+      const sel = h('select', { className: 'input', 'aria-label': `Catch-all target for ${domain}` }) as HTMLSelectElement
+      // A pick the user made but has not Set yet survives redraws:
+      // without the draft it would silently revert to the saved
+      // target (or the first mailbox) whenever another domain's
+      // update rebuilds the rows.
+      const draft = catchAllDrafts.get(domain)
+      const picked = draft && targets.some(t => t.email_address === draft) ? draft : state?.target_address
+      sel.replaceChildren(...targets.map(t => h('option', { value: t.email_address, selected: picked === t.email_address }, t.email_address)))
+      sel.addEventListener('change', () => { catchAllDrafts.set(domain, sel.value) })
+      const setBtn = btn('btn btn-primary btn-sm', 'Set', 'check') as HTMLButtonElement
+      const offBtn = btn('btn btn-ghost btn-sm', 'Disable', 'x') as HTMLButtonElement
+      const pending = catchAllPending.has(domain)
+      setBtn.disabled = pending
+      offBtn.disabled = pending || !state?.enabled
+      const putCatchAll = async (clicked: HTMLButtonElement, target: string | null) => {
+        if (catchAllPending.has(domain)) return
+        catchAllPending.add(domain)
+        setBtn.disabled = true
+        offBtn.disabled = true
+        const restore = busy(clicked, 'Saving…')
+        let ok = false
+        try {
+          const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: target }) })
+          ok = true
+          catchAlls.set(domain, res)
+          catchAllSeq++
+          // A Set just saved this pick, so it is no longer a draft —
+          // but only if the draft still holds this target. The user
+          // may have picked a different mailbox while the PUT was in
+          // flight, and that newer pick must survive the redraw.
+          // A Disable leaves the draft alone: the pick is still the
+          // user's choice for a later Set.
+          if (target !== null && catchAllDrafts.get(domain) === target) catchAllDrafts.delete(domain)
+          toast(target === null ? `Catch-all for ${domain} disabled` : `Catch-all for ${domain} set`)
+          // The pending key comes off before the redraw: the new row
+          // is built from it, and a key still present would leave
+          // the live buttons disabled with nothing left to
+          // re-enable them.
+          catchAllPending.delete(domain)
+          drawCatchAll()
+        } catch (err) { toast(orgError(err)) } finally {
+          catchAllPending.delete(domain)
+          restore()
+          // On failure no redraw happened, so rebuild the row from
+          // the current state: a concurrent redraw may have detached
+          // these buttons, and the live row would otherwise stay
+          // disabled with no way to retry.
+          if (!ok) drawCatchAll()
+        }
+      }
+      setBtn.addEventListener('click', () => { void putCatchAll(setBtn, sel.value) })
+      offBtn.addEventListener('click', () => { void putCatchAll(offBtn, null) })
+      return h('li', { className: 'org-item' },
+        h('span', { className: 'org-item-title' }, domain),
+        h('span', { className: 'muted' }, state?.enabled ? `→ ${state.target_address}` : 'Off'),
+        sel, setBtn, offBtn)
+    }))
+  }
+  // Domain list for the catch-all section. GET /api/v1/domains returns all
+  // server domains for admins and the user's own mailbox domains otherwise.
+  // Against an older server without the endpoint, fall back to the domains
+  // of the current user's mailboxes.
+  const loadDomains = async () => {
+    try {
+      const res = await api<{ domains: { name: string }[] }>('/api/v1/domains')
+      catchAllDomains = res.domains.map(d => d.name.toLowerCase()).sort()
+    } catch (err) {
+      const status = (err as HttpError).status
+      if (status === 401) throw err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllAvailable = false; catchAllDomains = [] }
+      else {
+        if (status !== 404) toast(orgError(err))
+        catchAllDomains = [...new Set(boxes().map(b => b.email_address.split('@')[1].toLowerCase()))].sort()
+      }
+    }
+  }
+  // Per-domain reads, used only when the batch endpoint 404s: a 404
+  // from the batch endpoint only proves the endpoint is missing (an
+  // older server), not the domains. Each domain is read on its own —
+  // four concurrent workers, outcomes applied in domain order — so a
+  // per-domain 404 genuinely means that domain is missing, while
+  // any other failure marks the domain failed instead of a wrong Off.
+  // `seq` is the generation the calling load started at: if a
+  // Set/Disable landed while these reads were in flight, the
+  // outcomes are stale and must not overwrite that newer state.
+  const loadCatchAllPerDomain = async (seq: number) => {
+    const CONCURRENCY = 4
+    const outcomes: { res?: CatchAll; err?: unknown }[] = new Array(catchAllDomains.length)
+    let next = 0
+    let stopped = false
+    const workers = Array.from({ length: Math.min(CONCURRENCY, catchAllDomains.length) }, async () => {
+      while (!stopped) {
+        const i = next++
+        if (i >= catchAllDomains.length) return
+        const domain = catchAllDomains[i]
+        try {
+          outcomes[i] = { res: await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`) }
+        } catch (err) {
+          outcomes[i] = { err }
+          const status = (err as HttpError).status
+          if (status === 401 || status === 503) stopped = true
+        }
+      }
+    })
+    await Promise.all(workers)
+    // A 401 still goes to the caller's sign-in recovery even when
+    // the snapshot is stale: the session is dead either way.
+    const authFailure = outcomes.find(o => o?.err && (o.err as HttpError).status === 401)
+    if (authFailure?.err) throw authFailure.err
+    if (seq !== catchAllSeq) { catchAllStaleReload = true; return }
+    catchAlls.clear()
+    catchAllMissing.clear()
+    catchAllFailed.clear()
+    for (let i = 0; i < catchAllDomains.length; i++) {
+      const outcome = outcomes[i]
+      if (!outcome) continue
+      const domain = catchAllDomains[i]
+      if (outcome.res) {
+        catchAlls.set(domain, outcome.res)
+        continue
+      }
+      const status = (outcome.err as HttpError).status
+      if (status === 401) throw outcome.err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false; break }
+      if (status === 404) { catchAllMissing.add(domain); continue }
+      toast(orgError(outcome.err))
+      catchAllFailed.add(domain)
+    }
+  }
+  // The batch load in flight, if any: a retry clicked while a load
+  // is running reuses it instead of starting a second batch load,
+  // so two completions cannot overwrite shared state out of order.
+  let catchAllInFlight: Promise<void> | null = null
+  const loadCatchAll = (): Promise<void> => {
+    if (catchAllInFlight) return catchAllInFlight
+    const run = (async () => {
+      // Generation at load start: a Set/Disable after this point
+      // makes the snapshot below stale (see catchAllSeq above).
+      const seq = catchAllSeq
+      const stale = () => seq !== catchAllSeq
+      // One request for every domain, backed by a single domain-catalog
+      // read on the server (GET /api/v1/domains/catch-all). The old loop
+      // GETed each domain in turn — four concurrent workers, still one
+      // whole-catalog read per domain under `organize_lock` — and applied
+      // the results in domain order, so a 503 on an early domain could
+      // swallow a 401 on a later one, and a failed domain silently
+      // rendered Off. A failed batch load leaves the previous state
+      // alone and marks every domain failed, so the rows offer a retry
+      // instead of a wrong Off. A 404 means an older server without the
+      // endpoint, so the per-domain GETs run instead (see
+      // loadCatchAllPerDomain): a per-domain 404 genuinely means that
+      // domain is missing.
+      try {
+        const res = await api<{ catch_alls: CatchAll[]; missing: { name: string }[] }>('/api/v1/domains/catch-all')
+        if (stale()) {
+          // A Set/Disable landed while this load was in flight: its
+          // own state update is newer than this snapshot. Skip
+          // applying and reload once after settling instead.
+          catchAllStaleReload = true
+        } else {
+          catchAlls.clear()
+          catchAllMissing.clear()
+          catchAllFailed.clear()
+          // The batch enumerates every domain the caller may manage,
+          // so it is the authority on which domains to display: a
+          // domain outside the fallback list (an admin domain with a
+          // catch-all but no mailbox) would otherwise be stored but
+          // never drawn.
+          catchAllDomains = [...new Set([...res.catch_alls.map(c => c.domain.toLowerCase()), ...res.missing.map(m => m.name.toLowerCase())])].sort()
+          for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
+          for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
+        }
+      } catch (err) {
+        const status = (err as HttpError).status
+        if (status === 401) throw err
+        if (status === 503) {
+          if (stale()) catchAllStaleReload = true
+          else { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
+        } else if (status === 404) {
+          await loadCatchAllPerDomain(seq)
+        } else {
+          if (stale()) catchAllStaleReload = true
+          else {
+            toast(orgError(err))
+            for (const domain of catchAllDomains) catchAllFailed.add(domain)
+          }
+        }
+      }
+      drawCatchAll()
+    })()
+    catchAllInFlight = run
+    // Cleared on settle so a later retry starts a fresh load. Both
+    // outcomes are observed here, so this derived promise never
+    // rejects and the callers still see the original outcome. A load
+    // that went stale reloads once here so a Retry click is not
+    // wasted on a snapshot that was skipped; the reload's own 401
+    // goes through the same sign-in recovery as a Retry.
+    const settle = () => {
+      if (catchAllInFlight === run) catchAllInFlight = null
+      if (catchAllStaleReload) {
+        catchAllStaleReload = false
+        void loadCatchAll().catch((err) => {
+          if ((err as HttpError).status === 401) { account = null; void renderLogin() }
+        })
+      }
+    }
+    void run.then(settle, settle)
+    return run
+  }
+
   const sigSection = section('Signature', 'Added automatically to new messages. You can still edit or delete it in the composer.',
     sigBox, h('div', { className: 'org-submit' }, sigSave, sigStatus))
 
@@ -2321,6 +2731,7 @@ async function renderOrganize() {
       btn('btn btn-secondary btn-sm', 'New label', 'plus', { onclick: async () => { if (await newLabelDialog(base)) { drawLabels(); drawForm() } } })),
     section('Filters', 'Filters run on the mail server as new mail arrives, even when IRIS is closed. Moves run last; the first matching move wins.', filterList, form),
     section('Contacts', 'People you email often. They show up as suggestions when you type in To, Cc or Bcc.', contactList, contactForm),
+    aliasSection, catchAllSection,
     sigSection)), mobileNav('organize', account?.is_admin === true))
   folderList.replaceChildren(skeleton(2))
   try {
@@ -2331,6 +2742,9 @@ async function renderOrganize() {
     sigText.value = sg.text
     sigRich.setHtml(sg.html)
     drawFolders(); drawLabels(); drawFilters(); drawContacts()
+    await loadAliases()
+    await loadDomains()
+    await loadCatchAll()
   } catch (err) {
     if ((err as HttpError).status === 401) { account = null; return renderLogin() }
     folderList.replaceChildren(errorState(orgError(err), () => { void renderOrganize() }))

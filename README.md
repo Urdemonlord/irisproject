@@ -185,6 +185,8 @@ Every variable in [`.env.example`](.env.example) is read by the code
 | `TURNSTILE_SECRET_KEY` | (empty) | Cloudflare Turnstile secret key for login verification; empty = logins skip the challenge. The public half is the web build-time variable `VITE_TURNSTILE_SITE_KEY` — see "Login CAPTCHA" below |
 | `TURNSTILE_HOSTNAMES` | (empty) | Comma-separated frontend hostnames a Turnstile token must have been minted on (e.g. `mail.example.com`); while the secret is set, an empty list rejects every login. Loopback hostnames (`localhost`, `127.0.0.1`, `::1`) are rejected at startup in production (allowed outside production, for localhost testing) |
 | `STALWART_API_URL` | `http://localhost:8092` | JMAP API, loopback only |
+| `STALWART_MANAGEMENT_URL` | `http://127.0.0.1:8080` | Stalwart management (JMAP) API, loopback only — the alias and catch-all endpoints talk here, never to `STALWART_API_URL` |
+| `STALWART_ADMIN_USER`, `STALWART_ADMIN_PASSWORD` | (empty) | Stalwart admin credential for the management API (alias and catch-all changes). The account must hold `sysAccountGet`, `sysAccountUpdate`, `sysDomainGet` and `sysDomainUpdate`, and every permission of the accounts it changes (a System Administrator role account). While either is empty, the alias and catch-all endpoints answer 503 `aliases_unavailable` |
 | `TEMP_INBOX_DOMAIN` | `inbox.example.com` | Domain for temporary addresses; needs a catch-all mailbox |
 | `TEMP_INBOX_DEFAULT_EXPIRY_HOURS` | `1` | Temp inbox lifetime |
 | `TEMP_INBOX_MAIL_USER`, `TEMP_INBOX_MAIL_PASSWORD` | (empty) | Catch-all mailbox credentials |
