@@ -2457,7 +2457,20 @@ async function renderOrganize() {
       }
       if (catchAllFailed.has(domain)) {
         const retryBtn = btn('btn btn-ghost btn-sm', 'Retry', 'refresh') as HTMLButtonElement
-        retryBtn.addEventListener('click', () => { void loadCatchAll() })
+        retryBtn.addEventListener('click', () => {
+          // Disabled until the load settles: a second click while a
+          // batch load is running would start a concurrent load whose
+          // completion overwrites shared state out of order. The
+          // redraw at the end of the load replaces this button, so
+          // there is nothing to re-enable.
+          retryBtn.disabled = true
+          // The promise is caught, not discarded: loadCatchAll
+          // rethrows 401, and an unhandled rejection would leave the
+          // user on a dead session instead of sending them to login.
+          loadCatchAll().catch((err) => {
+            if ((err as HttpError).status === 401) { account = null; void renderLogin() }
+          })
+        })
         return h('li', { className: 'org-item' },
           h('span', { className: 'org-item-title' }, domain),
           h('span', { className: 'muted' }, "Couldn't load catch-all."),
@@ -2559,37 +2572,99 @@ async function renderOrganize() {
       }
     }
   }
-  const loadCatchAll = async () => {
-    // One request for every domain, backed by a single domain-catalog
-    // read on the server (GET /api/v1/domains/catch-all). The old loop
-    // GETed each domain in turn — four concurrent workers, still one
-    // whole-catalog read per domain under `organize_lock` — and applied
-    // the results in domain order, so a 503 on an early domain could
-    // swallow a 401 on a later one, and a failed domain silently
-    // rendered Off. A failed batch load leaves the previous state
-    // alone and marks every domain failed, so the rows offer a retry
-    // instead of a wrong Off. A 404 means an older server without the
-    // endpoint: every domain is missing, as the per-domain GETs used
-    // to report.
-    try {
-      const res = await api<{ catch_alls: CatchAll[]; missing: { name: string }[] }>('/api/v1/domains/catch-all')
-      catchAlls.clear()
-      catchAllMissing.clear()
-      catchAllFailed.clear()
-      for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
-      for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
-    } catch (err) {
-      const status = (err as HttpError).status
-      if (status === 401) throw err
-      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
-      else if (status === 404) {
-        for (const domain of catchAllDomains) catchAllMissing.add(domain)
-      } else {
-        toast(orgError(err))
-        for (const domain of catchAllDomains) catchAllFailed.add(domain)
+  // Per-domain reads, used only when the batch endpoint 404s: a 404
+  // from the batch endpoint only proves the endpoint is missing (an
+  // older server), not the domains. Each domain is read on its own —
+  // four concurrent workers, outcomes applied in domain order — so a
+  // per-domain 404 genuinely means that domain is missing, while
+  // any other failure marks the domain failed instead of a wrong Off.
+  const loadCatchAllPerDomain = async () => {
+    const CONCURRENCY = 4
+    const outcomes: { res?: CatchAll; err?: unknown }[] = new Array(catchAllDomains.length)
+    let next = 0
+    let stopped = false
+    const workers = Array.from({ length: Math.min(CONCURRENCY, catchAllDomains.length) }, async () => {
+      while (!stopped) {
+        const i = next++
+        if (i >= catchAllDomains.length) return
+        const domain = catchAllDomains[i]
+        try {
+          outcomes[i] = { res: await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`) }
+        } catch (err) {
+          outcomes[i] = { err }
+          const status = (err as HttpError).status
+          if (status === 401 || status === 503) stopped = true
+        }
       }
+    })
+    await Promise.all(workers)
+    catchAlls.clear()
+    catchAllMissing.clear()
+    catchAllFailed.clear()
+    for (let i = 0; i < catchAllDomains.length; i++) {
+      const outcome = outcomes[i]
+      if (!outcome) continue
+      const domain = catchAllDomains[i]
+      if (outcome.res) {
+        catchAlls.set(domain, outcome.res)
+        continue
+      }
+      const status = (outcome.err as HttpError).status
+      if (status === 401) throw outcome.err
+      if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false; break }
+      if (status === 404) { catchAllMissing.add(domain); continue }
+      toast(orgError(outcome.err))
+      catchAllFailed.add(domain)
     }
-    drawCatchAll()
+  }
+  // The batch load in flight, if any: a retry clicked while a load
+  // is running reuses it instead of starting a second batch load,
+  // so two completions cannot overwrite shared state out of order.
+  let catchAllInFlight: Promise<void> | null = null
+  const loadCatchAll = (): Promise<void> => {
+    if (catchAllInFlight) return catchAllInFlight
+    const run = (async () => {
+      // One request for every domain, backed by a single domain-catalog
+      // read on the server (GET /api/v1/domains/catch-all). The old loop
+      // GETed each domain in turn — four concurrent workers, still one
+      // whole-catalog read per domain under `organize_lock` — and applied
+      // the results in domain order, so a 503 on an early domain could
+      // swallow a 401 on a later one, and a failed domain silently
+      // rendered Off. A failed batch load leaves the previous state
+      // alone and marks every domain failed, so the rows offer a retry
+      // instead of a wrong Off. A 404 means an older server without the
+      // endpoint, so the per-domain GETs run instead (see
+      // loadCatchAllPerDomain): a per-domain 404 genuinely means that
+      // domain is missing.
+      try {
+        const res = await api<{ catch_alls: CatchAll[]; missing: { name: string }[] }>('/api/v1/domains/catch-all')
+        catchAlls.clear()
+        catchAllMissing.clear()
+        catchAllFailed.clear()
+        for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
+        for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
+      } catch (err) {
+        const status = (err as HttpError).status
+        if (status === 401) throw err
+        if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
+        else if (status === 404) {
+          await loadCatchAllPerDomain()
+        } else {
+          toast(orgError(err))
+          for (const domain of catchAllDomains) catchAllFailed.add(domain)
+        }
+      }
+      drawCatchAll()
+    })()
+    catchAllInFlight = run
+    // Cleared on settle so a later retry starts a fresh load. Both
+    // outcomes are observed here, so this derived promise never
+    // rejects and the callers still see the original outcome.
+    void run.then(
+      () => { if (catchAllInFlight === run) catchAllInFlight = null },
+      () => { if (catchAllInFlight === run) catchAllInFlight = null },
+    )
+    return run
   }
 
   const sigSection = section('Signature', 'Added automatically to new messages. You can still edit or delete it in the composer.',
