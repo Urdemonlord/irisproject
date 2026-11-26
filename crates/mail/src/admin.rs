@@ -15,7 +15,10 @@
 //! Wire shapes (verified against the Stalwart docs, "Managing
 //! accounts" and the Account object reference):
 //! * An alias is an `EmailAlias` entry of an account's `aliases` list:
-//!   `{ "name": <local part>, "domainId": <domain id>, "enabled": bool }`.
+//!   `{ "name": <local part>, "domainId": <domain id>, "enable": bool }`.
+//!   (Live Stalwart v1.0.1 rejects `enabled` with "Invalid key for
+//!   object" and accepts `enable`; verified live 26 Nov 2026. The
+//!   Stalwart docs still say `enabled`, so do not "fix" this back.)
 //! * Lists are index-keyed JSON objects in `x:Account/set` arguments,
 //!   never arrays (`{"0": {...}, "1": {...}}`); a `get` answer may
 //!   return either shape, so reads accept both.
@@ -79,7 +82,8 @@ pub struct EmailAlias {
     pub domain_id: String,
     /// Disabled aliases stay listed but receive no mail. Stalwart
     /// always reports the flag; a missing flag means enabled.
-    #[serde(default = "default_enabled")]
+    /// Wire key is `enable`, not `enabled` (live Stalwart v1.0.1).
+    #[serde(default = "default_enabled", rename = "enable")]
     pub enabled: bool,
 }
 
@@ -108,7 +112,7 @@ pub struct DomainInfo {
 /// either shape: a JSON array, or an index-keyed object.
 ///
 /// Strict: every entry must deserialize (object with `name` and
-/// `domainId` strings; a missing `enabled` still defaults to enabled)
+/// `domainId` strings; a missing `enable` still defaults to enabled)
 /// and every object key must parse as `usize`. Any failure is
 /// `MailError::Protocol` — silently dropping a malformed entry would
 /// be dangerous, because `set_account_aliases` replaces the whole
@@ -256,7 +260,7 @@ impl AdminClient {
         for (i, a) in aliases.iter().enumerate() {
             map.insert(
                 i.to_string(),
-                json!({"name": a.name, "domainId": a.domain_id, "enabled": a.enabled}),
+                json!({"name": a.name, "domainId": a.domain_id, "enable": a.enabled}),
             );
         }
         let r = self
@@ -463,17 +467,17 @@ mod tests {
     #[test]
     fn alias_list_parses_array_and_indexed_map() {
         let from_array = parse_alias_list(&json!([
-            {"name": "a", "domainId": "d1", "enabled": true},
+            {"name": "a", "domainId": "d1", "enable": true},
             {"name": "b", "domainId": "d1"},
         ]))
         .unwrap();
         assert_eq!(from_array.len(), 2);
         assert_eq!(from_array[0].name, "a");
-        // A missing `enabled` flag means enabled.
+        // A missing `enable` flag means enabled.
         assert!(from_array[1].enabled);
         let from_map = parse_alias_list(&json!({
-            "1": {"name": "b", "domainId": "d1", "enabled": false},
-            "0": {"name": "a", "domainId": "d1", "enabled": true},
+            "1": {"name": "b", "domainId": "d1", "enable": false},
+            "0": {"name": "a", "domainId": "d1", "enable": true},
         }))
         .unwrap();
         assert_eq!(

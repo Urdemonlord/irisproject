@@ -853,7 +853,7 @@ mod tests {
                 .aliases
                 .entry(account.to_string())
                 .or_default()
-                .push(json!({"name": name, "domainId": domain_id, "enabled": enabled}));
+                .push(json!({"name": name, "domainId": domain_id, "enable": enabled}));
         }
 
         /// The server's current alias list for `account`, in order.
@@ -925,7 +925,7 @@ mod tests {
         let state = Arc::new(Mutex::new(MgmtState {
             aliases: HashMap::from([(
                 "acct-other".to_string(),
-                vec![json!({"name": "taken", "domainId": "d-x", "enabled": true})],
+                vec![json!({"name": "taken", "domainId": "d-x", "enable": true})],
             )]),
             catch_all: HashMap::from([
                 ("d-x".to_string(), None),
@@ -1047,7 +1047,7 @@ mod tests {
                                                     && a["domainId"].as_str().unwrap_or("")
                                                         == domain_id
                                                 {
-                                                    a["enabled"] = json!(false);
+                                                    a["enable"] = json!(false);
                                                 }
                                             }
                                         }
@@ -1430,7 +1430,7 @@ mod tests {
         let patch = &sets[0]["body"]["methodCalls"][0][1]["update"]["acct-me"]["aliases"];
         assert_eq!(
             patch,
-            &json!({"0": {"name": "sales", "domainId": "d-x", "enabled": true}})
+            &json!({"0": {"name": "sales", "domainId": "d-x", "enable": true}})
         );
         // And the audit trail recorded it, with the address only.
         let audit: (String, String) =
@@ -1516,7 +1516,7 @@ mod tests {
         assert_eq!(sets.len(), 0);
         assert_eq!(
             fake.server_aliases("acct-me"),
-            vec![json!({"name": "sales", "domainId": "d-x", "enabled": true})]
+            vec![json!({"name": "sales", "domainId": "d-x", "enable": true})]
         );
     }
 
@@ -1546,7 +1546,7 @@ mod tests {
         assert_eq!(sets.len(), 0);
         assert_eq!(
             fake.server_aliases("acct-me"),
-            vec![json!({"name": "sales", "domainId": "d-x", "enabled": false})]
+            vec![json!({"name": "sales", "domainId": "d-x", "enable": false})]
         );
     }
 
@@ -1560,7 +1560,7 @@ mod tests {
         // re-apply it on top of the other writer's list, instead of
         // writing a mirror row for an alias the server no longer has.
         fake.replace_after_next_set(vec![
-            json!({"name": "other", "domainId": "d-x", "enabled": true}),
+            json!({"name": "other", "domainId": "d-x", "enable": true}),
         ]);
         let id = create_ok(&s, "sales@x.id").await;
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id=?")
@@ -1578,8 +1578,8 @@ mod tests {
         assert_eq!(
             fake.server_aliases("acct-me"),
             vec![
-                json!({"name": "other", "domainId": "d-x", "enabled": true}),
-                json!({"name": "sales", "domainId": "d-x", "enabled": true}),
+                json!({"name": "other", "domainId": "d-x", "enable": true}),
+                json!({"name": "sales", "domainId": "d-x", "enable": true}),
             ]
         );
     }
@@ -1600,15 +1600,15 @@ mod tests {
         assert_eq!(
             sets[0]["body"]["methodCalls"][0][1]["update"]["acct-me"]["aliases"],
             json!({
-                "0": {"name": "other", "domainId": "d-x", "enabled": true},
-                "1": {"name": "sales", "domainId": "d-x", "enabled": true},
+                "0": {"name": "other", "domainId": "d-x", "enable": true},
+                "1": {"name": "sales", "domainId": "d-x", "enable": true},
             })
         );
         assert_eq!(
             fake.server_aliases("acct-me"),
             vec![
-                json!({"name": "other", "domainId": "d-x", "enabled": true}),
-                json!({"name": "sales", "domainId": "d-x", "enabled": true}),
+                json!({"name": "other", "domainId": "d-x", "enable": true}),
+                json!({"name": "sales", "domainId": "d-x", "enable": true}),
             ]
         );
     }
@@ -1631,7 +1631,7 @@ mod tests {
         assert_eq!(row, ("mb1".into(), "sales@x.id".into()));
         assert_eq!(
             fake.server_aliases("acct-me"),
-            vec![json!({"name": "sales", "domainId": "d-x", "enabled": true})]
+            vec![json!({"name": "sales", "domainId": "d-x", "enable": true})]
         );
     }
 
@@ -2203,7 +2203,7 @@ mod tests {
         let server = fake.server_aliases("acct-me");
         assert_eq!(server.len(), 1);
         assert_eq!(server[0]["name"], "sales");
-        assert_eq!(server[0]["enabled"], json!(false));
+        assert_eq!(server[0]["enable"], json!(false));
         // And the mirror row survives the refused delete.
         let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM mail_aliases WHERE id='al-del'")
             .fetch_one(&s.pool)
