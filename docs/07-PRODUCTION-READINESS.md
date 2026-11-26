@@ -71,7 +71,7 @@ Actions (DNS changes, owner: the deployment operator):
 
 ## 7. Monitoring
 
-- [ ] Uptime check on `/ready` (DB) and `/health`.
+- [ ] Uptime check on `/heartbeat` (200 = database + Stalwart JMAP healthy, 503 = degraded; `?roundtrip=true` every 15-30 min proves mail delivery end to end). `/ready` (DB only) and `/health` (static) remain as lighter probes.
 - [ ] Disk usage alert at 80 % (mail + SQLite volumes).
   Live note (2026-11-06): root disk is at 89% (6.5 GB free) — already
   above the 80% threshold — and no alert is configured. Check disk before
