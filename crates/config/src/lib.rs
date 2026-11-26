@@ -349,7 +349,9 @@ fn parse_turnstile_hostnames(env: &str, raw: &str) -> anyhow::Result<Vec<String>
 /// userinfo, no query or fragment (either would swallow the `/jmap/`
 /// path the admin client appends), and a port in range when one is
 /// given. A bare IPv6 authority is not a valid HTTP URL, so it is
-/// rejected in favour of the bracketed form. Anything else fails
+/// rejected in favour of the bracketed form; a bracketed IPv4
+/// address is rejected too, since no URL parser accepts it even
+/// though it reads as loopback. Anything else fails
 /// startup (`from_env` returns `Err`), never silently. The error
 /// message never echoes the supplied value, so a rejected URL cannot
 /// leak embedded credentials into startup logs. Pure so it can be
@@ -386,6 +388,17 @@ fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
         let Some((host, after)) = bracketed.split_once(']') else {
             return Err(err());
         };
+        // Brackets are only for IPv6 literals: `[127.0.0.1]` reads
+        // as loopback below (the brackets strip off and the IPv4
+        // parses) but no URL parser accepts it — reqwest rejects it
+        // as an invalid IPv6 address — so every request would fail.
+        // The same holds for any other bracketed non-IPv6 host such
+        // as `[localhost]`, so the diagnostic names the general case.
+        if host.parse::<std::net::Ipv6Addr>().is_err() {
+            return Err(anyhow::anyhow!(
+                "STALWART_MANAGEMENT_URL has a bracketed host that is not a valid IPv6 address; brackets are only for IPv6 literals, e.g. http://127.0.0.1:8080"
+            ));
+        }
         if !after.is_empty() {
             let Some(port) = after.strip_prefix(':') else {
                 return Err(err());
@@ -809,6 +822,35 @@ mod tests {
             );
         }
         // The bracketed forms stay accepted.
+        assert!(validate_stalwart_management_url("http://[::1]:8080").is_ok());
+        assert!(validate_stalwart_management_url("http://[::1]").is_ok());
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_bracketed_ipv4() {
+        // `[127.0.0.1]` reads as loopback (the brackets strip off
+        // and the IPv4 parses) but no URL parser accepts it:
+        // reqwest rejects it as an invalid IPv6 address, so a URL
+        // that passed validation would fail every request.
+        for bad in ["http://[127.0.0.1]:8080", "http://[127.0.0.1]"] {
+            let err = validate_stalwart_management_url(bad)
+                .unwrap_err()
+                .to_string();
+            assert!(
+                err.contains("http://127.0.0.1:8080"),
+                "{bad} must point at the unbracketed form: {err}"
+            );
+        }
+        // The diagnostic names the general case, so a bracketed
+        // non-IPv6 hostname gets an accurate message too.
+        let err = validate_stalwart_management_url("http://[localhost]:8080")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("bracketed host that is not a valid IPv6 address"),
+            "[localhost] must get the general bracketed-host diagnostic: {err}"
+        );
+        // The bracketed IPv6 forms stay accepted.
         assert!(validate_stalwart_management_url("http://[::1]:8080").is_ok());
         assert!(validate_stalwart_management_url("http://[::1]").is_ok());
     }

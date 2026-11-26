@@ -182,7 +182,7 @@ mod tests {
             "INSERT INTO permanent_mailboxes (id,user_id,email_address,mail_server_account_id,status,created_at,updated_at) \
              VALUES ('mb1','u1','me@x.id','acct-me','active','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')",
             "INSERT INTO mail_aliases (id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at) \
-             VALUES ('al1','u1','mb1','sales@x.id','acct-me',1,'2026-01-01T00:00:00Z')",
+             VALUES ('al1','u1','mb1','sales@x.id','acct-me',0,'2026-01-01T00:00:00Z')",
         ] {
             sqlx::query(q).execute(&pool).await.unwrap();
         }
@@ -193,6 +193,9 @@ mod tests {
             .run(&pool)
             .await
             .unwrap();
+        // The row survives with its values intact — seeded disabled,
+        // so a rebuild that resets disabled aliases to enabled fails
+        // this assertion instead of passing silently.
         let row: (String, String, String, String, String, i64, String) = sqlx::query_as(
             "SELECT id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at FROM mail_aliases WHERE id='al1'",
         )
@@ -207,7 +210,7 @@ mod tests {
                 "mb1".to_string(),
                 "sales@x.id".to_string(),
                 "acct-me".to_string(),
-                1,
+                0,
                 "2026-01-01T00:00:00Z".to_string()
             )
         );
