@@ -25,7 +25,13 @@
 //!   (`IRIS_HEARTBEAT_MAILBOX_USER` /
 //!   `IRIS_HEARTBEAT_MAILBOX_PASSWORD`). Sends a test message from the
 //!   heartbeat mailbox to itself, polls the inbox until it arrives,
-//!   then deletes it. Unconfigured it reports `disabled` and never
+//!   then deletes it. The send also files a copy in Sent (the same
+//!   message object the submission moved there), and the delivery
+//!   files a second, distinct copy in the inbox, so the probe
+//!   deletes both: the Sent copy right after the send returns, and
+//!   the inbox copy once it arrives. A probe that deleted only the
+//!   inbox copy would leave one Sent message behind per probe.
+//!   Unconfigured it reports `disabled` and never
 //!   fails the endpoint; configured but not requested it reports
 //!   `skipped`. The slow cadence (every 15-30 minutes) belongs to the
 //!   external monitor, which calls the plain endpoint frequently and
@@ -62,6 +68,17 @@ pub(crate) const ROUNDTRIP_TIMEOUT: Duration = Duration::from_secs(60);
 const ROUNDTRIP_POLL_INTERVAL: Duration = Duration::from_secs(2);
 /// Polls before the roundtrip gives up: ~30s of polling after the send.
 const ROUNDTRIP_MAX_POLLS: usize = 15;
+/// Attempts to find this probe's Sent copy before giving up. The copy
+/// is filed by the submission itself, so it is there as soon as
+/// `send` returns; the retries only cover a slow mailbox update.
+const SENT_DELETE_ATTEMPTS: usize = 3;
+/// Gap between Sent-copy lookups.
+const SENT_DELETE_RETRY_INTERVAL: Duration = Duration::from_secs(1);
+/// How many of the newest Sent messages one lookup scans. The
+/// heartbeat mailbox holds nothing but probe messages, so the
+/// probe's own copy is always the newest; the bound only keeps a
+/// leaked backlog from turning the scan into a full-folder read.
+const SENT_SCAN_LIMIT: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -253,15 +270,17 @@ async fn check_mail_roundtrip(s: &Arc<AppState>, want_roundtrip: bool) -> CheckR
 }
 
 /// Sends one test message from the heartbeat mailbox to itself,
-/// waits until it shows up in the inbox, then deletes it. Any error
-/// (login, send, delivery, delete) fails the check: a half-proven
-/// roundtrip is not a healthy mail path.
+/// deletes the Sent copy the submission filed, waits until the
+/// delivery copy shows up in the inbox, then deletes that too. Any
+/// error (login, send, Sent delete, delivery, inbox delete) fails
+/// the check: a half-proven roundtrip is not a healthy mail path,
+/// and a half-cleaned one would leave residue behind.
 async fn run_roundtrip(s: &Arc<AppState>) -> Result<(), MailError> {
     let user = &s.config.heartbeat_mailbox_user;
     let pass = &s.config.heartbeat_mailbox_password;
     let client = JmapClient::new(s.config.stalwart_api_url.clone());
     let account = client.login(user, pass).await?;
-    // Unique per probe, so the inbox search cannot match an older
+    // Unique per probe, so the folder searches cannot match an older
     // probe's leftover message (or another probe running concurrently).
     let token = format!("iris-heartbeat-{}", uuid::Uuid::new_v4());
     let compose = Compose {
@@ -272,6 +291,13 @@ async fn run_roundtrip(s: &Arc<AppState>) -> Result<(), MailError> {
         ..Compose::default()
     };
     client.send(user, pass, &account, &compose, None).await?;
+    // Delete the Sent copy first, before waiting on delivery: if
+    // delivery never arrives the check fails, but the Sent folder is
+    // already clean instead of leaking one message per failed probe.
+    // The Sent copy is the message object the submission moved there;
+    // the inbox delivery is a second, distinct object, so destroying
+    // one cannot remove the other.
+    let sent_ids = delete_sent_copy(&client, user, pass, &account, &token).await?;
     for _ in 0..ROUNDTRIP_MAX_POLLS {
         let (found, _) = client
             .list_folder(
@@ -290,9 +316,15 @@ async fn run_roundtrip(s: &Arc<AppState>) -> Result<(), MailError> {
             // The search is full-text; confirm the hit really is this
             // probe's message before deleting anything.
             if message.subject.contains(&token) {
-                client
-                    .destroy_one(user, pass, &account, &message.id)
-                    .await?;
+                // Defensive: never destroy an id already destroyed
+                // as the Sent copy (the two copies are distinct
+                // objects on Stalwart, but a server that merged them
+                // must not turn the second destroy into an error).
+                if !sent_ids.iter().any(|id| id == &message.id) {
+                    client
+                        .destroy_one(user, pass, &account, &message.id)
+                        .await?;
+                }
                 return Ok(());
             }
         }
@@ -300,6 +332,54 @@ async fn run_roundtrip(s: &Arc<AppState>) -> Result<(), MailError> {
     }
     Err(MailError::Unavailable(
         "heartbeat test message was not delivered".into(),
+    ))
+}
+
+/// Finds this probe's Sent copy and destroys it, returning the ids
+/// destroyed. The lookup lists the newest Sent messages and matches
+/// the subject client-side instead of using a full-text search: the
+/// server's search index lags behind a message filed seconds ago,
+/// while a plain newest-first listing sees it immediately. Only
+/// messages whose subject carries this probe's token are destroyed,
+/// so no other mail is ever touched.
+async fn delete_sent_copy(
+    client: &JmapClient,
+    user: &str,
+    pass: &str,
+    account: &str,
+    token: &str,
+) -> Result<Vec<String>, MailError> {
+    for attempt in 0..SENT_DELETE_ATTEMPTS {
+        let (found, _) = client
+            .list_folder(
+                user,
+                pass,
+                account,
+                "sent",
+                ListPage {
+                    limit: SENT_SCAN_LIMIT,
+                    position: 0,
+                    query: None,
+                },
+            )
+            .await?;
+        let targets: Vec<String> = found
+            .into_iter()
+            .filter(|m| m.subject.contains(token))
+            .map(|m| m.id)
+            .collect();
+        if !targets.is_empty() {
+            for id in &targets {
+                client.destroy_one(user, pass, account, id).await?;
+            }
+            return Ok(targets);
+        }
+        if attempt + 1 < SENT_DELETE_ATTEMPTS {
+            tokio::time::sleep(SENT_DELETE_RETRY_INTERVAL).await;
+        }
+    }
+    Err(MailError::Unavailable(
+        "heartbeat test message was not stored in Sent".into(),
     ))
 }
 
@@ -476,12 +556,22 @@ mod tests {
     /// State shared by the fake user-JMAP server for the roundtrip
     /// happy path: it only reports the test message as arrived after
     /// an `Email/set` create landed, and records whether the probe
-    /// deleted it again.
+    /// deleted it again. The send files one copy in Sent (id
+    /// `msg-sent`) and the delivery files a second, distinct copy in
+    /// the inbox (id `msg-1`), the way Stalwart does: the probe must
+    /// destroy both.
     struct FakeJmapState {
         delivered: bool,
         /// Subject text of the last `Email/query` search, so the
         /// `Email/get` answer can carry this probe's token.
         last_query_text: Option<String>,
+        /// Subject of the created message, so the `Email/get` answer
+        /// carries this probe's token even for a query without a
+        /// full-text search (the Sent listing).
+        created_subject: Option<String>,
+        /// Mailbox id of the last `Email/query`, so the `Email/get`
+        /// answer returns that folder's copy.
+        last_query_mailbox: Option<String>,
         destroyed: Vec<String>,
     }
 
@@ -494,6 +584,8 @@ mod tests {
         let shared = Arc::new(Mutex::new(FakeJmapState {
             delivered: false,
             last_query_text: None,
+            created_subject: None,
+            last_query_mailbox: None,
             destroyed: Vec::new(),
         }));
         let task_shared = shared.clone();
@@ -551,9 +643,11 @@ mod tests {
                         "Email/set" => {
                             if args["create"].is_object() {
                                 guard.delivered = true;
+                                guard.created_subject =
+                                    args["create"]["n"]["subject"].as_str().map(str::to_string);
                                 serde_json::json!({
                                     "accountId": "acct-hb",
-                                    "created": {"n": {"id": "msg-1"}},
+                                    "created": {"n": {"id": "msg-sent"}},
                                     "notCreated": {}
                                 })
                             } else {
@@ -582,36 +676,56 @@ mod tests {
                             // probe token as a `text` condition inside
                             // `filter.conditions` (see `with_text` in
                             // the mail crate); remember it for the
-                            // `Email/get` answer below.
+                            // `Email/get` answer below. Also remember
+                            // which folder was queried: a plain folder
+                            // filter carries `inMailbox` directly,
+                            // a searched one inside `conditions`.
                             guard.last_query_text = args["filter"]["conditions"]
                                 .as_array()
                                 .into_iter()
                                 .flatten()
                                 .find_map(|c| c["text"].as_str().map(str::to_string));
-                            if guard.delivered {
-                                serde_json::json!({
-                                    "accountId": "acct-hb",
-                                    "ids": ["msg-1"], "total": 1,
-                                    "queryState": "q1", "canCalculateChanges": false
-                                })
+                            guard.last_query_mailbox = args["filter"]["inMailbox"]
+                                .as_str()
+                                .map(str::to_string)
+                                .or_else(|| {
+                                    args["filter"]["conditions"]
+                                        .as_array()
+                                        .into_iter()
+                                        .flatten()
+                                        .find_map(|c| c["inMailbox"].as_str().map(str::to_string))
+                                });
+                            let sent = guard.last_query_mailbox.as_deref() == Some("m-sent");
+                            let ids: &[&str] = if guard.delivered && sent {
+                                &["msg-sent"]
+                            } else if guard.delivered {
+                                &["msg-1"]
                             } else {
-                                serde_json::json!({
-                                    "accountId": "acct-hb",
-                                    "ids": [], "total": 0,
-                                    "queryState": "q0", "canCalculateChanges": false
-                                })
-                            }
+                                &[]
+                            };
+                            serde_json::json!({
+                                "accountId": "acct-hb",
+                                "ids": ids, "total": ids.len(),
+                                "queryState": "q1", "canCalculateChanges": false
+                            })
                         }
                         "Email/get" => {
-                            let subject = guard
-                                .last_query_text
-                                .clone()
-                                .map(|t| format!("IRIS heartbeat {t}"))
-                                .unwrap_or_default();
+                            let subject = guard.created_subject.clone().unwrap_or_else(|| {
+                                guard
+                                    .last_query_text
+                                    .clone()
+                                    .map(|t| format!("IRIS heartbeat {t}"))
+                                    .unwrap_or_default()
+                            });
+                            let id = if guard.last_query_mailbox.as_deref() == Some("m-sent") {
+                                "msg-sent"
+                            } else {
+                                "msg-1"
+                            };
                             serde_json::json!({
                                 "accountId": "acct-hb",
                                 "list": [{
-                                    "id": "msg-1",
+                                    "id": id,
                                     "subject": subject,
                                     "from": [{"email": "hb@example.test"}],
                                     "to": [{"email": "hb@example.test"}],
@@ -732,10 +846,14 @@ mod tests {
         let (code, report) = probe(s, true).await;
         assert_eq!(code, StatusCode::OK);
         assert_eq!(report.checks.mail_roundtrip.status, CheckStatus::Ok);
-        // The probe deleted exactly the message it sent.
+        // The probe deleted exactly the two copies it sent: the
+        // Sent copy first, then the inbox delivery copy.
         let guard = shared.lock().await;
         assert!(guard.delivered);
-        assert_eq!(guard.destroyed, vec!["msg-1".to_string()]);
+        assert_eq!(
+            guard.destroyed,
+            vec!["msg-sent".to_string(), "msg-1".to_string()]
+        );
     }
 
     #[tokio::test]
