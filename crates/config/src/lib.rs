@@ -351,7 +351,11 @@ fn parse_turnstile_hostnames(env: &str, raw: &str) -> anyhow::Result<Vec<String>
 /// given. A bare IPv6 authority is not a valid HTTP URL, so it is
 /// rejected in favour of the bracketed form; a bracketed IPv4
 /// address is rejected too, since no URL parser accepts it even
-/// though it reads as loopback. Anything else fails
+/// though it reads as loopback. The whole value must also parse with
+/// the same URL parser the admin HTTP client (reqwest) uses, so a
+/// host no real parser accepts — e.g. `bad space.localhost`, which
+/// slips past the `.localhost` suffix check — is rejected here
+/// instead of failing every request later. Anything else fails
 /// startup (`from_env` returns `Err`), never silently. The error
 /// message never echoes the supplied value, so a rejected URL cannot
 /// leak embedded credentials into startup logs. Pure so it can be
@@ -423,7 +427,30 @@ fn validate_stalwart_management_url(raw: &str) -> anyhow::Result<String> {
     } else {
         authority.to_string()
     };
+    // The parse gate above strips ASCII tab/newline from the input
+    // before parsing (WHATWG rule), so a tab inside the host would
+    // still parse — as a different, shorter hostname. Reject any
+    // whitespace or control character in the raw host outright, so
+    // the hostname the validator sees is the one the client uses.
+    if host
+        .bytes()
+        .any(|b| b.is_ascii_whitespace() || b.is_ascii_control())
+    {
+        return Err(err());
+    }
     if !is_loopback_hostname(&host.to_lowercase()) {
+        return Err(err());
+    }
+    // Parse gate, last: the admin client hands this string to
+    // reqwest, so it must parse with the same URL parser reqwest
+    // uses. This rejects hosts no parser accepts (a space in the
+    // host, ...) that the hand-rolled checks above would otherwise
+    // let through. It runs after those checks so their specific
+    // diagnostics (bare IPv6, bracketed non-IPv6) are kept. The
+    // parsed URL is only a gate: the trimmed raw string is still
+    // what is returned and handed to the client, so accepted URLs
+    // keep their exact spelling.
+    if url::Url::parse(url).is_err() {
         return Err(err());
     }
     Ok(url.to_string())
@@ -853,6 +880,34 @@ mod tests {
         // The bracketed IPv6 forms stay accepted.
         assert!(validate_stalwart_management_url("http://[::1]:8080").is_ok());
         assert!(validate_stalwart_management_url("http://[::1]").is_ok());
+    }
+
+    #[test]
+    fn stalwart_management_url_rejects_whitespace_in_host() {
+        // `bad space.localhost` ends with `.localhost`, so the suffix
+        // check alone lets it through — but no URL parser accepts a
+        // space in the host (Node and reqwest's `url` crate both
+        // reject it), so a URL that passed validation would fail
+        // every request. The validator now gates on the same parser
+        // the admin HTTP client uses.
+        for bad in [
+            "http://bad space.localhost:8080",
+            "http://bad space.localhost",
+            // A tab is stripped by the WHATWG parser before parsing,
+            // so the parse gate alone would accept this as
+            // `badspace.localhost`; the raw host is rejected outright
+            // instead, so the validated hostname is the one used.
+            "http://bad\tspace.localhost:8080",
+            "http://bad\nspace.localhost:8080",
+        ] {
+            assert!(
+                validate_stalwart_management_url(bad).is_err(),
+                "{bad:?} must be rejected"
+            );
+        }
+        // The plain `.localhost` forms stay accepted.
+        assert!(validate_stalwart_management_url("http://foo.localhost:8080").is_ok());
+        assert!(validate_stalwart_management_url("http://localhost:8080").is_ok());
     }
 
     #[test]
