@@ -36,6 +36,7 @@ mod contacts;
 mod dmarc;
 mod email_address;
 mod filters;
+mod heartbeat;
 mod html_body;
 mod integration_apps;
 mod integration_keys;
@@ -441,6 +442,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(|| async { "OK" }))
+        .route("/heartbeat", get(heartbeat::heartbeat))
         .route("/ready", get(ready))
         .route("/auth/csrf", get(csrf))
         .route("/auth/login", post(login))
@@ -1826,6 +1828,8 @@ mod password_reset_webhook_tests {
                 stalwart_management_url: "http://127.0.0.1:9".into(),
                 stalwart_admin_user: String::new(),
                 stalwart_admin_password: String::new(),
+                heartbeat_mailbox_user: String::new(),
+                heartbeat_mailbox_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
@@ -2605,6 +2609,8 @@ mod read_limit_tests {
                 stalwart_management_url: "http://127.0.0.1:9".into(),
                 stalwart_admin_user: String::new(),
                 stalwart_admin_password: String::new(),
+                heartbeat_mailbox_user: String::new(),
+                heartbeat_mailbox_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
@@ -3110,6 +3116,8 @@ mod handler_integration_tests {
                 stalwart_management_url: "http://127.0.0.1:9".into(),
                 stalwart_admin_user: String::new(),
                 stalwart_admin_password: String::new(),
+                heartbeat_mailbox_user: String::new(),
+                heartbeat_mailbox_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),

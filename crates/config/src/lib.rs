@@ -63,6 +63,19 @@ pub struct Config {
     /// account). Never shipped to the browser.
     pub stalwart_admin_user: String,
     pub stalwart_admin_password: String,
+    /// Dedicated mailbox for the heartbeat mail roundtrip
+    /// (`GET /heartbeat?roundtrip=true`): the probe sends a test
+    /// message from this mailbox to itself and deletes it after
+    /// delivery is confirmed. Read from
+    /// `IRIS_HEARTBEAT_MAILBOX_USER` / `IRIS_HEARTBEAT_MAILBOX_PASSWORD`.
+    /// Both must be set for the roundtrip to run; when either is
+    /// empty the roundtrip check reports `disabled` and never fails
+    /// the endpoint (see `heartbeat_mailbox_configured`). Never the
+    /// demo mailbox: the roundtrip deletes what it sends, and the
+    /// demo account must not be disturbed. Never shipped to the
+    /// browser.
+    pub heartbeat_mailbox_user: String,
+    pub heartbeat_mailbox_password: String,
     pub temp_inbox_domain: String,
     pub temp_inbox_default_expiry_hours: u32,
     /// Catch-all sink mailbox for the temp domain (not an admin account).
@@ -164,6 +177,11 @@ impl Config {
                 .map(|v| v.trim().to_owned())
                 .unwrap_or_default(),
             stalwart_admin_password: std::env::var("STALWART_ADMIN_PASSWORD").unwrap_or_default(),
+            heartbeat_mailbox_user: std::env::var("IRIS_HEARTBEAT_MAILBOX_USER")
+                .map(|v| v.trim().to_owned())
+                .unwrap_or_default(),
+            heartbeat_mailbox_password: std::env::var("IRIS_HEARTBEAT_MAILBOX_PASSWORD")
+                .unwrap_or_default(),
             temp_inbox_domain: std::env::var("TEMP_INBOX_DOMAIN")
                 .unwrap_or_else(|_| "inbox.example.com".to_string()),
             temp_inbox_default_expiry_hours: std::env::var("TEMP_INBOX_DEFAULT_EXPIRY_HOURS")
@@ -227,6 +245,23 @@ impl Config {
     pub fn stalwart_admin_configured(&self) -> bool {
         stalwart_admin_configured(&self.stalwart_admin_user, &self.stalwart_admin_password)
     }
+
+    /// True when this config carries a usable heartbeat mailbox
+    /// credential (see `heartbeat_mailbox_configured`).
+    pub fn heartbeat_mailbox_configured(&self) -> bool {
+        heartbeat_mailbox_configured(
+            &self.heartbeat_mailbox_user,
+            &self.heartbeat_mailbox_password,
+        )
+    }
+}
+
+/// True when the heartbeat roundtrip mailbox credential is fully
+/// configured: both the user and the password are set. The roundtrip
+/// check reports `disabled` while this is false, and never fails the
+/// endpoint — unlike the admin credential, which fails closed.
+pub fn heartbeat_mailbox_configured(user: &str, password: &str) -> bool {
+    !user.trim().is_empty() && !password.is_empty()
 }
 
 /// Parse `IRIS_ADMIN_EMAILS` (comma-separated, lowercased, trimmed).
@@ -944,6 +979,15 @@ mod tests {
         assert!(!stalwart_admin_configured("   ", "secret"));
         assert!(!stalwart_admin_configured("admin", ""));
         assert!(!stalwart_admin_configured("", ""));
+    }
+
+    #[test]
+    fn heartbeat_mailbox_needs_both_user_and_password() {
+        assert!(heartbeat_mailbox_configured("hb@example.test", "secret"));
+        assert!(!heartbeat_mailbox_configured("", "secret"));
+        assert!(!heartbeat_mailbox_configured("   ", "secret"));
+        assert!(!heartbeat_mailbox_configured("hb@example.test", ""));
+        assert!(!heartbeat_mailbox_configured("", ""));
     }
 
     #[test]

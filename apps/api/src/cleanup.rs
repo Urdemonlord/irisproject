@@ -163,6 +163,8 @@ mod tests {
                 stalwart_management_url: "http://127.0.0.1:9".into(),
                 stalwart_admin_user: String::new(),
                 stalwart_admin_password: String::new(),
+                heartbeat_mailbox_user: String::new(),
+                heartbeat_mailbox_password: String::new(),
                 temp_inbox_domain: "example.test".into(),
                 temp_inbox_default_expiry_hours: 1,
                 temp_inbox_mail_user: String::new(),
