@@ -719,17 +719,26 @@ pub(crate) async fn set_catch_all(
         .await?
         .ok_or(ApiError(StatusCode::NOT_FOUND, "not_found"))?;
     let previous_target = info.catch_all.clone();
-    // An ambiguous write (transport failure: the update may have
-    // landed while the response was lost) is reconciled by reading
-    // the domain back: if the requested target is there, the write
-    // landed and the mirror/audit steps below still run; if the
-    // server still holds something else, the original error is
-    // returned; if the readback itself fails, the original error is
-    // returned and the failure is logged — the mirror keeps the old
-    // target and the next GET refreshes it from the server, so the
-    // disagreement stays visible instead of silent.
+    // An ambiguous write is reconciled by reading the domain back:
+    // if the requested target is there, the write landed and the
+    // mirror/audit steps below still run; if the server still holds
+    // something else, the original error is returned; if the readback
+    // itself fails, the original error is returned and the failure is
+    // logged — the mirror keeps the old target and the next GET
+    // refreshes it from the server, so the disagreement stays visible
+    // instead of silent. Ambiguous means the outcome is unknown: a
+    // transport failure (`Unavailable`, response lost) or a malformed
+    // HTTP-200 response (`Protocol`, the server may have committed
+    // before the response broke). A definitive refusal — the
+    // `notUpdated` Protocol from `set_catch_all` — is reconciled too,
+    // harmlessly: the readback shows the old target still in place,
+    // so the original error is returned unchanged, at the cost of one
+    // extra read.
     if let Err(e) = admin.set_catch_all(&info.id, target.as_deref()).await {
-        if matches!(e, iris_mail::MailError::Unavailable(_)) {
+        if matches!(
+            e,
+            iris_mail::MailError::Unavailable(_) | iris_mail::MailError::Protocol(_)
+        ) {
             match admin.resolve_domain(&domain).await {
                 Ok(Some(current)) if current.catch_all == target => {}
                 Ok(_) => return Err(e.into()),
@@ -797,6 +806,11 @@ mod tests {
         time::{timeout, Duration},
     };
 
+    /// Armed one-shot hook for `disable_alias_on_get`: (account,
+    /// alias name, domain id, Nth get) — disable that entry on the
+    /// Nth `x:Account/get` for its account.
+    type DisableOnGet = Arc<Mutex<Option<(String, String, String, usize)>>>;
+
     /// Fake Stalwart management server: stateful, so tests prove the
     /// exact JMAP calls and the read-modify-write of the alias list.
     /// `acct-me` starts with no aliases; `acct-other` already owns
@@ -810,11 +824,6 @@ mod tests {
     /// without it (the write never landed) — or to have its committed
     /// list replaced right after, as if a concurrent out-of-band
     /// writer overwrote it.
-    /// Armed one-shot hook for `disable_alias_on_get`: (account,
-    /// alias name, domain id, Nth get) — disable that entry on the
-    /// Nth `x:Account/get` for its account.
-    type DisableOnGet = Arc<Mutex<Option<(String, String, String, usize)>>>;
-
     struct FakeMgmt {
         base_url: String,
         requests: Arc<Mutex<Vec<serde_json::Value>>>,
@@ -872,6 +881,15 @@ mod tests {
         fn drop_next_domain_set_response(&self, commit: bool) {
             self.domain_set_fail_mode
                 .store(if commit { 1 } else { 2 }, Ordering::SeqCst);
+        }
+
+        /// Answers the next `x:Domain/set` with a malformed HTTP-200
+        /// body instead of a JMAP response: mode 3 still commits
+        /// first, mode 4 does not. The client sees `Protocol`, the
+        /// same ambiguous failure a truncated real response gives.
+        fn malformed_next_domain_set_response(&self, commit: bool) {
+            self.domain_set_fail_mode
+                .store(if commit { 3 } else { 4 }, Ordering::SeqCst);
         }
 
         /// Disables one alias on the Nth `x:Account/get` for its
@@ -1139,30 +1157,41 @@ mod tests {
                             .unwrap()
                         }
                         "x:Domain/set" => {
-                            // An armed drop mode (see
-                            // `drop_next_domain_set_response`) closes
-                            // the connection without answering: mode 1
-                            // still commits first, mode 2 does not.
+                            // Armed failure modes (see
+                            // `drop_next_domain_set_response` and
+                            // `malformed_next_domain_set_response`):
+                            // 1 drops the response after committing,
+                            // 2 drops it without committing, 3 answers
+                            // with a malformed body after committing,
+                            // 4 the same without committing.
                             let fail_mode = task_domain_set_fail_mode.swap(0, Ordering::SeqCst);
                             let mut st = task_state.lock().unwrap();
                             let update = args["update"].as_object().cloned().unwrap_or_default();
                             for (domain_id, patch) in &update {
-                                if fail_mode != 2 {
+                                if fail_mode != 2 && fail_mode != 4 {
                                     st.catch_all.insert(
                                         domain_id.clone(),
                                         patch["catchAllAddress"].as_str().map(str::to_string),
                                     );
                                 }
                             }
-                            if fail_mode != 0 {
+                            if fail_mode == 1 || fail_mode == 2 {
                                 task_domain_set_dropped.store(true, Ordering::SeqCst);
                             }
-                            serde_json::to_vec(&json!({"methodResponses": [[
-                                "x:Domain/set",
-                                {"updated": {"d-x": {}}, "notUpdated": {}},
-                                "s",
-                            ]]}))
-                            .unwrap()
+                            if fail_mode == 3 || fail_mode == 4 {
+                                // Truncated JSON: the HTTP 200 arrives
+                                // but cannot be parsed, so the client
+                                // reports Protocol even though the
+                                // server may have committed.
+                                b"{\"methodResponses\":[".to_vec()
+                            } else {
+                                serde_json::to_vec(&json!({"methodResponses": [[
+                                    "x:Domain/set",
+                                    {"updated": {"d-x": {}}, "notUpdated": {}},
+                                    "s",
+                                ]]}))
+                                .unwrap()
+                            }
                         }
                         _ => br#"{"methodResponses":[]}"#.to_vec(),
                     }
@@ -2047,6 +2076,67 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(err.1, "mail_server_unavailable");
+        // Server and mirror both keep the old (unset) target.
+        let res = get_catch_all(State(s.clone()), Extension(user()), Path("x.id".into()))
+            .await
+            .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], false);
+        assert!(v["target_address"].is_null());
+    }
+
+    #[tokio::test]
+    async fn set_catch_all_reconciles_malformed_response_when_write_landed() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The Domain/set update committed, but the HTTP-200 body is
+        // malformed: a Protocol error the handler must still
+        // reconcile via readback instead of leaving the mirror stale.
+        fake.malformed_next_domain_set_response(true);
+        let res = set_catch_all(
+            State(s.clone()),
+            Extension(user()),
+            Path("x.id".into()),
+            Json(SetCatchAllBody {
+                target_address: Some("me@x.id".into()),
+            }),
+        )
+        .await
+        .unwrap();
+        let body = to_bytes(res.into_body(), 4096).await.unwrap();
+        let v: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(v["enabled"], true);
+        assert_eq!(v["target_address"], "me@x.id");
+        // The mirror followed the landed write.
+        let target: Option<String> =
+            sqlx::query_scalar("SELECT target_address FROM domain_catch_all WHERE domain='x.id'")
+                .fetch_one(&s.pool)
+                .await
+                .unwrap();
+        assert_eq!(target.as_deref(), Some("me@x.id"));
+    }
+
+    #[tokio::test]
+    async fn set_catch_all_returns_error_on_malformed_response_when_write_never_landed() {
+        let fake = fake_mgmt().await;
+        let s = state(&fake, "admin", vec![]).await;
+        // The malformed response hides a write that never committed:
+        // the readback proves it, so the original Protocol error is
+        // returned instead of a phantom success.
+        fake.malformed_next_domain_set_response(false);
+        let err = set_catch_all(
+            State(s.clone()),
+            Extension(user()),
+            Path("x.id".into()),
+            Json(SetCatchAllBody {
+                target_address: Some("me@x.id".into()),
+            }),
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.0, StatusCode::BAD_GATEWAY);
+        assert_eq!(err.1, "mail_server_error");
         // Server and mirror both keep the old (unset) target.
         let res = get_catch_all(State(s.clone()), Extension(user()), Path("x.id".into()))
             .await

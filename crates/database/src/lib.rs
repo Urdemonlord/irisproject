@@ -193,8 +193,8 @@ mod tests {
             .run(&pool)
             .await
             .unwrap();
-        let row: (String, String, String, String, i64) = sqlx::query_as(
-            "SELECT id,user_id,mailbox_id,address,enabled FROM mail_aliases WHERE id='al1'",
+        let row: (String, String, String, String, String, i64, String) = sqlx::query_as(
+            "SELECT id,user_id,mailbox_id,address,stalwart_account_id,enabled,created_at FROM mail_aliases WHERE id='al1'",
         )
         .fetch_one(&pool)
         .await
@@ -206,22 +206,27 @@ mod tests {
                 "u1".to_string(),
                 "mb1".to_string(),
                 "sales@x.id".to_string(),
-                1
+                "acct-me".to_string(),
+                1,
+                "2026-01-01T00:00:00Z".to_string()
             )
         );
-        let indexes: Vec<String> = sqlx::query_scalar(
-            "SELECT name FROM sqlite_master WHERE type='index' AND tbl_name='mail_aliases' ORDER BY name",
-        )
-        .fetch_all(&pool)
-        .await
-        .unwrap();
-        // The two named indexes survive the rebuild (SQLite also
-        // reports its own autoindexes for the PRIMARY KEY and the
-        // UNIQUE address, which is expected, not a regression).
-        for want in ["idx_mail_aliases_mailbox", "idx_mail_aliases_user"] {
-            assert!(
-                indexes.iter().any(|i| i == want),
-                "missing index {want}: {indexes:?}"
+        // The two named indexes survive the rebuild with their
+        // indexed columns intact, not just their names.
+        for (want, col) in [
+            ("idx_mail_aliases_mailbox", "mailbox_id"),
+            ("idx_mail_aliases_user", "user_id"),
+        ] {
+            let got: Vec<String> = sqlx::query_scalar(&format!(
+                "SELECT name FROM pragma_index_info('{want}') ORDER BY seqno"
+            ))
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+            assert_eq!(
+                got,
+                vec![col.to_string()],
+                "index {want} columns changed: {got:?}"
             );
         }
         let sql: String = sqlx::query_scalar(
