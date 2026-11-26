@@ -2076,6 +2076,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(err.1, "mail_server_unavailable");
+        // The mirror must still have no row: the failed PUT must not
+        // have written one. Check it directly here — the GET below
+        // upserts the server's (unset) target into the mirror, so it
+        // would hide a row the PUT wrote by mistake.
+        let mirror: Option<String> =
+            sqlx::query_scalar("SELECT target_address FROM domain_catch_all WHERE domain='x.id'")
+                .fetch_optional(&s.pool)
+                .await
+                .unwrap();
+        assert!(mirror.is_none());
         // Server and mirror both keep the old (unset) target.
         let res = get_catch_all(State(s.clone()), Extension(user()), Path("x.id".into()))
             .await
@@ -2137,6 +2147,16 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.0, StatusCode::BAD_GATEWAY);
         assert_eq!(err.1, "mail_server_error");
+        // The mirror must still have no row: the failed PUT must not
+        // have written one. Check it directly here — the GET below
+        // upserts the server's (unset) target into the mirror, so it
+        // would hide a row the PUT wrote by mistake.
+        let mirror: Option<String> =
+            sqlx::query_scalar("SELECT target_address FROM domain_catch_all WHERE domain='x.id'")
+                .fetch_optional(&s.pool)
+                .await
+                .unwrap();
+        assert!(mirror.is_none());
         // Server and mirror both keep the old (unset) target.
         let res = get_catch_all(State(s.clone()), Extension(user()), Path("x.id".into()))
             .await

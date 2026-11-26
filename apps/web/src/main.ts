@@ -2403,6 +2403,14 @@ async function renderOrganize() {
   // user made but has not Set yet. Drafts are reapplied on redraw
   // and cleared when their domain's Set succeeds.
   const catchAllDrafts = new Map<string, string>()
+  // Generation counter for catch-all state: bumped on every
+  // successful Set/Disable. A load that started before the bump
+  // must not apply its snapshot afterwards — the Set/Disable
+  // already wrote newer state, and the load's response predates
+  // it. A stale load schedules one fresh load after it settles
+  // instead of overwriting.
+  let catchAllSeq = 0
+  let catchAllStaleReload = false
   // Domains whose catch-all could not be read (the batch load failed
   // for a reason other than 401/503): their state is unknown, never
   // Off, and the row offers a retry instead of a wrong state.
@@ -2424,6 +2432,7 @@ async function renderOrganize() {
       const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: null }) })
       ok = true
       catchAlls.set(domain, res)
+      catchAllSeq++
       toast(`Catch-all for ${domain} disabled`)
       // The pending key comes off before the redraw: the new row is
       // built from it, and a key still present would leave the live
@@ -2525,10 +2534,14 @@ async function renderOrganize() {
           const res = await api<CatchAll>(`/api/v1/domains/${encodeURIComponent(domain)}/catch-all`, { method: 'PUT', body: JSON.stringify({ target_address: target }) })
           ok = true
           catchAlls.set(domain, res)
-          // A Set just saved this pick, so it is no longer a draft.
+          catchAllSeq++
+          // A Set just saved this pick, so it is no longer a draft —
+          // but only if the draft still holds this target. The user
+          // may have picked a different mailbox while the PUT was in
+          // flight, and that newer pick must survive the redraw.
           // A Disable leaves the draft alone: the pick is still the
           // user's choice for a later Set.
-          if (target !== null) catchAllDrafts.delete(domain)
+          if (target !== null && catchAllDrafts.get(domain) === target) catchAllDrafts.delete(domain)
           toast(target === null ? `Catch-all for ${domain} disabled` : `Catch-all for ${domain} set`)
           // The pending key comes off before the redraw: the new row
           // is built from it, and a key still present would leave
@@ -2578,7 +2591,10 @@ async function renderOrganize() {
   // four concurrent workers, outcomes applied in domain order — so a
   // per-domain 404 genuinely means that domain is missing, while
   // any other failure marks the domain failed instead of a wrong Off.
-  const loadCatchAllPerDomain = async () => {
+  // `seq` is the generation the calling load started at: if a
+  // Set/Disable landed while these reads were in flight, the
+  // outcomes are stale and must not overwrite that newer state.
+  const loadCatchAllPerDomain = async (seq: number) => {
     const CONCURRENCY = 4
     const outcomes: { res?: CatchAll; err?: unknown }[] = new Array(catchAllDomains.length)
     let next = 0
@@ -2598,6 +2614,11 @@ async function renderOrganize() {
       }
     })
     await Promise.all(workers)
+    // A 401 still goes to the caller's sign-in recovery even when
+    // the snapshot is stale: the session is dead either way.
+    const authFailure = outcomes.find(o => o?.err && (o.err as HttpError).status === 401)
+    if (authFailure?.err) throw authFailure.err
+    if (seq !== catchAllSeq) { catchAllStaleReload = true; return }
     catchAlls.clear()
     catchAllMissing.clear()
     catchAllFailed.clear()
@@ -2624,6 +2645,10 @@ async function renderOrganize() {
   const loadCatchAll = (): Promise<void> => {
     if (catchAllInFlight) return catchAllInFlight
     const run = (async () => {
+      // Generation at load start: a Set/Disable after this point
+      // makes the snapshot below stale (see catchAllSeq above).
+      const seq = catchAllSeq
+      const stale = () => seq !== catchAllSeq
       // One request for every domain, backed by a single domain-catalog
       // read on the server (GET /api/v1/domains/catch-all). The old loop
       // GETed each domain in turn — four concurrent workers, still one
@@ -2638,20 +2663,38 @@ async function renderOrganize() {
       // domain is missing.
       try {
         const res = await api<{ catch_alls: CatchAll[]; missing: { name: string }[] }>('/api/v1/domains/catch-all')
-        catchAlls.clear()
-        catchAllMissing.clear()
-        catchAllFailed.clear()
-        for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
-        for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
+        if (stale()) {
+          // A Set/Disable landed while this load was in flight: its
+          // own state update is newer than this snapshot. Skip
+          // applying and reload once after settling instead.
+          catchAllStaleReload = true
+        } else {
+          catchAlls.clear()
+          catchAllMissing.clear()
+          catchAllFailed.clear()
+          // The batch enumerates every domain the caller may manage,
+          // so it is the authority on which domains to display: a
+          // domain outside the fallback list (an admin domain with a
+          // catch-all but no mailbox) would otherwise be stored but
+          // never drawn.
+          catchAllDomains = [...new Set([...res.catch_alls.map(c => c.domain.toLowerCase()), ...res.missing.map(m => m.name.toLowerCase())])].sort()
+          for (const c of res.catch_alls) catchAlls.set(c.domain.toLowerCase(), c)
+          for (const m of res.missing) catchAllMissing.add(m.name.toLowerCase())
+        }
       } catch (err) {
         const status = (err as HttpError).status
         if (status === 401) throw err
-        if (status === 503) { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
-        else if (status === 404) {
-          await loadCatchAllPerDomain()
+        if (status === 503) {
+          if (stale()) catchAllStaleReload = true
+          else { catchAlls.clear(); catchAllMissing.clear(); catchAllFailed.clear(); catchAllAvailable = false }
+        } else if (status === 404) {
+          await loadCatchAllPerDomain(seq)
         } else {
-          toast(orgError(err))
-          for (const domain of catchAllDomains) catchAllFailed.add(domain)
+          if (stale()) catchAllStaleReload = true
+          else {
+            toast(orgError(err))
+            for (const domain of catchAllDomains) catchAllFailed.add(domain)
+          }
         }
       }
       drawCatchAll()
@@ -2659,11 +2702,20 @@ async function renderOrganize() {
     catchAllInFlight = run
     // Cleared on settle so a later retry starts a fresh load. Both
     // outcomes are observed here, so this derived promise never
-    // rejects and the callers still see the original outcome.
-    void run.then(
-      () => { if (catchAllInFlight === run) catchAllInFlight = null },
-      () => { if (catchAllInFlight === run) catchAllInFlight = null },
-    )
+    // rejects and the callers still see the original outcome. A load
+    // that went stale reloads once here so a Retry click is not
+    // wasted on a snapshot that was skipped; the reload's own 401
+    // goes through the same sign-in recovery as a Retry.
+    const settle = () => {
+      if (catchAllInFlight === run) catchAllInFlight = null
+      if (catchAllStaleReload) {
+        catchAllStaleReload = false
+        void loadCatchAll().catch((err) => {
+          if ((err as HttpError).status === 401) { account = null; void renderLogin() }
+        })
+      }
+    }
+    void run.then(settle, settle)
     return run
   }
 
